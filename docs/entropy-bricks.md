@@ -170,16 +170,17 @@ Not yet read in full; audit when Q1/Q2 land.
 Sequenced by (expected win × certainty) / risk, per the playbook — biggest,
 safest, most-informative first; each independently revertible:
 
-| # | Brick | Class | Expected |
+| # | Brick | Class | Status / Expected |
 |---|---|---|---|
-| 1 | ~~**F-audit**~~ ✅ done — 192M symbols, ~13-19ns each, pool = majority of EntropyRate but lean per-call | analyzer | (see Foundation §) |
-| 2 | **B4** eob-proportional levels init (scatter coded positions instead of full-area fill) | elim-redundancy | area→eob work cut; big for sparse blocks |
-| 3 | **B1+B2** fused gather/sum + one-pass ctx folds (+ lazy dc_sign) | elim-redundancy | small×1.38M calls |
-| 4 | **B7a** stencil: hoist invariants, then SIMD (libaom precedent) | elim→vectorize | the per-coeff workhorse |
-| 5 | **Q2** unblock quantize autovec (two-pass level_mode) | elim-redundancy | chunk of the 12.3% |
-| 6 | **F1** one foundation micro-brick (branchless update_cdf / push) — revert-if-flat | elim-redundancy | ≤5% total; honest attempt only |
-| 7 | **Q1** EOB scan codegen check | elim-redundancy | small-medium |
-| 8 | B8 nonzero-only sign walk; B5/B6 audit | elim-redundancy | small |
+| 1 | **F-audit** | analyzer | ✅ 192M symbols ~13-19ns; lean per-call (see Foundation §) |
+| 2 | **B4** eob-proportional levels init | elim-redundancy | ❌ REVERTED flat — fill already autovec'd |
+| 3 | **F1** update_cdf split-loop | elim-redundancy | ❌ REVERTED flat — already cmov |
+| 4 | **B7a** full-area ctx kernel | prep+autovec | ✅ **KEPT: −64% stage, −8.3% whole encode** |
+| — | — remaining queue — | | |
+| 5 | **F2** dedup fc_log pushes (log only first mutation per CDF row per checkpoint epoch; needs nesting-safe last-save-index scheme — see Foundation §) | elim-redundancy | est. 150-300 ms; MEDIUM risk (nested checkpoints) |
+| 6 | **B7a-SIMD** hand-AVX2 of the area kernel | vectorize-kernel | only if profiling shows autovec left lanes on the table |
+| 7 | **Q2** quantize two-pass level_mode (parked per user) | elim-redundancy | ~15-20% of the 12.3% pool |
+| 8 | B1/B2/B8 micro-fusions | elim-redundancy | ~0.5% each — likely sub-noise (B4 lesson) |
 
 **Not on the table (bitstream-changing, → `experimental` skill):** frozen-CDF rate
 estimation, tx-domain rate (`use_tx_domain_rate`), candidate pruning. Those change
@@ -198,3 +199,6 @@ Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-
 | 07-01 | F-audit | info scope on symbol_with_update + tell_frac (removed after) | n/a | n/a | hash `688d…95e` ✔ | 192M symbols ~13-19ns; tell_frac dead |
 | 07-01 | B4 | eob-proportional levels scatter instead of full-area fill | share 50.5%→50.5% FLAT | n/a | hash ✔ | **REVERTED** — old fill already autovec'd; per-call fixed cost (~15ns) is noise vs 2.5µs call. Small-array data movement ≠ redundancy (3rd codec confirming) |
 | 07-01 | F1 | update_cdf split-loop (branch-free at monotonic `i>=val`) | share 50.5%→49.7%, <noise | n/a | hash ✔ | **REVERTED** — LLVM already emits cmov; ≤1% unresolvable on ±10% thermal box |
+| 07-01 | B7a-audit | info scope on get_nz_map_contexts | n/a | n/a | hash ✔ | stencil pool = **864-892 ms = 14.2% of RDO** (1.24M calls, ~700ns ea) |
+| 07-01 | **B7a** | full-area column-contiguous ctx kernel, safe-Rust autovec (the TX_PAD layout was designed for this SIMD pattern) | **878→449 ms (−49%), non-overlapping** | — | hash ✔ · oracle ✔ (19 sizes × 3 classes, every raster pos) | **KEPT** — commit 434d9202 |
+| 07-01 | **B7a-tune** | drop the density cutoff — kernel wins at every density (sweep K=8/16/64/∞: 449/338/311/320 ms) | stencil **878→320 ms (−64%)** | **553.6→507.8 ms/frame = −8.3% whole encode** (interleaved 1T A/B, non-overlapping) | hash ✔ · 547/547 lib tests ✔ | **KEPT** — commit df2ab0e6 |
