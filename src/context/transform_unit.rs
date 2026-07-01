@@ -843,6 +843,9 @@ impl ContextWriter<'_> {
     mag as usize
   }
 
+  // Scalar oracle for `nz_map_area_kernel` (brick B7a) — kept in-tree per the
+  // optimize-codec discipline; exercised by nz_map_kernel_test.
+  #[allow(dead_code)]
   fn get_nz_map_ctx_from_stats(
     stats: usize,
     coeff_idx: usize, // raster order
@@ -882,6 +885,9 @@ impl ContextWriter<'_> {
       }
   }
 
+  // Scalar oracle for `nz_map_area_kernel` (brick B7a) — kept in-tree per the
+  // optimize-codec discipline; exercised by nz_map_kernel_test.
+  #[allow(dead_code)]
   fn get_nz_map_ctx(
     levels: &[u8], coeff_idx: usize, bhl: usize, area: usize, scan_idx: usize,
     is_eob: bool, tx_size: TxSize, tx_class: TxClass,
@@ -1029,48 +1035,33 @@ impl ContextWriter<'_> {
     let scan = &scan[..usize::from(eob)];
     let coeffs = &mut coeff_contexts_no_scan[..usize::from(eob)];
 
-    // Brick B7a cutoff: the area kernel does area-proportional VECTOR work,
-    // the scalar stencil eob-proportional GATHER work; the kernel pays off
-    // once the block is dense enough.
-    if usize::from(eob) * 8 >= area {
-      let height = 1usize << bhl;
-      let width = area >> bhl;
-      let mut ctx_area = [0u8; MAX_CODED_TX_SQUARE];
-      Self::nz_map_area_kernel(
-        levels, height, width, tx_size, tx_class, &mut ctx_area,
-      );
-      let last = usize::from(eob) - 1;
-      let (body, last_c) = coeffs.split_at_mut(last);
-      for (coeff, &pos) in body.iter_mut().zip(&scan[..last]) {
-        coeff.write(ctx_area[pos as usize] as i8);
-      }
-      // the eob position's context depends only on its scan index
-      let eob_ctx: i8 = if last == 0 {
-        0
-      } else if last <= area / 8 {
-        1
-      } else if last <= area / 4 {
-        2
-      } else {
-        3
-      };
-      last_c[0].write(eob_ctx);
-    } else {
-      for (i, (coeff, pos)) in
-        coeffs.iter_mut().zip(scan.iter().copied()).enumerate()
-      {
-        coeff.write(Self::get_nz_map_ctx(
-          levels,
-          pos as usize,
-          bhl,
-          area,
-          i,
-          i == usize::from(eob) - 1,
-          tx_size,
-          tx_class,
-        ) as i8);
-      }
+    // Brick B7a: the area kernel's vectorized column loops beat the scalar
+    // per-scan-position stencil at EVERY measured density (cutoff sweep
+    // eob*K>=area, K=8/16/64/always: 449/338/311/320 ms) — vector throughput
+    // covers the area-vs-eob work difference even for sparse blocks, so no
+    // density cutoff. The scalar `get_nz_map_ctx` remains as the oracle.
+    let height = 1usize << bhl;
+    let width = area >> bhl;
+    let mut ctx_area = [0u8; MAX_CODED_TX_SQUARE];
+    Self::nz_map_area_kernel(
+      levels, height, width, tx_size, tx_class, &mut ctx_area,
+    );
+    let last = usize::from(eob) - 1;
+    let (body, last_c) = coeffs.split_at_mut(last);
+    for (coeff, &pos) in body.iter_mut().zip(&scan[..last]) {
+      coeff.write(ctx_area[pos as usize] as i8);
     }
+    // the eob position's context depends only on its scan index
+    let eob_ctx: i8 = if last == 0 {
+      0
+    } else if last <= area / 8 {
+      1
+    } else if last <= area / 4 {
+      2
+    } else {
+      3
+    };
+    last_c[0].write(eob_ctx);
     // SAFETY: every element has been initialized
     unsafe { slice_assume_init_mut(coeffs) }
   }
