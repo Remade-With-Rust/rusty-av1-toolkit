@@ -196,3 +196,5 @@ Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-
 | date | brick | change | stage Δ (median) | bench Δ | gate | verdict |
 |---|---|---|---|---|---|---|
 | 07-01 | F-audit | info scope on symbol_with_update + tell_frac (removed after) | n/a | n/a | hash `688d…95e` ✔ | 192M symbols ~13-19ns; tell_frac dead |
+| 07-01 | B4 | eob-proportional levels scatter instead of full-area fill | share 50.5%→50.5% FLAT | n/a | hash ✔ | **REVERTED** — old fill already autovec'd; per-call fixed cost (~15ns) is noise vs 2.5µs call. Small-array data movement ≠ redundancy (3rd codec confirming) |
+| 07-01 | F1 | update_cdf split-loop (branch-free at monotonic `i>=val`) | share 50.5%→49.7%, <noise | n/a | hash ✔ | **REVERTED** — LLVM already emits cmov; ≤1% unresolvable on ±10% thermal box |

@@ -74,6 +74,7 @@ stages! {
   // --- info tier: nested inside other stages, displayed but never summed ---
   SymbolMachinery  => "symbol_with_update [info]",
   TellFrac         => "tell_frac [info]",
+  NzMapCtx         => "get_nz_map_contexts [info]",
 }
 
 impl Stage {
@@ -81,7 +82,10 @@ impl Stage {
   /// inside EntropyRate), so they are displayed for audits but excluded from
   /// every sum — including them would double-count and corrupt the residue.
   pub const fn is_info(self) -> bool {
-    matches!(self, Stage::SymbolMachinery | Stage::TellFrac)
+    matches!(
+      self,
+      Stage::SymbolMachinery | Stage::TellFrac | Stage::NzMapCtx
+    )
   }
 
   /// RDO-child stages nest *inside* `PartitionRdo`; reported as a sub-breakdown

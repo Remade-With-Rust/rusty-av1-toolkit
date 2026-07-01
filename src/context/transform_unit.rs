@@ -906,30 +906,170 @@ impl ContextWriter<'_> {
     Self::get_nz_map_ctx_from_stats(stats, coeff_idx, bhl, tx_size, tx_class)
   }
 
+  /// Brick B7a (docs/entropy-bricks.md): full-area nz-map context kernel.
+  ///
+  /// The scalar path (`get_nz_map_ctx` per scan position) gathers a 5-point
+  /// neighbour stencil per coded coefficient — measured at 870-890 ms
+  /// (12-13% of encode). This kernel computes the context for EVERY raster
+  /// position with column-contiguous u8 min/add loops over the padded
+  /// `levels` buffer — the layout libaom designed for exactly this SIMD
+  /// access pattern (see `TX_PAD_END`) — which LLVM can auto-vectorize.
+  /// The offset tables saturate (2D at row/col 4; 1D at index 2), so each
+  /// column is a short scalar prologue plus a constant-offset vector tail.
+  ///
+  /// Byte-identical to `get_nz_map_ctx` at every non-eob position — the
+  /// scalar stays in-tree as the oracle (`nz_map_area_kernel_matches_scalar`)
+  /// and as the sparse-block fallback.
+  fn nz_map_area_kernel(
+    levels: &[u8], height: usize, width: usize, tx_size: TxSize,
+    tx_class: TxClass, out: &mut [u8; MAX_CODED_TX_SQUARE],
+  ) {
+    let stride = height + TX_PAD_HOR;
+
+    #[inline(always)]
+    fn m3(x: u8) -> u8 {
+      x.min(3)
+    }
+
+    match tx_class {
+      TX_CLASS_2D => {
+        // stencil: {1,0} {2,0} in-column, {0,1} {1,1} col+1, {0,2} col+2
+        #[inline(always)]
+        fn ctx2d(col0: &[u8], col1: &[u8], col2: &[u8], r: usize) -> u8 {
+          let mag = m3(col0[r + 1])
+            + m3(col0[r + 2])
+            + m3(col1[r])
+            + m3(col1[r + 1])
+            + m3(col2[r]);
+          ((mag + 1) >> 1).min(4)
+        }
+        let offs = &av1_nz_map_ctx_offset[tx_size as usize];
+        for c in 0..width {
+          let lb = c * stride;
+          let col0 = &levels[lb..lb + height + 2];
+          let col1 = &levels[lb + stride..lb + stride + height + 1];
+          let col2 = &levels[lb + 2 * stride..lb + 2 * stride + height];
+          let out_col = &mut out[c * height..c * height + height];
+          let mc = c.min(4);
+          // per-row offsets saturate at row 4: scalar prologue, vector tail
+          let pro = height.min(4);
+          for r in 0..pro {
+            out_col[r] = ctx2d(col0, col1, col2, r) + offs[r][mc] as u8;
+          }
+          let k = offs[4][mc] as u8;
+          for r in pro..height {
+            out_col[r] = ctx2d(col0, col1, col2, r) + k;
+          }
+        }
+        // 2D DC: context is 0 regardless of stats
+        out[0] = 0;
+      }
+      TX_CLASS_HORIZ => {
+        // stencil: {1,0} in-column, then cols +1..+4 at the same row;
+        // the 1D offset depends only on the column => constant per column
+        for c in 0..width {
+          let lb = c * stride;
+          let col0 = &levels[lb..lb + height + 1];
+          let col1 = &levels[lb + stride..lb + stride + height];
+          let col2 = &levels[lb + 2 * stride..lb + 2 * stride + height];
+          let col3 = &levels[lb + 3 * stride..lb + 3 * stride + height];
+          let col4 = &levels[lb + 4 * stride..lb + 4 * stride + height];
+          let k = nz_map_ctx_offset_1d[c] as u8;
+          let out_col = &mut out[c * height..c * height + height];
+          for r in 0..height {
+            let mag = m3(col0[r + 1])
+              + m3(col1[r])
+              + m3(col2[r])
+              + m3(col3[r])
+              + m3(col4[r]);
+            out_col[r] = ((mag + 1) >> 1).min(4) + k;
+          }
+        }
+      }
+      TX_CLASS_VERT => {
+        // stencil: rows +1..+4 in-column plus {0,1} col+1;
+        // the 1D offset depends on the row and saturates at index 2
+        #[inline(always)]
+        fn ctxv(col0: &[u8], col1: &[u8], r: usize) -> u8 {
+          let mag = m3(col0[r + 1])
+            + m3(col1[r])
+            + m3(col0[r + 2])
+            + m3(col0[r + 3])
+            + m3(col0[r + 4]);
+          ((mag + 1) >> 1).min(4)
+        }
+        for c in 0..width {
+          let lb = c * stride;
+          let col0 = &levels[lb..lb + height + 4];
+          let col1 = &levels[lb + stride..lb + stride + height];
+          let out_col = &mut out[c * height..c * height + height];
+          let pro = height.min(2);
+          for r in 0..pro {
+            out_col[r] = ctxv(col0, col1, r) + nz_map_ctx_offset_1d[r] as u8;
+          }
+          let k = nz_map_ctx_offset_1d[2] as u8;
+          for r in pro..height {
+            out_col[r] = ctxv(col0, col1, r) + k;
+          }
+        }
+      }
+    }
+  }
+
   /// `coeff_contexts_no_scan` is not in the scan order.
   /// Value for `pos = scan[i]` is at `coeff[i]`, not at `coeff[pos]`.
   pub fn get_nz_map_contexts<'c>(
     &self, levels: &mut [u8], scan: &[u16], eob: u16, tx_size: TxSize,
     tx_class: TxClass, coeff_contexts_no_scan: &'c mut [MaybeUninit<i8>],
   ) -> &'c mut [i8] {
+    let _prof = crate::prof::scope(crate::prof::Stage::NzMapCtx);
     let bhl = Self::get_txb_bhl(tx_size);
     let area = av1_get_coded_tx_size(tx_size).area();
 
     let scan = &scan[..usize::from(eob)];
     let coeffs = &mut coeff_contexts_no_scan[..usize::from(eob)];
-    for (i, (coeff, pos)) in
-      coeffs.iter_mut().zip(scan.iter().copied()).enumerate()
-    {
-      coeff.write(Self::get_nz_map_ctx(
-        levels,
-        pos as usize,
-        bhl,
-        area,
-        i,
-        i == usize::from(eob) - 1,
-        tx_size,
-        tx_class,
-      ) as i8);
+
+    // Brick B7a cutoff: the area kernel does area-proportional VECTOR work,
+    // the scalar stencil eob-proportional GATHER work; the kernel pays off
+    // once the block is dense enough.
+    if usize::from(eob) * 8 >= area {
+      let height = 1usize << bhl;
+      let width = area >> bhl;
+      let mut ctx_area = [0u8; MAX_CODED_TX_SQUARE];
+      Self::nz_map_area_kernel(
+        levels, height, width, tx_size, tx_class, &mut ctx_area,
+      );
+      let last = usize::from(eob) - 1;
+      let (body, last_c) = coeffs.split_at_mut(last);
+      for (coeff, &pos) in body.iter_mut().zip(&scan[..last]) {
+        coeff.write(ctx_area[pos as usize] as i8);
+      }
+      // the eob position's context depends only on its scan index
+      let eob_ctx: i8 = if last == 0 {
+        0
+      } else if last <= area / 8 {
+        1
+      } else if last <= area / 4 {
+        2
+      } else {
+        3
+      };
+      last_c[0].write(eob_ctx);
+    } else {
+      for (i, (coeff, pos)) in
+        coeffs.iter_mut().zip(scan.iter().copied()).enumerate()
+      {
+        coeff.write(Self::get_nz_map_ctx(
+          levels,
+          pos as usize,
+          bhl,
+          area,
+          i,
+          i == usize::from(eob) - 1,
+          tx_size,
+          tx_class,
+        ) as i8);
+      }
     }
     // SAFETY: every element has been initialized
     unsafe { slice_assume_init_mut(coeffs) }
@@ -982,5 +1122,83 @@ impl ContextWriter<'_> {
     }
 
     mag + 14
+  }
+}
+
+#[cfg(test)]
+mod nz_map_kernel_test {
+  use super::*;
+  use crate::transform::TxSize::*;
+  use pretty_assertions::assert_eq;
+
+  /// Brick B7a oracle: the full-area kernel must agree with the scalar
+  /// `get_nz_map_ctx` at EVERY raster position (non-eob path), for every
+  /// coded tx size and tx class, over pseudorandom levels.
+  #[test]
+  fn nz_map_area_kernel_matches_scalar() {
+    const ALL: [TxSize; 19] = [
+      TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64, TX_4X8, TX_8X4,
+      TX_8X16, TX_16X8, TX_16X32, TX_32X16, TX_32X64, TX_64X32, TX_4X16,
+      TX_16X4, TX_8X32, TX_32X8, TX_16X64, TX_64X16,
+    ];
+    let classes = [TX_CLASS_2D, TX_CLASS_HORIZ, TX_CLASS_VERT];
+
+    let mut rng: u32 = 0x1234_5678;
+    let mut next = move || {
+      rng ^= rng << 13;
+      rng ^= rng >> 17;
+      rng ^= rng << 5;
+      rng
+    };
+
+    for &ts in &ALL {
+      let coded = av1_get_coded_tx_size(ts);
+      let height = coded.height();
+      let width = coded.width();
+      let area = coded.area();
+      let bhl = ContextWriter::get_txb_bhl(ts);
+      assert_eq!(1usize << bhl, height);
+
+      for &tc in &classes {
+        for _trial in 0..4 {
+          // Build a padded levels buffer exactly like write_coeffs_lv_map:
+          // zeroed, coded area filled column-wise (transposed layout).
+          let mut levels_buf = [0u8; TX_PAD_2D];
+          let levels =
+            &mut levels_buf[TX_PAD_TOP * (height + TX_PAD_HOR)..];
+          for c in 0..width {
+            for r in 0..height {
+              // mix of zeros (sparse) and levels up to the 127 clamp
+              let v = match next() % 4 {
+                0 | 1 => 0u8,
+                2 => (next() % 4) as u8,
+                _ => (next() % 128) as u8,
+              };
+              levels[c * (height + TX_PAD_HOR) + r] = v;
+            }
+          }
+
+          let mut ctx_area = [0u8; MAX_CODED_TX_SQUARE];
+          ContextWriter::nz_map_area_kernel(
+            levels, height, width, ts, tc, &mut ctx_area,
+          );
+
+          for pos in 0..area {
+            let scalar = ContextWriter::get_nz_map_ctx(
+              levels, pos, bhl, area, 1, false, ts, tc,
+            );
+            assert_eq!(
+              ctx_area[pos] as usize,
+              scalar,
+              "mismatch at pos {pos} (r={}, c={}) ts={} tc={}",
+              pos & (height - 1),
+              pos >> bhl,
+              ts as usize,
+              tc as usize,
+            );
+          }
+        }
+      }
+    }
   }
 }
