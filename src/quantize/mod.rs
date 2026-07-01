@@ -269,6 +269,7 @@ impl QuantizationContext {
   pub fn quantize<T: Coefficient>(
     &self, coeffs: &[T], qcoeffs: &mut [T], tx_size: TxSize, tx_type: TxType,
   ) -> u16 {
+    let _prof = crate::prof::scope(crate::prof::Stage::Quantize);
     let scan = av1_scan_orders[tx_size as usize][tx_type as usize].scan;
     let iscan = av1_scan_orders[tx_size as usize][tx_type as usize].iscan;
 

@@ -154,6 +154,7 @@ pub fn estimate_tile_motion<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   inter_cfg: &InterConfig,
 ) {
+  let _prof = crate::prof::scope(crate::prof::Stage::MotionEstimation);
   let init_size = MIB_SIZE_LOG2;
 
   let mut prev_ssdec: Option<u8> = None;
@@ -539,6 +540,7 @@ pub fn estimate_motion<T: Pixel>(
   pmv: Option<[MotionVector; 2]>, corner: MVSamplingMode,
   extensive_search: bool, ssdec: u8, lambda: Option<u32>,
 ) -> Option<MotionSearchResult> {
+  let _prof = crate::prof::scope(crate::prof::Stage::MotionEstEnc);
   if let Some(ref rec) =
     fi.rec_buffer.frames[fi.ref_frames[ref_frame.to_index()] as usize]
   {

@@ -1496,6 +1496,9 @@ impl<T: Pixel> ContextInner<T> {
 
   #[profiling::function]
   pub fn receive_packet(&mut self) -> Result<Packet<T>, EncoderStatus> {
+    // analyzer spine: TOTAL scope — wraps all per-call encoder work (lookahead
+    // analysis for buffered frames + this frame's encode + rate control).
+    let _prof = crate::prof::scope(crate::prof::Stage::Total);
     if self.done_processing() {
       return Err(EncoderStatus::LimitReached);
     }

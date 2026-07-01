@@ -726,6 +726,7 @@ impl<'a> ContextWriter<'a> {
   pub fn checkpoint(
     &self, tile_bo: &TileBlockOffset, chroma_sampling: ChromaSampling,
   ) -> ContextWriterCheckpoint {
+    let _prof = crate::prof::scope(crate::prof::Stage::CtxSaveRestore);
     ContextWriterCheckpoint {
       fc: self.fc_log.checkpoint(),
       bc: self.bc.checkpoint(tile_bo, chroma_sampling),
@@ -733,6 +734,7 @@ impl<'a> ContextWriter<'a> {
   }
 
   pub fn rollback(&mut self, checkpoint: &ContextWriterCheckpoint) {
+    let _prof = crate::prof::scope(crate::prof::Stage::CtxSaveRestore);
     self.fc_log.rollback(self.fc, &checkpoint.fc);
     self.bc.rollback(&checkpoint.bc);
     #[cfg(feature = "desync_finder")]

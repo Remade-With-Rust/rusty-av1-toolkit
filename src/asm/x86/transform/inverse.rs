@@ -19,6 +19,7 @@ pub fn inverse_transform_add<T: Pixel>(
   input: &[T::Coeff], output: &mut PlaneRegionMut<'_, T>, eob: u16,
   tx_size: TxSize, tx_type: TxType, bd: usize, cpu: CpuFeatureLevel,
 ) {
+  let _prof = crate::prof::scope(crate::prof::Stage::Reconstruct);
   match T::type_enum() {
     PixelType::U8 => {
       if let Some(func) = INV_TXFM_FNS[cpu.as_index()][tx_size][tx_type] {

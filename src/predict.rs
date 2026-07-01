@@ -209,6 +209,7 @@ impl PredictionMode {
     cpu: CpuFeatureLevel,
   ) {
     assert!(self.is_intra());
+    let _prof = crate::prof::scope(crate::prof::Stage::Predict);
     let &Rect { x: frame_x, y: frame_y, .. } = dst.rect();
     debug_assert!(frame_x >= 0 && frame_y >= 0);
     // x and y are expressed relative to the tile

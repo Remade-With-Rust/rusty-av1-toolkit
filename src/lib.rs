@@ -85,6 +85,8 @@ mod cpu_features;
 mod activity;
 pub(crate) mod asm;
 mod dist;
+#[doc(hidden)]
+pub mod prof;
 mod ec;
 mod partition;
 mod predict;

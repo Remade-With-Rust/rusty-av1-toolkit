@@ -48,6 +48,9 @@ quick_test = []
 desync_finder = ["backtrace"]
 bench = []
 check_asm = []
+# rusty_av1e analyzer spine: opt-in feature-gated stage profiler (src/prof.rs).
+# OFF = release byte-identical; ON = rdtsc stage-cycle buckets + dump()/snapshot().
+profile = []
 capi = ["scan_fmt"]
 tracing = [
   "profiling/profile-with-tracing",

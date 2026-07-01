@@ -1,0 +1,198 @@
+# The entropy house — brick ledger for the coeff rate/entropy path
+
+**Why this path:** the analyzer measured `write_coeffs_lv_map` at **48.6% of total
+encode** (3671 ms / 7546 ms RDO, 1,376,974 calls, speed 6, 640×480×10f, 1 thread),
+all pure Rust. Quantize (12.3%, same 1.38M call count) is its upstream sibling and
+shares data with it. This ledger maps **every brick** — each primitive/function on
+the path — so we can optimize one at a time under the `optimize-codec` discipline:
+*one brick per commit, byte-identical gate (bitstream MD5 + `bench_encode` A/B),
+revert if flat.*
+
+Average cost: 3671 ms / 1.38M calls ≈ **2.66 µs per tx-block call**.
+
+Verification gate for every brick: `stage_breakdown` (per-stage median — the honest
+kernel verdict) + `bench_encode` best-of-N + **byte-identical output** (same encoded
+bytes, e.g. hash the packet stream in the harness) + `cargo test`.
+
+---
+
+## Floor plan (the call tree)
+
+```
+encode_tx_block (encoder.rs:1556-1586)
+├─ quantize()                    [12.3%, upstream sibling — brick Q1..Q3]
+└─ write_coeffs_lv_map (block_unit.rs:1783)   [48.6% — the house]
+   ├─ B1  scan-order gather + cul_level sum      (per-coeff ×2 passes)
+   ├─ B2  get_txb_ctx (block_unit.rs:442)        (per-call, 2-pass neighbour folds)
+   ├─ B3  txb_skip symbol                        (per-call, 1 symbol)
+   │      └─ eob==0 → set_coeff_context, return  (the skip fast path)
+   ├─ B4  levels_buf zero + txb_init_levels (transform_unit.rs:780)
+   │                                             (per-call memset + full-AREA fill)
+   ├─ B5  write_tx_type (transform_unit.rs:530)  (per-luma-block, 1 symbol)
+   ├─ B6  encode_eob (block_unit.rs:1862)        (per-call: eob_pt token + extra bits)
+   │      └─ get_eob_pos_token (transform_unit.rs:808)  (table lookups)
+   ├─ B7  encode_coeffs (block_unit.rs:1917)
+   │      ├─ B7a get_nz_map_contexts (transform_unit.rs:911)   (per-COEFF stencil)
+   │      │      └─ get_nz_map_ctx → get_nz_mag (5 neighbour reads + mins)
+   │      │                        → get_nz_map_ctx_from_stats (3-D table)
+   │      ├─ B7b reverse-scan base-level loop    (per-COEFF: 1×4-ary symbol)
+   │      └─ B7c BR loop for level>2             (per big coeff: get_br_ctx + ≤4 symbols)
+   ├─ B8  encode_coeff_signs (block_unit.rs:1984) (per-nonzero: DC symbol / raw bit
+   │                                              + golomb for level>14)
+   └─ B9  set_coeff_context                       (per-call neighbour-array write)
+
+every `symbol_with_update!` above bottoms out in:
+   └─ F*  ec.rs Writer machinery                  [FOUNDATION — see §Foundation]
+          WriterCounter rate path · CDF adapt · fc_log append (rollback support)
+```
+
+---
+
+## The bricks (numbered, with observed redundancy)
+
+### B1 — scan gather + cul_level (block_unit.rs:1802-1807)
+`coeffs.extend(scan.iter().map(|&i| coeffs_in[i]))` then a **second pass**
+`coeffs.iter().map(abs).sum()`. Two passes over the same data; the gather itself
+re-derives what `quantize` just produced while walking the same scan order.
+- **Lever (cheap):** fuse the sum into the gather (single pass).
+- **Lever (structural, later):** quantize iterates scan positions already — it could
+  emit scan-ordered levels/cul_level as by-products (cross-brick fusion with Q*).
+- Class: eliminate-redundancy. Risk: low → medium (fusion).
+
+### B2 — get_txb_ctx (block_unit.rs:442)
+Derives `txb_skip_ctx` + `dc_sign_ctx` from above/left context rows. Reads the SAME
+two slices **twice** (dc_sign fold, then OR folds). `dc_sign_ctx` is only consumed
+when a nonzero DC gets its sign coded (B8), yet computed on every call including
+eob==0 skips.
+- **Lever:** single fused pass; and/or compute `dc_sign_ctx` lazily.
+- Class: eliminate-redundancy. Risk: low.
+
+### B3 — txb_skip symbol + the eob==0 fast path
+One adaptive symbol; the skip path is already short. Healthy brick — audit only
+after B2 (its ctx feed) is tightened.
+
+### B4 — levels_buf + txb_init_levels (block_unit.rs:1831-1835, transform_unit.rs:780)
+`[0u8; TX_PAD_2D]` zeroed per call, then |coeff|.min(127) filled for the **full
+coded area** (height × width) — even when eob is tiny (common at high QP). Work is
+area-proportional, not eob-proportional. Only the stencil neighbourhood of coded
+positions is ever read (B7a/B7c read levels at scan positions + padded neighbours).
+- **Lever:** zero/fill only rows up to the highest coded row (derivable from eob and
+  scan geometry), or fill from the scan-gathered coeffs (eob-proportional).
+- Class: eliminate-redundancy. Risk: medium (padding reads must stay valid — the
+  stencil reads +1/+2 beyond coded positions; keep the pad rows zeroed).
+
+### B5 — write_tx_type (transform_unit.rs:530)
+Per-luma-block symbol from inter/intra tx-set CDFs. Small. Audit later.
+
+### B6 — encode_eob + get_eob_pos_token
+Table lookups + one multi-symbol + offset bits. Small per call, once per block.
+The 7-way `match` on tx-area picking `eob_flag_cdf{16..1024}` is branchy but cold.
+
+### B7a — get_nz_map_contexts (transform_unit.rs:911) — **the per-coefficient stencil**
+For each of the eob coefficients: padded-index math, `get_nz_mag` (5 neighbour
+reads + 5 min(3,·) + adds), `get_nz_map_ctx_from_stats` (shift/min + 3-D table).
+This is the scalar workhorse; **libaom SIMDs exactly this**
+(`av1_get_nz_map_contexts_sse2/avx2`) — strong precedent that the stencil
+vectorizes (process a column of positions at once; the levels layout is already
+transposed/padded for it).
+- **Lever 1 (eliminate-redundancy):** hoist per-call invariants (bhl, area, tx_class
+  branches) out of the per-coeff closure — check codegen first.
+- **Lever 2 (vectorize-kernel):** SIMD the stencil à la libaom, scalar twin as oracle.
+- Class: both, in order. Risk: low / medium.
+
+### B7b — the reverse-scan base-level loop (block_unit.rs:1939-1960)
+Per coefficient: min(level,3) → one 4-ary `symbol_with_update!`. The loop itself is
+lean; its cost is ~all in the Foundation (per-symbol CDF walk + adapt + log).
+Sequential by construction (context adaptation) — **not** SIMD-able. Optimize via F*.
+
+### B7c — the BR loop (block_unit.rs:1962-1979)
+For each coeff with level>2: `get_br_ctx` (3 neighbour reads) + up to 4 4-ary
+symbols. Data-dependent; bounded. Cost lives in F*.
+
+### B8 — encode_coeff_signs (block_unit.rs:1984)
+Walks ALL scan-ordered coeffs (including zeros — `continue` per zero) to code signs
+of the nonzero ones; golomb (raw bits) for level>14.
+- **Lever:** iterate only nonzeros (they're knowable from the gather in B1);
+  micro — measure first.
+- Class: eliminate-redundancy. Risk: low.
+
+### B9 — set_coeff_context
+Neighbour-array writes (cul_level | dc_sign). Tiny. Leave.
+
+---
+
+## Foundation — the per-symbol machinery (ec.rs)  ⟨AUDITED 2026-07-01⟩
+
+**What one `symbol_with_update!` costs (verified in source, all writers incl. the
+RDO `WriterCounter`):**
+1. `fc.offset(cdf)` — offset math (free).
+2. `CDFContextLog::push` (cdf_context.rs:598) — raw-ptr copy of the CDF row
+   (8 B small / 32 B large partition) + offset tag + deferred-capacity bookkeeping.
+   Already unsafe-optimized upstream.
+3. `symbol → store` — Counter (ec.rs:195): `lr_compute` (2 mults) + CLZ + add.
+4. `update_cdf` (ec.rs:935) — const-generic ≤15-iteration shift-add adapt loop.
+
+**Measured (info-scope audit, 640×480×10f speed 6):**
+- **192,251,661 calls** ≈ 140 symbols per `write_coeffs_lv_map` call.
+- Overhead identity confirmed: EntropyRate 3671→8071 ms with the scope on
+  ≈ 192M × ~23 ns — the audit instrument itself. True pool ≈ **2.0-2.9 s of the
+  3671 ms EntropyRate stage (majority)** at **~13-19 ns/symbol**.
+- `tell_frac`: 1.3M calls, **11.7 ms** — negligible. Cost-table hypothesis: dead.
+
+**Verdict:** the foundation is per-call LEAN. Micro-bricks (branchless update_cdf,
+cheaper push) target ≤20% of the pool ≈ ≤5% total encode — attempt ONE brick (F1),
+measure honestly, revert if flat. The real levers are the B-bricks above it (fewer
+per-call passes) and Q-bricks (12.3% pool). Symbol COUNT is decision-determined —
+cutting it byte-identically is not possible; count reduction = `experimental` land.
+
+---
+
+## Upstream sibling — quantize (quantize/mod.rs:269) [12.3%]
+
+### Q1 — full-area EOB scan (lines 293-306)
+`iscan.iter().zip(coeffs).map(select).max()` over the ENTIRE tx area to find eob.
+Vectorizable select+max; verify codegen, consider early structure.
+
+### Q2 — the main quant loop's serial `level_mode` (lines 318-340)
+`level_mode` feeds each iteration from the previous → **blocks auto-vectorization**
+(the classic pattern from the playbook). Byte-identical restructure candidates:
+compute `level0 = divu_pair(...)` for all positions vectorized (pass 1), then run
+the cheap serial mode/rounding fix-up over level0 (pass 2).
+- Class: eliminate-redundancy (unblock autovec) → vectorize-kernel if needed.
+
+### Q3 — tail zeroing (line 342+)
+Not yet read in full; audit when Q1/Q2 land.
+
+---
+
+## Build order (the scaffolding plan)
+
+Sequenced by (expected win × certainty) / risk, per the playbook — biggest,
+safest, most-informative first; each independently revertible:
+
+| # | Brick | Class | Expected |
+|---|---|---|---|
+| 1 | ~~**F-audit**~~ ✅ done — 192M symbols, ~13-19ns each, pool = majority of EntropyRate but lean per-call | analyzer | (see Foundation §) |
+| 2 | **B4** eob-proportional levels init (scatter coded positions instead of full-area fill) | elim-redundancy | area→eob work cut; big for sparse blocks |
+| 3 | **B1+B2** fused gather/sum + one-pass ctx folds (+ lazy dc_sign) | elim-redundancy | small×1.38M calls |
+| 4 | **B7a** stencil: hoist invariants, then SIMD (libaom precedent) | elim→vectorize | the per-coeff workhorse |
+| 5 | **Q2** unblock quantize autovec (two-pass level_mode) | elim-redundancy | chunk of the 12.3% |
+| 6 | **F1** one foundation micro-brick (branchless update_cdf / push) — revert-if-flat | elim-redundancy | ≤5% total; honest attempt only |
+| 7 | **Q1** EOB scan codegen check | elim-redundancy | small-medium |
+| 8 | B8 nonzero-only sign walk; B5/B6 audit | elim-redundancy | small |
+
+**Not on the table (bitstream-changing, → `experimental` skill):** frozen-CDF rate
+estimation, tx-domain rate (`use_tx_domain_rate`), candidate pruning. Those change
+decisions; this house is built byte-identical.
+
+---
+
+## Ledger (results — append per brick, measured, before/after)
+
+Baseline (640×480×10f, speed 6, QP 100, 1 thread, profile build):
+**bitstream FNV = `688d5eeaee94d95e`** · EntropyRate ≈ 3671 ms · quantize ≈ 898-931 ms.
+Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-3.
+
+| date | brick | change | stage Δ (median) | bench Δ | gate | verdict |
+|---|---|---|---|---|---|---|
+| 07-01 | F-audit | info scope on symbol_with_update + tell_frac (removed after) | n/a | n/a | hash `688d…95e` ✔ | 192M symbols ~13-19ns; tell_frac dead |

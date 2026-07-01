@@ -31,6 +31,7 @@ pub(crate) fn estimate_intra_costs<T: Pixel>(
   temp_plane: &mut Plane<T>, frame: &Frame<T>, bit_depth: usize,
   cpu_feature_level: CpuFeatureLevel,
 ) -> Box<[u32]> {
+  let _prof = crate::prof::scope(crate::prof::Stage::Lookahead);
   let plane = &frame.planes[0];
   let plane_after_prediction = temp_plane;
 

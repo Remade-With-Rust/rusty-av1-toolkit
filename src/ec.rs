@@ -549,6 +549,11 @@ where
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {
+    // F-audit 2026-07-01 (see docs/entropy-bricks.md): an info scope here measured
+    // 192,251,661 calls/10f — the per-symbol pool is the majority of EntropyRate
+    // at ~13-19ns/symbol (already lean). Scope removed: at 192M calls its ~23ns
+    // overhead corrupts every other stage's verdict. Re-add temporarily to verify
+    // foundation bricks.
     #[cfg(feature = "desync_finder")]
     {
       if self.debug {
@@ -794,6 +799,7 @@ where
   ///         This will always be slightly larger than the exact value (e.g., all
   ///          rounding error is in the positive direction).
   fn tell_frac(&mut self) -> u32 {
+    // F-audit: 1,315,872 calls / 11.7 ms — negligible; no cost table needed.
     Self::frac_compute(self.tell(), self.rng as u32) + self.fake_bits_frac
   }
   /// Save current point in coding/recording to a checkpoint that can

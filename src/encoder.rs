@@ -1670,6 +1670,7 @@ pub fn motion_compensate<T: Pixel>(
   mvs: [MotionVector; 2], bsize: BlockSize, tile_bo: TileBlockOffset,
   luma_only: bool,
 ) {
+  let _prof = crate::prof::scope(crate::prof::Stage::Predict);
   debug_assert!(!luma_mode.is_intra());
 
   let PlaneConfig { xdec: u_xdec, ydec: u_ydec, .. } = ts.input.planes[1].cfg;
@@ -3264,20 +3265,24 @@ fn encode_tile_group<T: Pixel>(
    * frame rather than the frame itself so that deblocking is
    * available inside RDO when needed */
   /* TODO: Don't apply if lossless */
-  let levels = fs.apply_tile_state_mut(|ts| {
-    let rec = &mut ts.rec;
-    deblock_filter_optimize(
-      fi,
-      &rec.as_const(),
-      &ts.input.as_tile(),
-      &blocks.as_tile_blocks(),
-      fi.width,
-      fi.height,
-    )
-  });
+  let levels = {
+    let _prof = crate::prof::scope(crate::prof::Stage::Deblock);
+    fs.apply_tile_state_mut(|ts| {
+      let rec = &mut ts.rec;
+      deblock_filter_optimize(
+        fi,
+        &rec.as_const(),
+        &ts.input.as_tile(),
+        &blocks.as_tile_blocks(),
+        fi.width,
+        fi.height,
+      )
+    })
+  };
   fs.deblock.levels = levels;
 
   if fs.deblock.levels[0] != 0 || fs.deblock.levels[1] != 0 {
+    let _prof = crate::prof::scope(crate::prof::Stage::Deblock);
     fs.apply_tile_state_mut(|ts| {
       let rec = &mut ts.rec;
       deblock_filter_frame(
@@ -3299,20 +3304,25 @@ fn encode_tile_group<T: Pixel>(
 
     /* TODO: Don't apply if lossless */
     if fi.sequence.enable_cdef {
+      let _prof = crate::prof::scope(crate::prof::Stage::Cdef);
       fs.apply_tile_state_mut(|ts| {
         let rec = &mut ts.rec;
         cdef_filter_tile(fi, &deblocked_frame, &blocks.as_tile_blocks(), rec);
       });
     }
     /* TODO: Don't apply if lossless */
-    fs.restoration.lrf_filter_frame(
-      Arc::get_mut(&mut fs.rec).unwrap(),
-      &deblocked_frame,
-      fi,
-    );
+    {
+      let _prof = crate::prof::scope(crate::prof::Stage::LoopRestoration);
+      fs.restoration.lrf_filter_frame(
+        Arc::get_mut(&mut fs.rec).unwrap(),
+        &deblocked_frame,
+        fi,
+      );
+    }
   } else {
     /* TODO: Don't apply if lossless */
     if fi.sequence.enable_cdef {
+      let _prof = crate::prof::scope(crate::prof::Stage::Cdef);
       let deblocked_frame = (*fs.rec).clone();
       fs.apply_tile_state_mut(|ts| {
         let rec = &mut ts.rec;
@@ -3470,6 +3480,7 @@ fn encode_tile<'a, T: Pixel>(
   fc: &'a mut CDFContext, blocks: &'a mut TileBlocksMut<'a>,
   inter_cfg: &InterConfig,
 ) -> (Vec<u8>, EncoderStats) {
+  let _prof = crate::prof::scope(crate::prof::Stage::PartitionRdo);
   let mut enc_stats = EncoderStats::default();
   let mut w = WriterEncoder::new();
   let planes =

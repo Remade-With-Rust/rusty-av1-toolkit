@@ -1787,6 +1787,7 @@ impl ContextWriter<'_> {
     use_reduced_tx_set: bool, frame_clipped_txw: usize,
     frame_clipped_txh: usize,
   ) -> bool {
+    let _prof = crate::prof::scope(crate::prof::Stage::EntropyRate);
     debug_assert!(frame_clipped_txw != 0);
     debug_assert!(frame_clipped_txh != 0);
 
