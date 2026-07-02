@@ -222,3 +222,27 @@ Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-
 | 07-01 | **GLUE decomposition** | info scopes on the 24.7% RDO-glue residue | loop-filter RDO search **8.3%** (biggest named); compute_distortion 2.6%; compute_rd_cost 0.1%; CtxSaveRestore ~1.4% (already a child); ~16% still diffuse | n/a | hash ✔ | commit f70b7f63. An agent's code-size survey proposed checkpoint-caching (est 20-30% of glue) + distortion-scale (10-15%) as the top bricks — BOTH REFUTED by the scopes (1.4% / 2.6%). rav1e's glue is TIGHT (stack ArrayVecs, cheap checkpoints) — the h264 glue-win patterns (frame clones, unused-feature work) don't exist here |
 | 07-01 | LF-alloc | scope rec_subset.scratch_copy + cdef_work.clone + lrf_work Plane::new×3 (800 calls) | setup+alloc = **2.9-4.0 ms = 0.1%** of the 383 ms loop-filter RDO | n/a | hash ✔ | **NOT A BRICK** — allocs are a red herring; the 8.3% is inherent CDEF/LRF search |
 | 07-01 | LF-rate-hoist | cache the LRF `count_lrf_switchable` rate (constant across cdef_index, doesn't affect argmin) instead of re-summing 1<<cdef_bits× per SB | loop-filter stage FLAT: A 339/341/387 vs B 352/345/330 (overlapping) | n/a | hash ✔ · 547/547 ✔ | **REVERTED** — real redundancy (removed 7/8 of the calls) but count_lrf_switchable is below the ~5% noise floor. Loop-filter RDO = inherent search; no byte-identical brick. Real lever is algorithmic (fewer trials via speed preset = BD-rate, out of scope) |
+
+## Definitive whole-encode result (2026-07-01)
+
+The one measurement that gives a single defensible number: the real `rav1e` CLI binary
+at **opt-entropy HEAD (885a2887)** vs **stock rav1e (564ae3b0** = merge-base with
+xiph/master = local `master`), built with identical flags, encoding the same clip,
+interleaved to cancel thermal drift.
+
+- Clip: 640×480 × 60f `testsrc2` (deterministic). Args: `--speed 6 --quantizer 100
+  --tiles 1 --threads 1` (single-thread single-tile isolates the serial per-block path
+  the bricks optimize; lowest noise).
+- 7 interleaved rounds (stock, opt), median: **stock 7.588 s → opt 6.911 s = 1.098× =
+  ~9.8% faster** (opt takes 8.9% less wall-clock). Tight distribution 1.072–1.117×.
+- **Output BYTE-IDENTICAL**: both SHA256 `e6c294bb…6ce2d`, 262 180 B. Pure speed win —
+  same bitstream, size, quality — and an independent re-validation that B7a / B7a-SIMD /
+  Q2 stay byte-identical in the *default CLI config*, not just the profiling harness.
+
+**Honest reconciliation:** the earlier "~16%" was a *sum of per-stage / per-brick
+deltas on the synthetic harness clip*. The true **whole-encode** figure on a real CLI
+encode is **~10%** — the sum dilutes into one number because whole-encode also runs ME,
+transforms, prediction and I/O that the bricks never touch, and `testsrc2` has a
+different coefficient density than the harness clip. Content-dependent: denser /
+higher-bitrate content puts more of the encode in the entropy path → larger speedup.
+Repro: worktree `rusty_av1e_stock` @564ae3b0 + `scratchpad/ab.sh`.
