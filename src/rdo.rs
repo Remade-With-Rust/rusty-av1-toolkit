@@ -255,6 +255,7 @@ fn compute_distortion<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &TileStateMut<'_, T>, bsize: BlockSize,
   is_chroma_block: bool, tile_bo: TileBlockOffset, luma_only: bool,
 ) -> ScaledDistortion {
+  let _prof = crate::prof::scope(crate::prof::Stage::ComputeDistortion);
   let area = Area::BlockStartingAt { bo: tile_bo.0 };
   let input_region = ts.input_tile.planes[0].subregion(area);
   let rec_region = ts.rec.planes[0].subregion(area);
@@ -351,6 +352,7 @@ fn compute_tx_distortion<T: Pixel>(
   is_chroma_block: bool, tile_bo: TileBlockOffset, tx_dist: ScaledDistortion,
   skip: bool, luma_only: bool,
 ) -> ScaledDistortion {
+  let _prof = crate::prof::scope(crate::prof::Stage::ComputeDistortion);
   assert!(fi.config.tune == Tune::Psnr);
   let area = Area::BlockStartingAt { bo: tile_bo.0 };
   let input_region = ts.input_tile.planes[0].subregion(area);
@@ -718,6 +720,7 @@ impl std::ops::AddAssign for ScaledDistortion {
 pub fn compute_rd_cost<T: Pixel>(
   fi: &FrameInvariants<T>, rate: u32, distortion: ScaledDistortion,
 ) -> f64 {
+  let _prof = crate::prof::scope(crate::prof::Stage::ComputeRdCost);
   let rate_in_bits = (rate as f64) / ((1 << OD_BITRES) as f64);
   fi.lambda.mul_add(rate_in_bits, distortion.0 as f64)
 }
@@ -2106,6 +2109,7 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
   ts: &mut TileStateMut<'_, T>, cw: &mut ContextWriter, w: &mut W,
   deblock_p: bool,
 ) {
+  let _prof = crate::prof::scope(crate::prof::Stage::LoopFilterRdo);
   let planes = if fi.sequence.chroma_sampling == ChromaSampling::Cs400 {
     1
   } else {

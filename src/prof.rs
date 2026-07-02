@@ -77,6 +77,11 @@ stages! {
   NzMapCtx         => "get_nz_map_contexts [info]",
   QuantEobScan     => "quantize: eob scan [info]",
   QuantMainLoop    => "quantize: main loop [info]",
+  // glue-decomposition info scopes (nested inside PartitionRdo, never summed):
+  LoopFilterRdo    => "loop-filter RDO search [info]",
+  ComputeDistortion => "compute_distortion [info]",
+  ComputeRdCost    => "compute_rd_cost [info]",
+  LfRdoSetup       => "  lf-rdo setup+alloc [info]",
 }
 
 impl Stage {
@@ -91,6 +96,10 @@ impl Stage {
         | Stage::NzMapCtx
         | Stage::QuantEobScan
         | Stage::QuantMainLoop
+        | Stage::LoopFilterRdo
+        | Stage::ComputeDistortion
+        | Stage::ComputeRdCost
+        | Stage::LfRdoSetup
     )
   }
 
