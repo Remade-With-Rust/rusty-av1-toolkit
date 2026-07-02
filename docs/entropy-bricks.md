@@ -274,3 +274,41 @@ Validation (2026-07-02):
   each other **and** SHA256-equal to the recorded definitive artifact
   (`e6c294bb…6ce2d`, 262 180 B) — normal mode reproduces the stock
   bitstream exactly.
+- **QP density sweep** (2026-07-02, same harness, 9/5/5 interleaved rounds):
+  racecar over normal = **1.126× @ QP 60** (dense, 382 KB), **1.099× @
+  QP 100** (262 KB — an independent reproduction of the definitive 1.098×),
+  **1.058× @ QP 160** (sparse, 89 KB); byte-identical at every QP. Confirms
+  the ledgered content-dependence: denser coefficients → entropy path is a
+  bigger share → bigger racecar win. When a single quick A/B reads "only
+  8%", it's the bottom of this box's ±5% thermal band — the medians hold
+  9.8-10% at QP 100.
+
+## tx-domain rate probe (2026-07-02) — measured, NOT kept
+
+The `use_tx_domain_rate` lever flagged in the original RDO decomposition
+(#1-ROI stage: coeff entropy/rate = 48.5% of RDO), probed via a
+`--features serialize` binary + config toml pair identical except the flag
+(tune Psnr so `tx_domain_distortion` resolves true; 5 interleaved rounds,
+QP 100 testsrc2 60f):
+
+- **Speed: 6.493 → 4.020 s = 1.62× faster (−38% whole encode)** — the prize
+  for skipping real token coding (`write_coeffs_lv_map` behind
+  `needs_coeff_rate()`, encoder.rs:1565) during candidate RDO.
+- **Cost: catastrophic. +48.4% bitstream (285 041 → 423 101 B) AND −1.13 dB
+  PSNR (45.05 → 43.92)** — strictly worse on both axes, massive BD-rate
+  loss. `estimate_rate` (rdo.rs:127) interpolates a
+  `[q_bin][tx_size][dist_bin]` table from tx-domain distortion alone — no
+  coefficient positions/context — so RDO systematically picks bad
+  candidates. This is why stock rav1e ships it `false` at every speed 0-10.
+- Verdict: **not a speed brick and not close to free** — a ~1.6× speed
+  lever gated behind fixing the estimator (retrain `RDO_RATE_TABLE`, or a
+  hybrid: est-rate to prune candidates, real rate for finalists). That is
+  `experimental`-skill territory (BD-rate corpus gate), out of scope for
+  the byte-identical house.
+- **Latent upstream bug found**: `tx_domain_rate=true` +
+  `tx_domain_distortion=false` (the Psychovisual-resolved combo) panics —
+  `rdo_type` becomes `TxDistEstRate` on `use_tx_domain_rate` alone
+  (rdo.rs:974) but `temporal_rdo()` only checks `tx_domain_distortion`
+  (encoder.rs config), so `distortion_scale` hits
+  `assert!(bsize <= BLOCK_8X8)` (rdo.rs:454). Unreachable from the CLI
+  (no preset enables tx_domain_rate); reachable via API/config-file.
