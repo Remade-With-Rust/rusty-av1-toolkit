@@ -255,6 +255,18 @@ pub struct CliOptions {
   /// Outputs a Y4M file containing the output from the decoder
   #[clap(long, short, value_parser, help_heading = "DEBUGGING")]
   pub reconstruction: Option<PathBuf>,
+  /// Kernel mode: on = optimized "racecar" kernels (default); off = the
+  /// original stock rav1e code paths. Output is byte-identical either way —
+  /// the switch changes speed only (see docs/entropy-bricks.md)
+  #[clap(
+    long,
+    value_name = "on|off",
+    action = clap::ArgAction::Set,
+    value_parser = clap::builder::BoolishValueParser::new(),
+    default_value = "on",
+    help_heading = "DEBUGGING"
+  )]
+  pub racecar: bool,
 
   #[clap(subcommand)]
   pub command: Option<Commands>,
@@ -402,6 +414,9 @@ fn build_speed_long_help() -> Option<&'static str> {
 /// otherwise bad things will happen.
 pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
   let matches = CliOptions::parse();
+
+  // Latch the kernel mode before any encoder code can read it.
+  rav1e::racecar::set(matches.racecar);
 
   #[cfg(feature = "serialize")]
   let mut save_config_path = None;

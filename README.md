@@ -79,6 +79,11 @@ rounds): median **7.588 s → 6.911 s = 1.098× = ~9.8% faster**, tight 1.072–
 byte-identical** (262 180 B, same SHA256). Content-dependent — denser content puts more of
 the encode in the entropy path, so the speedup grows.
 
+**Single-binary A/B:** `--racecar <on|off>` (default on) switches at runtime between the
+kept bricks and the resurrected stock code paths — byte-identical either way, ~8-10%
+apart in speed. `RAV1E_RACECAR=0` does the same for library/test builds. See "The racecar
+switch" in [docs/entropy-bricks.md](docs/entropy-bricks.md).
+
 Reverted, ledgered *do-not-retry*: **B4** (levels scatter — already autovec'd), **F1**
 (update_cdf split-loop — LLVM already emits cmov), **F2** (fc_log dedup — a random side-table
 load costs more than the streaming copy it saved, +6-7%), **Q2-twopass** (division-hoist,

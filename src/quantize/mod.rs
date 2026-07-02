@@ -317,30 +317,59 @@ impl QuantizationContext {
     // To that end, we want to bias more toward rounding to zero for
     // that tail of zeroes and ones than we do for the larger coefficients.
     let _q2 = crate::prof::scope(crate::prof::Stage::QuantMainLoop);
-    // Brick Q2 (docs/entropy-bricks.md): the loop is inherently serial
-    // (`level_mode` is loop-carried) so it can't vectorize, but the two
-    // data-dependent branches (offset select + level_mode update) mispredict
-    // on coefficient magnitude. Both are rewritten branchless — byte-identical
-    // (see the case analysis in the comments) — to remove the mispredict tax.
-    let mut level_mode: u32 = 1;
-    let ac_quant = self.ac_quant.get() as u32;
-    let ac_doffset = self.ac_offset1 - self.ac_offset0;
-    for &pos in scan.iter().take(usize::from(eob)).skip(1) {
-      let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
-      let abs_coeff = coeff.unsigned_abs();
+    if crate::racecar::on() {
+      // Brick Q2 (docs/entropy-bricks.md): the loop is inherently serial
+      // (`level_mode` is loop-carried) so it can't vectorize, but the two
+      // data-dependent branches (offset select + level_mode update) mispredict
+      // on coefficient magnitude. Both are rewritten branchless — byte-identical
+      // (see the case analysis in the comments) — to remove the mispredict tax.
+      let mut level_mode: u32 = 1;
+      let ac_quant = self.ac_quant.get() as u32;
+      let ac_doffset = self.ac_offset1 - self.ac_offset0;
+      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
+        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+        let abs_coeff = coeff.unsigned_abs();
 
-      let level0 = divu_pair(abs_coeff, self.ac_mul_add);
-      // offset1 iff level0 > 1 - level_mode, else offset0 (ac_offset1 >= offset0).
-      let offset =
-        self.ac_offset0 + (level0 > 1 - level_mode) as u32 * ac_doffset;
+        let level0 = divu_pair(abs_coeff, self.ac_mul_add);
+        // offset1 iff level0 > 1 - level_mode, else offset0 (ac_offset1 >= offset0).
+        let offset =
+          self.ac_offset0 + (level0 > 1 - level_mode) as u32 * ac_doffset;
 
-      let abs_qcoeff: u32 =
-        level0 + (abs_coeff + offset >= (level0 + 1) * ac_quant) as u32;
-      // level_mode := 0 if abs_qcoeff==0, 1 if abs_qcoeff>1, else unchanged.
-      level_mode =
-        if abs_qcoeff == 1 { level_mode } else { (abs_qcoeff > 1) as u32 };
+        let abs_qcoeff: u32 =
+          level0 + (abs_coeff + offset >= (level0 + 1) * ac_quant) as u32;
+        // level_mode := 0 if abs_qcoeff==0, 1 if abs_qcoeff>1, else unchanged.
+        level_mode =
+          if abs_qcoeff == 1 { level_mode } else { (abs_qcoeff > 1) as u32 };
 
-      qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+      }
+    } else {
+      // Normal mode (--racecar off): the stock rav1e branchy loop, verbatim
+      // from pre-Q2 (560e8e52~1). Byte-identical to the branchless path —
+      // this exists only for single-binary A/B.
+      let mut level_mode = 1;
+      let ac_quant = self.ac_quant.get() as u32;
+      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
+        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+        let abs_coeff = coeff.unsigned_abs();
+
+        let level0 = divu_pair(abs_coeff, self.ac_mul_add);
+        let offset = if level0 > 1 - level_mode {
+          self.ac_offset1
+        } else {
+          self.ac_offset0
+        };
+
+        let abs_qcoeff: u32 =
+          level0 + (abs_coeff + offset >= (level0 + 1) * ac_quant) as u32;
+        if level_mode != 0 && abs_qcoeff == 0 {
+          level_mode = 0;
+        } else if abs_qcoeff > 1 {
+          level_mode = 1;
+        }
+
+        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+      }
     }
 
     // Rather than zeroing the tail in scan order, assume that qcoeffs is

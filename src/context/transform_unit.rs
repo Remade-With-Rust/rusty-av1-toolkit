@@ -844,8 +844,8 @@ impl ContextWriter<'_> {
   }
 
   // Scalar oracle for `nz_map_area_kernel` (brick B7a) — kept in-tree per the
-  // optimize-codec discipline; exercised by nz_map_kernel_test.
-  #[allow(dead_code)]
+  // optimize-codec discipline; exercised by nz_map_kernel_test and the
+  // normal (--racecar off) path of `get_nz_map_contexts`.
   fn get_nz_map_ctx_from_stats(
     stats: usize,
     coeff_idx: usize, // raster order
@@ -886,8 +886,8 @@ impl ContextWriter<'_> {
   }
 
   // Scalar oracle for `nz_map_area_kernel` (brick B7a) — kept in-tree per the
-  // optimize-codec discipline; exercised by nz_map_kernel_test.
-  #[allow(dead_code)]
+  // optimize-codec discipline; exercised by nz_map_kernel_test and the
+  // normal (--racecar off) path of `get_nz_map_contexts`.
   fn get_nz_map_ctx(
     levels: &[u8], coeff_idx: usize, bhl: usize, area: usize, scan_idx: usize,
     is_eob: bool, tx_size: TxSize, tx_class: TxClass,
@@ -1215,6 +1215,28 @@ impl ContextWriter<'_> {
 
     let scan = &scan[..usize::from(eob)];
     let coeffs = &mut coeff_contexts_no_scan[..usize::from(eob)];
+
+    // Normal mode (--racecar off): the stock rav1e per-scan-position
+    // stencil, verbatim from pre-B7a (434d9202~1). Byte-identical to the
+    // racecar path below — this exists only for single-binary A/B.
+    if !crate::racecar::on() {
+      for (i, (coeff, pos)) in
+        coeffs.iter_mut().zip(scan.iter().copied()).enumerate()
+      {
+        coeff.write(Self::get_nz_map_ctx(
+          levels,
+          pos as usize,
+          bhl,
+          area,
+          i,
+          i == usize::from(eob) - 1,
+          tx_size,
+          tx_class,
+        ) as i8);
+      }
+      // SAFETY: every element has been initialized
+      return unsafe { slice_assume_init_mut(coeffs) };
+    }
 
     // Brick B7a: the area kernel's vectorized column loops beat the scalar
     // per-scan-position stencil at EVERY measured density (cutoff sweep

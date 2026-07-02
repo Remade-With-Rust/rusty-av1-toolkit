@@ -246,3 +246,31 @@ transforms, prediction and I/O that the bricks never touch, and `testsrc2` has a
 different coefficient density than the harness clip. Content-dependent: denser /
 higher-bitrate content puts more of the encode in the entropy path → larger speedup.
 Repro: worktree `rusty_av1e_stock` @564ae3b0 + `scratchpad/ab.sh`.
+
+## The racecar switch (2026-07-02)
+
+`--racecar <on|off>` (default **on**) on the CLI: one binary, both worlds.
+`on` = the kept bricks (B7a area kernel + AVX2 twin, Q2 branchless); `off` =
+the original stock rav1e code paths, resurrected verbatim from history (nz-map
+per-scan-position stencil from `434d9202~1`, branchy quantize loop from
+`560e8e52~1`) behind `racecar::on()` (`src/racecar.rs` — OnceLock latch:
+CLI flag > `RAV1E_RACECAR` env (`0`/`off` disables) > default on). **Not a
+brick** — single-binary A/B / demo infrastructure; the racecar path is
+bit-for-bit the pre-switch code, and the switch itself costs one latched
+atomic load per `get_nz_map_contexts`/`quantize` call (sub-noise).
+
+Validation (2026-07-02):
+
+- 547/547 lib tests.
+- `stage_breakdown` (10f gate config) FNV `688d5eeaee94d95e` in **both**
+  modes = the recorded campaign baseline. Stage medians with racecar off:
+  `get_nz_map_contexts` 102→713 ms, quantize main loop 446→670 ms; untouched
+  stages flat — the toggle bites exactly where the bricks live.
+- Single-binary CLI A/B (same clip + args as the definitive A/B above; clip
+  regenerated with `ffmpeg testsrc2` and bit-identical; 7 interleaved
+  rounds): median **on 7.099 s vs off 7.661 s = 1.079×** (per-round
+  1.055–1.115) — reproduces the two-binary stock-vs-opt result (1.098×,
+  1.072–1.117) within the box's thermal noise. Outputs byte-identical to
+  each other **and** SHA256-equal to the recorded definitive artifact
+  (`e6c294bb…6ce2d`, 262 180 B) — normal mode reproduces the stock
+  bitstream exactly.

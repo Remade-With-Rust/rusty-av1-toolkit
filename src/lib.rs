@@ -87,6 +87,8 @@ pub(crate) mod asm;
 mod dist;
 #[doc(hidden)]
 pub mod prof;
+#[doc(hidden)]
+pub mod racecar;
 mod ec;
 mod partition;
 mod predict;
