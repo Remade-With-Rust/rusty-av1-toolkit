@@ -136,6 +136,10 @@ mod obu;
 mod pal;
 mod picture;
 mod pool;
+/// analyzer spine: feature-gated stage profiler (byte-identical when `profile` off).
+/// `pub` so the `dav1d` CLI can call `reset()`/`dump()` around the decode loop.
+#[doc(hidden)]
+pub mod prof;
 mod qm;
 mod recon;
 mod refmvs;

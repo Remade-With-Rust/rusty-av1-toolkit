@@ -520,6 +520,8 @@ fn decode_coefs<BD: BitDepth>(
     txtp: &mut TxfmType,
     res_ctx: &mut u8,
 ) -> c_int {
+    // analyzer: coeff decode is the pure-Rust entropy leaf (nested in recon_b_*).
+    let _prof = crate::prof::scope(crate::prof::Stage::CoeffDecode);
     let dc_sign_ctx;
     let dc_sign;
     let mut dc_dq;
@@ -2145,6 +2147,7 @@ pub(crate) fn rav1d_recon_b_intra<BD: BitDepth>(
     b: &Av1Block,
     intra: &Av1BlockIntra,
 ) {
+    let _prof = crate::prof::scope(crate::prof::Stage::ReconIntra);
     let bd = BD::from_c(f.bitdepth_max);
     let cur_data = &f.cur.data.as_ref().unwrap().data;
     let ts = &f.ts[t.ts];
@@ -2822,6 +2825,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
     b: &Av1Block,
     inter: &Av1BlockInter,
 ) -> Result<(), ()> {
+    let _prof = crate::prof::scope(crate::prof::Stage::ReconInter);
     let bd = BD::from_c(f.bitdepth_max);
     let cur_data = &f.cur.data.as_ref().unwrap().data;
 
@@ -3836,10 +3840,14 @@ pub(crate) fn rav1d_filter_sbrow<BD: BitDepth>(
     t: &mut Rav1dTaskContext,
     sby: c_int,
 ) {
-    rav1d_filter_sbrow_deblock_cols::<BD>(c, f, t, sby);
-    rav1d_filter_sbrow_deblock_rows::<BD>(c, f, t, sby);
+    {
+        let _prof = crate::prof::scope(crate::prof::Stage::Deblock);
+        rav1d_filter_sbrow_deblock_cols::<BD>(c, f, t, sby);
+        rav1d_filter_sbrow_deblock_rows::<BD>(c, f, t, sby);
+    }
     let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
     if seq_hdr.cdef != 0 {
+        let _prof = crate::prof::scope(crate::prof::Stage::Cdef);
         rav1d_filter_sbrow_cdef::<BD>(c, f, t, sby);
     }
     let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
@@ -3847,6 +3855,7 @@ pub(crate) fn rav1d_filter_sbrow<BD: BitDepth>(
         rav1d_filter_sbrow_resize::<BD>(c, f, t, sby);
     }
     if !f.lf.restore_planes.is_empty() {
+        let _prof = crate::prof::scope(crate::prof::Stage::LoopRestoration);
         rav1d_filter_sbrow_lr::<BD>(c, f, t, sby);
     }
 }

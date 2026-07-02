@@ -4664,6 +4664,7 @@ pub(crate) fn rav1d_decode_frame_init_cdf(
 }
 
 fn rav1d_decode_frame_main(c: &Rav1dContext, f: &mut Rav1dFrameData) -> Rav1dResult {
+    let _prof = crate::prof::scope(crate::prof::Stage::Total);
     assert!(c.tc.len() == 1);
 
     let Rav1dContextTaskType::Single(t) = &c.tc[0].task else {
@@ -4708,6 +4709,7 @@ fn rav1d_decode_frame_main(c: &Rav1dContext, f: &mut Rav1dFrameData) -> Rav1dRes
             }
             for col in 0..cols {
                 t.ts = tile_row * cols + col;
+                let _prof = crate::prof::scope(crate::prof::Stage::TileSbrow);
                 rav1d_decode_tile_sbrow(c, &mut t, f).map_err(|()| Rav1dError::InvalidArgument)?;
             }
             if f.frame_hdr().frame_type.is_inter_or_switch() {
@@ -4718,7 +4720,10 @@ fn rav1d_decode_frame_main(c: &Rav1dContext, f: &mut Rav1dFrameData) -> Rav1dRes
             }
 
             // loopfilter + cdef + restoration
-            (f.bd_fn().filter_sbrow)(c, f, &mut t, sby);
+            {
+                let _prof = crate::prof::scope(crate::prof::Stage::FilterSbrow);
+                (f.bd_fn().filter_sbrow)(c, f, &mut t, sby);
+            }
         }
     }
 

@@ -467,6 +467,9 @@ unsafe fn main_0(argc: c_int, argv: *const *mut c_char) -> c_int {
         i_fps = cli_settings.realtime_fps;
         nspf = (1000000000.0f64 / cli_settings.realtime_fps) as u64;
     }
+    // analyzer spine: arm the stage profiler at decode start (no-op unless the
+    // `profile` feature is on). Dumped after the drain loop below.
+    rav1d::prof::reset();
     tfirst = get_time_nanos();
     loop {
         memset(
@@ -605,6 +608,8 @@ unsafe fn main_0(argc: c_int, argv: *const *mut c_char) -> c_int {
     if !frametimes.is_null() {
         fclose(frametimes);
     }
+    // analyzer spine: emit the per-stage decode breakdown (no-op unless `profile`).
+    rav1d::prof::dump("decode (single-thread)");
     input_close(in_0);
     if !out.is_null() {
         if cli_settings.quiet == 0 && istty != 0 {

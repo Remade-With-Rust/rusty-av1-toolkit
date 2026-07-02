@@ -32,6 +32,8 @@ asm_arm64_dotprod = ["rav1d/asm_arm64_dotprod"]
 asm_arm64_i8mm = ["rav1d/asm_arm64_i8mm"]
 bitdepth_8 = ["rav1d/bitdepth_8"]
 bitdepth_16 = ["rav1d/bitdepth_16"]
+# analyzer spine: forwards to the lib profiler; the CLI resets/dumps around decode.
+profile = ["rav1d/profile"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

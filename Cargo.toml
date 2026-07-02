@@ -43,6 +43,9 @@ asm_arm64_i8mm = ["asm"]
 asm_arm64_sve2 = ["asm"]
 bitdepth_8 = []
 bitdepth_16 = []
+# analyzer spine: feature-gated stage profiler (src/prof.rs). OFF = byte-identical
+# decode (md5 unchanged); ON times rdtsc cycle buckets per decode stage.
+profile = []
 
 [profile.dev]
 panic = "abort"
