@@ -867,7 +867,10 @@ fn decode_coefs<BD: BitDepth>(
         //
         // The value of `end` is known statically to not exceed the size of `levels`,
         // so there's also no bounds check.
-        levels[..end].fill(0);
+        {
+            let _prof = crate::prof::scope(crate::prof::Stage::CoefLevelsFill);
+            levels[..end].fill(0);
+        }
 
         let mut rc;
         let mut x;
@@ -971,6 +974,11 @@ fn decode_coefs<BD: BitDepth>(
             // At this point, we know that `get_lo_ctx` can elide the bounds check on `level`
             // because it is statically known that `level` has at least 65 elements.
             let level = &mut levels[level_off..];
+            // NOTE (analyzer, 07-01): a paired-scope differential measured get_lo_ctx
+            // at ~22 ms / 45M calls (~0.5 ns) — essentially free. It is NOT a brick;
+            // the token loop cost is the serial asm MSAC reads. Scope removed (45M
+            // calls polluted every stage); re-add the CoefLoCtx/CoefScopeRef pair only
+            // for a targeted audit.
             let lo_ctx = get_lo_ctx(level, tx_class, &mut mag, lo_ctx_offsets, x, y, stride);
             if tx_class == TxClass::TwoD {
                 y |= x;
@@ -1069,6 +1077,7 @@ fn decode_coefs<BD: BitDepth>(
     }
 
     if eob != 0 {
+        let _prof = crate::prof::scope(crate::prof::Stage::CoefClass);
         let cf = &mut cf;
         (rc, dc_tok) = match tx_class {
             TxClass::TwoD => decode_coefs_class::<{ TxClass::TwoD as _ }, BD>(
@@ -1210,6 +1219,7 @@ fn decode_coefs<BD: BitDepth>(
             ac = if rc != 0 { Some(Ac::NoQm) } else { None };
         }
     }
+    let _prof_dq = crate::prof::scope(crate::prof::Stage::CoefDequant);
     match ac {
         Some(Ac::Qm(qm_tbl)) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;

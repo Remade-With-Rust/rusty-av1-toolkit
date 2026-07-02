@@ -63,6 +63,13 @@ stages! {
   Deblock          => "deblock (asm) [info]",
   Cdef             => "cdef (asm) [info]",
   LoopRestoration  => "loop restoration (asm) [info]",
+  // --- decode_coefs internal audit (nested inside CoeffDecode) ---
+  CoefClass        => "coef: token loop (class+fill) [info]",
+  CoefLevelsFill   => "coef:   levels memset [info]",
+  CoefDequant      => "coef: dequant+sign loop [info]",
+  // per-coefficient differential: true get_lo_ctx = CoefLoCtx − CoefScopeRef
+  CoefLoCtx        => "coef:   get_lo_ctx (raw) [info]",
+  CoefScopeRef     => "coef:   scope-overhead ref [info]",
 }
 
 impl Stage {
@@ -76,6 +83,11 @@ impl Stage {
         | Stage::Deblock
         | Stage::Cdef
         | Stage::LoopRestoration
+        | Stage::CoefClass
+        | Stage::CoefLevelsFill
+        | Stage::CoefDequant
+        | Stage::CoefLoCtx
+        | Stage::CoefScopeRef
     )
   }
 
