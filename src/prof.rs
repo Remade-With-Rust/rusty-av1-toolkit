@@ -176,6 +176,17 @@ mod imp {
     Guard { idx: stage.idx(), start: rdtsc() }
   }
 
+  /// Free-form audit counters (e.g. the F2 dedup ceiling probe). Printed by
+  /// `dump()` when nonzero; reset with the stage buckets.
+  pub static EXTRA: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+  pub const EXTRA_DUP: usize = 0; // pushes the F2 dedup would skip
+  pub const EXTRA_TOTAL: usize = 1; // all log pushes
+
+  #[inline(always)]
+  pub fn bump(idx: usize) {
+    EXTRA[idx].fetch_add(1, Ordering::Relaxed);
+  }
+
   /// Clear all buckets and (re)start the wall/cycle calibration clock.
   pub fn reset() {
     for b in CYCLES.iter() {
@@ -183,6 +194,9 @@ mod imp {
     }
     for c in CALLS.iter() {
       c.store(0, Ordering::Relaxed);
+    }
+    for e in EXTRA.iter() {
+      e.store(0, Ordering::Relaxed);
     }
     *ANCHOR.lock().unwrap() = Some((Instant::now(), rdtsc()));
   }
@@ -272,6 +286,17 @@ mod imp {
         eprintln!("  {:<26} {:>10.3} {:>7.1}% {:>12}", s.name(), ms, pct(*ms, total_ms), calls);
       }
     }
+    // Audit counters (F2 ceiling probe etc.)
+    let dup = EXTRA[EXTRA_DUP].load(Ordering::Relaxed);
+    let tot = EXTRA[EXTRA_TOTAL].load(Ordering::Relaxed);
+    if tot > 0 {
+      eprintln!(
+        "\n  -- probe counters: fc_log pushes {} | dedup-skippable {} ({:.1}%)",
+        tot,
+        dup,
+        100.0 * dup as f64 / tot as f64
+      );
+    }
     eprintln!(
       "  (top residue = Total − Σ top-level; RDO glue = PartitionRdo − Σ children)\n"
     );
@@ -287,6 +312,12 @@ mod noop {
 
   /// Zero-sized, no `Drop` — the optimizer removes it entirely.
   pub struct Guard;
+
+  pub const EXTRA_DUP: usize = 0;
+  pub const EXTRA_TOTAL: usize = 1;
+
+  #[inline(always)]
+  pub fn bump(_idx: usize) {}
 
   #[inline(always)]
   pub fn scope(_stage: Stage) -> Guard {

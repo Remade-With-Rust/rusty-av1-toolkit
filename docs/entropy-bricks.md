@@ -177,7 +177,7 @@ safest, most-informative first; each independently revertible:
 | 3 | **F1** update_cdf split-loop | elim-redundancy | ❌ REVERTED flat — already cmov |
 | 4 | **B7a** full-area ctx kernel | prep+autovec | ✅ **KEPT: −64% stage, −8.3% whole encode** |
 | — | — remaining queue — | | |
-| 5 | **F2** dedup fc_log pushes (log only first mutation per CDF row per checkpoint epoch; needs nesting-safe last-save-index scheme — see Foundation §) | elim-redundancy | est. 150-300 ms; MEDIUM risk (nested checkpoints) |
+| 5 | ~~**F2** fc_log dedup~~ | elim-redundancy | ❌ **REVERTED — regression** (see ledger). 88.9% skippable but the tag-table load costs more than the streaming copy it saves. Closed. |
 | 6 | **B7a-SIMD** hand-AVX2 of the area kernel | vectorize-kernel | only if profiling shows autovec left lanes on the table |
 | 7 | **Q2** quantize two-pass level_mode (parked per user) | elim-redundancy | ~15-20% of the 12.3% pool |
 | 8 | B1/B2/B8 micro-fusions | elim-redundancy | ~0.5% each — likely sub-noise (B4 lesson) |
@@ -202,3 +202,6 @@ Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-
 | 07-01 | B7a-audit | info scope on get_nz_map_contexts | n/a | n/a | hash ✔ | stencil pool = **864-892 ms = 14.2% of RDO** (1.24M calls, ~700ns ea) |
 | 07-01 | **B7a** | full-area column-contiguous ctx kernel, safe-Rust autovec (the TX_PAD layout was designed for this SIMD pattern) | **878→449 ms (−49%), non-overlapping** | — | hash ✔ · oracle ✔ (19 sizes × 3 classes, every raster pos) | **KEPT** — commit 434d9202 |
 | 07-01 | **B7a-tune** | drop the density cutoff — kernel wins at every density (sweep K=8/16/64/∞: 449/338/311/320 ms) | stencil **878→320 ms (−64%)** | **553.6→507.8 ms/frame = −8.3% whole encode** (interleaved 1T A/B, non-overlapping) | hash ✔ · 547/547 lib tests ✔ | **KEPT** — commit df2ab0e6 |
+| 07-01 | F2-verify | workflow: call-site map (5 checkpoint sites, strict LIFO proven; double-rollback dominant; clear per-SB; no out-of-band CDF writes) + adversarial review (killed shared-base & no-invalidation variants; prescribed monotone-clock: tags=log-event counter, base:=clock at checkpoint/rollback/clear, skip iff tag>base) | n/a | n/a | n/a | scheme provably safe as prescribed |
+| 07-01 | F2-probe | monotone-semantics ceiling probe (profile-gated counters) | n/a | n/a | hash ✔ | **88.9% of 192M pushes dedup-skippable** (deterministic 170,826,849 across runs); naive probe said 98.9% (stale-tag overcount, as review predicted) |
+| 07-01 | **F2** | monotone-clock fc_log dedup (22 KB tag table, skip path in push) | CtxSaveRestore 94-102→33.5-34.6 ms (−65%); EntropyRate muddied by probe | **REGRESSION: A 483-489 vs B 519-532 ms/frame (~+6-7%), 2 interleaved rounds consistent** | hash ✔ all runs · 547/547 ✔ · skip counts deterministic | **REVERTED** — the copy was never the cost: the old push is a streaming L1 copy (~free); the dedup adds a dependent RANDOM tag-table load + branch to ALL 192M pushes ≈ 2ns×192M ≈ the 400ms lost. Correctness held; economics didn't. Do-not-retry with any side-table variant; only a same-cache-line tag could work, and there is no spare space in coded rows |
