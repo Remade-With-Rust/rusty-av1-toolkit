@@ -225,7 +225,13 @@ impl EncoderConfig {
     // multiple partition sizes properly. Unfortunately, when tx domain
     // distortion is used, distortion is only known at the tx block level which
     // might be bigger than 8x8. So temporal RDO is always disabled in that case.
-    !self.speed_settings.transform.tx_domain_distortion
+    //
+    // tx_domain_rate forces the TxDistEstRate rdo type, which also computes
+    // distortion at the tx block level regardless of tx_domain_distortion —
+    // without this check, tx_domain_rate=true + tx_domain_distortion=false
+    // asserts in distortion_scale (bsize > 8x8).
+    !(self.speed_settings.transform.tx_domain_distortion
+      || self.speed_settings.transform.tx_domain_rate)
   }
 
   /// Describes whether the output is targeted as HDR

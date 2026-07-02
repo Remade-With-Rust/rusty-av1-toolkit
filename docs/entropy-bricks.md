@@ -283,6 +283,37 @@ Validation (2026-07-02):
   8%", it's the bottom of this box's ±5% thermal band — the medians hold
   9.8-10% at QP 100.
 
+### Nitro (2026-07-02): `--racecar nitro` — speed over compression
+
+Third position on the switch, for CPU/latency-bound non-bandwidth-limited
+uses (e.g. NAT-traversal streaming where bits are free): the racecar
+kernels **plus** `tx_domain_rate=true` + `tx_domain_distortion=true`
+applied to the config at the CLI (after tune resolution). Unlike
+off/on this **CHANGES THE BITSTREAM** — it is the productized form of the
+tx-domain-rate probe above, and deliberately outside the byte-identical
+gate. `off`/`on` semantics and their byte-identity are untouched.
+
+Includes the fix for the latent assert: `EncoderConfig::temporal_rdo()`
+now returns false when **either** `tx_domain_distortion` or
+`tx_domain_rate` is set (TxDistEstRate computes tx-block-level distortion
+regardless of the distortion flag). Behavior change only for configs that
+previously panicked.
+
+Validation (2026-07-02, testsrc2 60f, speed 6, QP 100, 1T):
+- 547/547 lib tests; FNV `688d5eeaee94d95e` in both kernel modes
+  (on/off unchanged); on/off CLI outputs still SHA-equal to the
+  definitive artifact.
+- Nitro under the DEFAULT (psychovisual) tune — the previously-asserting
+  combo — encodes clean. 5 interleaved rounds: median **on 7.399 s vs
+  nitro 4.586 s = 1.61×**; vs normal/off (7.745 s from the sweep) =
+  **1.69× total**. Cost at default tune: 262 180 → 419 010 B (+60%),
+  PSNR 44.50 → 42.22 (−2.28 dB).
+- `nitro --tune Psnr` cross-checks the probe exactly (423 101 B,
+  byte-identical to the probe's output; 4.23 s) and is both faster and
+  less lossy than nitro under psychovisual (−1.13 dB, +48%) — **recommend
+  pairing nitro with `--tune Psnr`** (psychovisual's perceptual scaling
+  burns cycles and interacts poorly with the crude rate table).
+
 ## tx-domain rate probe (2026-07-02) — measured, NOT kept
 
 The `use_tx_domain_rate` lever flagged in the original RDO decomposition

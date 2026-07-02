@@ -255,18 +255,20 @@ pub struct CliOptions {
   /// Outputs a Y4M file containing the output from the decoder
   #[clap(long, short, value_parser, help_heading = "DEBUGGING")]
   pub reconstruction: Option<PathBuf>,
-  /// Kernel mode: on = optimized "racecar" kernels (default); off = the
-  /// original stock rav1e code paths. Output is byte-identical either way —
-  /// the switch changes speed only (see docs/entropy-bricks.md)
+  /// Speed mode. on = optimized "racecar" kernels, output byte-identical
+  /// to stock rav1e (default); off = the original stock code paths;
+  /// nitro = racecar kernels + estimated (table) coefficient rate in RDO
+  /// instead of real token coding — much faster, but CHANGES THE BITSTREAM
+  /// (larger output, lower quality). For CPU/latency-bound, non-bandwidth-
+  /// limited uses (see docs/entropy-bricks.md)
   #[clap(
     long,
-    value_name = "on|off",
-    action = clap::ArgAction::Set,
-    value_parser = clap::builder::BoolishValueParser::new(),
+    value_name = "off|on|nitro",
+    value_parser = ["off", "on", "nitro"],
     default_value = "on",
-    help_heading = "DEBUGGING"
+    help_heading = "ENCODE SETTINGS"
   )]
-  pub racecar: bool,
+  pub racecar: String,
 
   #[clap(subcommand)]
   pub command: Option<Commands>,
@@ -416,7 +418,9 @@ pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
   let matches = CliOptions::parse();
 
   // Latch the kernel mode before any encoder code can read it.
-  rav1e::racecar::set(matches.racecar);
+  // ("nitro" keeps the racecar kernels on and additionally flips the
+  // tx-domain-rate speed settings in the encoder config below.)
+  rav1e::racecar::set(matches.racecar != "off");
 
   #[cfg(feature = "serialize")]
   let mut save_config_path = None;
@@ -701,6 +705,16 @@ fn parse_config(matches: &CliOptions) -> Result<EncoderConfig, CliError> {
 
   if cfg.tune == Tune::Psychovisual {
     cfg.speed_settings.transform.tx_domain_distortion = false;
+  }
+
+  // Nitro: estimated (table) coefficient rate in RDO instead of real token
+  // coding — speed over compression (docs/entropy-bricks.md, "tx-domain
+  // rate probe"). Must be applied after the tune resolution above;
+  // tx_domain_distortion is forced back on because TxDistEstRate computes
+  // tx-block-level distortion regardless, and temporal_rdo() keys off it.
+  if matches.racecar == "nitro" {
+    cfg.speed_settings.transform.tx_domain_rate = true;
+    cfg.speed_settings.transform.tx_domain_distortion = true;
   }
 
   cfg.tile_cols = matches.tile_cols;
