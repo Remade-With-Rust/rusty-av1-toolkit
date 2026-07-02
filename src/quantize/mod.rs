@@ -291,6 +291,7 @@ impl QuantizationContext {
         .align_power_of_two_and_shift(self.log_tx_scale),
     );
     let eob = {
+      let _q1 = crate::prof::scope(crate::prof::Stage::QuantEobScan);
       let eob_minus_one = iscan
         .iter()
         .zip(coeffs)
@@ -315,6 +316,7 @@ impl QuantizationContext {
     // coefficients, most bits will be spent on coding its magnitude.
     // To that end, we want to bias more toward rounding to zero for
     // that tail of zeroes and ones than we do for the larger coefficients.
+    let _q2 = crate::prof::scope(crate::prof::Stage::QuantMainLoop);
     let mut level_mode = 1;
     let ac_quant = self.ac_quant.get() as u32;
     for &pos in scan.iter().take(usize::from(eob)).skip(1) {

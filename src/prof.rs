@@ -75,6 +75,8 @@ stages! {
   SymbolMachinery  => "symbol_with_update [info]",
   TellFrac         => "tell_frac [info]",
   NzMapCtx         => "get_nz_map_contexts [info]",
+  QuantEobScan     => "quantize: eob scan [info]",
+  QuantMainLoop    => "quantize: main loop [info]",
 }
 
 impl Stage {
@@ -84,7 +86,11 @@ impl Stage {
   pub const fn is_info(self) -> bool {
     matches!(
       self,
-      Stage::SymbolMachinery | Stage::TellFrac | Stage::NzMapCtx
+      Stage::SymbolMachinery
+        | Stage::TellFrac
+        | Stage::NzMapCtx
+        | Stage::QuantEobScan
+        | Stage::QuantMainLoop
     )
   }
 
