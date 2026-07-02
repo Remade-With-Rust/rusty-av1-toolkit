@@ -1803,21 +1803,26 @@ impl ContextWriter<'_> {
     let mut coeffs_storage: Aligned<ArrayVec<T, { 32 * 32 }>> =
       Aligned::new(ArrayVec::new());
     let coeffs = &mut coeffs_storage.data;
-    coeffs.extend(scan.iter().map(|&scan_idx| coeffs_in[scan_idx as usize]));
-
-    let cul_level: u32 = coeffs.iter().map(|c| u32::cast_from(c.abs())).sum();
+    let cul_level: u32 = {
+      let _s = crate::prof::scope(crate::prof::Stage::ScanGather);
+      coeffs.extend(scan.iter().map(|&scan_idx| coeffs_in[scan_idx as usize]));
+      coeffs.iter().map(|c| u32::cast_from(c.abs())).sum()
+    };
 
     let txs_ctx = Self::get_txsize_entropy_ctx(tx_size);
-    let txb_ctx = self.bc.get_txb_ctx(
-      plane_bsize,
-      tx_size,
-      plane,
-      bo,
-      xdec,
-      ydec,
-      frame_clipped_txw,
-      frame_clipped_txh,
-    );
+    let txb_ctx = {
+      let _s = crate::prof::scope(crate::prof::Stage::TxbCtx);
+      self.bc.get_txb_ctx(
+        plane_bsize,
+        tx_size,
+        plane,
+        bo,
+        xdec,
+        ydec,
+        frame_clipped_txw,
+        frame_clipped_txh,
+      )
+    };
 
     {
       let cdf = &self.fc.txb_skip_cdf[txs_ctx][txb_ctx.txb_skip_ctx];
@@ -1833,7 +1838,10 @@ impl ContextWriter<'_> {
     let levels: &mut [u8] =
       &mut levels_buf[TX_PAD_TOP * (height + TX_PAD_HOR)..];
 
-    self.txb_init_levels(coeffs_in, height, levels, height + TX_PAD_HOR);
+    {
+      let _s = crate::prof::scope(crate::prof::Stage::TxbInitLevels);
+      self.txb_init_levels(coeffs_in, height, levels, height + TX_PAD_HOR);
+    }
 
     let tx_class = tx_type_to_class[tx_type as usize];
     let plane_type = usize::from(plane != 0);
@@ -1854,8 +1862,10 @@ impl ContextWriter<'_> {
     self.encode_coeffs(
       coeffs, levels, scan, eob, tx_size, tx_class, txs_ctx, plane_type, w,
     );
-    let cul_level =
-      self.encode_coeff_signs(coeffs, w, plane_type, txb_ctx, cul_level);
+    let cul_level = {
+      let _s = crate::prof::scope(crate::prof::Stage::CoeffSigns);
+      self.encode_coeff_signs(coeffs, w, plane_type, txb_ctx, cul_level)
+    };
     self.bc.set_coeff_context(plane, bo, tx_size, xdec, ydec, cul_level as u8);
     true
   }

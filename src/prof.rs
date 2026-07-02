@@ -89,6 +89,11 @@ stages! {
   InterModeScreen  => "inter mode screen/SATD [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
+  // entropy-path internal audit (inside EntropyRate/write_coeffs_lv_map):
+  TxbCtx           => "  get_txb_ctx [info]",
+  TxbInitLevels    => "  txb_init_levels [info]",
+  CoeffSigns       => "  encode_coeff_signs [info]",
+  ScanGather       => "  scan gather+cul_level [info]",
 }
 
 impl Stage {
@@ -113,6 +118,10 @@ impl Stage {
         | Stage::InterModeScreen
         | Stage::MvRefList
         | Stage::QcoeffsZero
+        | Stage::TxbCtx
+        | Stage::TxbInitLevels
+        | Stage::CoeffSigns
+        | Stage::ScanGather
     )
   }
 

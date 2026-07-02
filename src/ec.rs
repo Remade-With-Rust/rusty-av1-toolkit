@@ -549,11 +549,10 @@ where
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {
-    // F-audit 2026-07-01 (see docs/entropy-bricks.md): an info scope here measured
-    // 192,251,661 calls/10f — the per-symbol pool is the majority of EntropyRate
-    // at ~13-19ns/symbol (already lean). Scope removed: at 192M calls its ~23ns
-    // overhead corrupts every other stage's verdict. Re-add temporarily to verify
-    // foundation bricks.
+    // F-audit / entropy final audit: an info scope here measured 192,251,661
+    // calls/10f at ~11.5 ns/symbol = the majority of write_coeffs_lv_map and the
+    // irreducible serial core (CDF adaptation is loop-carried). Scope removed: at
+    // 192M calls its ~23ns overhead corrupts every other stage. Re-add for audits.
     #[cfg(feature = "desync_finder")]
     {
       if self.debug {
