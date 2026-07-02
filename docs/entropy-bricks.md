@@ -178,9 +178,10 @@ safest, most-informative first; each independently revertible:
 | 4 | **B7a** full-area ctx kernel | prep+autovec | ✅ **KEPT: −64% stage, −8.3% whole encode** |
 | — | — remaining queue — | | |
 | 5 | ~~**F2** fc_log dedup~~ | elim-redundancy | ❌ **REVERTED — regression** (see ledger). 88.9% skippable but the tag-table load costs more than the streaming copy it saves. Closed. |
-| 6 | **B7a-SIMD** hand-AVX2 of the area kernel | vectorize-kernel | only if profiling shows autovec left lanes on the table |
+| 6 | ~~**B7a-SIMD**~~ | vectorize-kernel | ✅ **KEPT: stencil 320→97 ms (−70%), −3.5-4% whole encode** — asm inspection showed the "autovec" never happened; one ymm covers a whole column |
 | 7 | **Q2** quantize two-pass level_mode (parked per user) | elim-redundancy | ~15-20% of the 12.3% pool |
 | 8 | B1/B2/B8 micro-fusions | elim-redundancy | ~0.5% each — likely sub-noise (B4 lesson) |
+| 9 | NEON mirror of B7a-SIMD (aarch64) | vectorize-kernel | when an ARM target matters; same oracle |
 
 **Not on the table (bitstream-changing, → `experimental` skill):** frozen-CDF rate
 estimation, tx-domain rate (`use_tx_domain_rate`), candidate pruning. Those change
@@ -205,3 +206,4 @@ Honest throughput baseline (bench_encode, all threads, 20f): 3.44 Mpx/s best-of-
 | 07-01 | F2-verify | workflow: call-site map (5 checkpoint sites, strict LIFO proven; double-rollback dominant; clear per-SB; no out-of-band CDF writes) + adversarial review (killed shared-base & no-invalidation variants; prescribed monotone-clock: tags=log-event counter, base:=clock at checkpoint/rollback/clear, skip iff tag>base) | n/a | n/a | n/a | scheme provably safe as prescribed |
 | 07-01 | F2-probe | monotone-semantics ceiling probe (profile-gated counters) | n/a | n/a | hash ✔ | **88.9% of 192M pushes dedup-skippable** (deterministic 170,826,849 across runs); naive probe said 98.9% (stale-tag overcount, as review predicted) |
 | 07-01 | **F2** | monotone-clock fc_log dedup (22 KB tag table, skip path in push) | CtxSaveRestore 94-102→33.5-34.6 ms (−65%); EntropyRate muddied by probe | **REGRESSION: A 483-489 vs B 519-532 ms/frame (~+6-7%), 2 interleaved rounds consistent** | hash ✔ all runs · 547/547 ✔ · skip counts deterministic | **REVERTED** — the copy was never the cost: the old push is a streaming L1 copy (~free); the dedup adds a dependent RANDOM tag-table load + branch to ALL 192M pushes ≈ 2ns×192M ≈ the 400ms lost. Correctness held; economics didn't. Do-not-retry with any side-table variant; only a same-cache-line tag could work, and there is no spare space in coded rows |
+| 07-01 | **B7a-SIMD** | hand-AVX2 kernel: one ymm per ≤32-row column (5× vpminub/vpaddb stencil, vpavgb ≡ (mag+1)>>1, per-tx offset vectors in a lazy static); cached CpuFeatureLevel dispatch + hard release-mode bounds guard | stencil **320→96-97 ms (−70%; −89% cumulative vs 878 pre-B7a)**, ±1 ms across runs | **~−3.5-4% whole encode** (457-483 vs 474-499 ms/frame, 2 interleaved rounds consistent) | hash ✔ · oracle scalar==AVX2==dispatch every position ✔ · 547/547 ✔ · adversarial bounds review: SOUND ×9 attacks (2 fixes applied) | **KEPT** — commit b7bb106b. Asm inspection first: the scalar kernel had ZERO SIMD — "the compiler already vectorized it" was FALSE here; Step-0 inspection beats assumption |
