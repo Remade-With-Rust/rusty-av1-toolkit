@@ -70,6 +70,10 @@ stages! {
   // per-coefficient differential: true get_lo_ctx = CoefLoCtx − CoefScopeRef
   CoefLoCtx        => "coef:   get_lo_ctx (raw) [info]",
   CoefScopeRef     => "coef:   scope-overhead ref [info]",
+  // --- mode-symbol path audit (nested inside TileSbrow, ~17% of decode) ---
+  MvRefsFind       => "mode: refmvs_find (MV pred) [info]",
+  VartxTree        => "mode: read_vartx_tree [info]",
+  ResetCtx         => "mode: reset_context fills [info]",
 }
 
 impl Stage {
@@ -88,6 +92,9 @@ impl Stage {
         | Stage::CoefDequant
         | Stage::CoefLoCtx
         | Stage::CoefScopeRef
+        | Stage::MvRefsFind
+        | Stage::VartxTree
+        | Stage::ResetCtx
     )
   }
 

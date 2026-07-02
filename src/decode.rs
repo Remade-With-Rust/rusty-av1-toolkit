@@ -697,6 +697,7 @@ fn read_vartx_tree(
     bx4: c_int,
     by4: c_int,
 ) -> VarTx {
+    let _prof = crate::prof::scope(crate::prof::Stage::VartxTree);
     let b_dim = bs.dimensions();
     let bw4 = b_dim[0] as usize;
     let bh4 = b_dim[1] as usize;
@@ -3699,6 +3700,7 @@ fn decode_sb(
 }
 
 fn reset_context(ctx: &mut BlockContext, keyframe: bool, pass: c_int) {
+    let _prof = crate::prof::scope(crate::prof::Stage::ResetCtx);
     ctx.intra.get_mut().0.fill(keyframe.into());
     ctx.uvmode.get_mut().0.fill(DC_PRED);
     if keyframe {

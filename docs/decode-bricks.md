@@ -72,13 +72,56 @@ B7a does not exist; measurement proved it rather than assuming it.**
 Bricks refuted here (do-not-retry): levels memset (3.8 ms), get_lo_ctx restructure/SIMD
 (near-free + loop-carried, cannot batch), dequant vectorization (serial linked-list + asm signs).
 
-## Next target — mode-symbol decode (~17%)
+## Mode-symbol path — full teardown (07-01, measured)
 
-With `decode_coefs` proven at floor, the remaining pure-Rust ROI is **mode-symbol decode +
-setup (~170-198 ms, ~17% of decode)** — per-block partition/mode/MV/segment symbol reads in
-`decode_b`/`decode_sb` (pure Rust around asm MSAC). Its context derivation is *per-block* (not
-per-coef), so unlike `get_lo_ctx` there may be batchable neighbour-context computation worth a
-teardown. Also open: profile an **LR + film-grain** clip (this clip exercises neither).
+The other pure-Rust budget: **mode-symbol decode + setup = 177 ms (~17% of decode)**. Scopes
+on every named helper (`MvRefsFind`/`VartxTree`/`ResetCtx`), remainder = diffuse per-block reads:
+
+| block | ms | % decode | nature | brick? |
+|---|---|---|---|---|
+| **`refmvs_find`** (MV predictor scan) | **30** | 3.0% | serial neighbour scan + dedup + sort | **no** (inherent serial, <noise ceiling, correctness-critical) |
+| `read_vartx_tree` | 9 | 0.9% | recursion + CaseSet writes | no (tiny) |
+| `reset_context` fills (~18× `.fill()`) | **0.18** | ~0% | per-SB-col context reset | **NOT A BRICK (refuted)** |
+| diffuse mode-symbol reads + 74× CaseSet | ~138 | ~14% | asm MSAC + tiny per-block ctx + neighbour writes | no (no single fat block; encoder-glue pattern) |
+
+`refmvs_find` / `scan_row` / `scan_col` are tight ports (dav1d's own FIXMEs remain) — no fat
+waste, ~1% ceiling, high revert-risk. `reset_context`'s wall of `.fill()`s measured **0.18 ms**
+(the B4 lesson again: small array fills are already fast). The 138 ms remainder is the
+decoder's analog of the encoder's diffuse RDO glue: many small asm-MSAC symbol reads + tiny
+contexts + `CaseSet` neighbour writes, none individually brickable.
+
+## DECODE PATH — FINAL VERDICT (proven at floor)
+
+Every pure-Rust block in the decode hot path has been measured and evaluated:
+
+| budget | ms/900f | verdict |
+|---|---|---|
+| coeff decode (`decode_coefs`) | 531 (53%) | serial MSAC floor — no brick (get_lo_ctx ~free, memset ~free) |
+| mode-symbol decode + setup | 177 (17%) | diffuse serial — no brick (refmvs_find 3%, reset_context refuted) |
+| pixel recon (mc+itx+add) | ~117 (12%) | **asm** — not a pure-Rust brick |
+| deblock + cdef | 154 (16%) | **asm** — not a pure-Rust brick |
+
+**There is no fat byte-identical brick in the decode path — measured, not assumed.** Why the
+decoder differs from the encoder (which yielded ~10% via B7a+Q2): rav1d inherits dav1d's
+hand-written asm for *every* hot kernel (itx/mc/cdef/loopfilter/lr **and the MSAC core**), so
+the pure-Rust surface is small and already tight; and decoding is *incremental-serial* (levels
+written token-by-token) so there is no batch-parallel context computation to vectorize — the
+one structural lever the encoder had. The decoder is a mature, asm-heavy codebase near its
+floor. Baseline confirmed byte-identical + no regression: ~875 fps / ~357 Mpx/s 1-thread,
+decode md5 `c823cce7…` unchanged.
+
+**Kept "home" for the decoder:** the analyzer spine (`prof.rs` + CLI dump + the complete,
+reusable stage/coef/mode instrumentation) and this full ROI map. Any future decode gain must be
+**algorithmic** (decode fewer symbols — bitstream) or **asm** (improve an inherited kernel /
+add a missing AVX-512 path) — both outside the byte-identical-pure-Rust brick game.
+
+Refuted do-not-retry (decode): levels memset, get_lo_ctx SIMD, dequant vectorize,
+reset_context fills, refmvs_find micro-opt (all <noise / inherent-serial / already-tight).
+
+## Still open (not yet profiled)
+
+Profile an **LR + film-grain + 10-bit** clip separately (this 8-bit clip exercises no loop
+restoration and no film grain — those asm kernels are untested here, though asm regardless).
 
 ## Gate & method (same discipline as the encoder)
 

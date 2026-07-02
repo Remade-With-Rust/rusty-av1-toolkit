@@ -904,6 +904,7 @@ pub(crate) fn rav1d_refmvs_find(
     bx4: i32,
     frame_hdr: &Rav1dFrameHeader,
 ) {
+    let _prof = crate::prof::scope(crate::prof::Stage::MvRefsFind);
     let b_dim = bs.dimensions();
     let bw4 = b_dim[0] as i32;
     let w4 = cmp::min(cmp::min(bw4, 16), rt.tile_col.end - bx4);
