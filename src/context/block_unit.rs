@@ -1425,6 +1425,7 @@ impl ContextWriter<'_> {
     mv_stack: &mut ArrayVec<CandidateMV, 9>, bsize: BlockSize,
     fi: &FrameInvariants<T>, is_compound: bool,
   ) -> usize {
+    let _prof = crate::prof::scope(crate::prof::Stage::MvRefList);
     assert!(ref_frames[0] != NONE_FRAME);
     if ref_frames[0] != NONE_FRAME {
       // TODO: If ref_frames[0] != INTRA_FRAME, convert global mv to an mv;

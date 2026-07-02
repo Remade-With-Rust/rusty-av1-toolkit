@@ -1322,6 +1322,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
 
     // Calculate SATD for each mode
     if num_modes_rdo != inter_mode_set.len() {
+      let _prof = crate::prof::scope(crate::prof::Stage::InterModeScreen);
       let tile_rect = ts.tile_rect();
       let rec = &mut ts.rec.planes[0];
       let po = tile_bo.plane_offset(rec.plane_cfg);
@@ -1435,6 +1436,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   // may be improved by emulating prediction for each tx block.
   {
     let satds = {
+      let _prof = crate::prof::scope(crate::prof::Stage::InterModeScreen);
       // FIXME: If tx partition is used, this whole sads block should be fixed
       let tx_size = bsize.tx_size();
       let mut edge_buf = Aligned::uninit_array();
@@ -1597,6 +1599,7 @@ pub fn rdo_cfl_alpha<T: Pixel>(
   ts: &mut TileStateMut<'_, T>, tile_bo: TileBlockOffset, bsize: BlockSize,
   luma_tx_size: TxSize, fi: &FrameInvariants<T>,
 ) -> Option<CFLParams> {
+  let _prof = crate::prof::scope(crate::prof::Stage::CflAlpha);
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
   let uv_tx_size = bsize.largest_chroma_tx_size(xdec, ydec);
   debug_assert!(

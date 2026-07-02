@@ -82,6 +82,13 @@ stages! {
   ComputeDistortion => "compute_distortion [info]",
   ComputeRdCost    => "compute_rd_cost [info]",
   LfRdoSetup       => "  lf-rdo setup+alloc [info]",
+  // glue tier-2 (the ~16% diffuse residue):
+  Diff             => "diff (residual) [info]",
+  IntraEdges       => "get_intra_edges [info]",
+  CflAlpha         => "rdo_cfl_alpha [info]",
+  InterModeScreen  => "inter mode screen/SATD [info]",
+  MvRefList        => "find_mvrefs [info]",
+  QcoeffsZero      => "qcoeffs zeroing [info]",
 }
 
 impl Stage {
@@ -100,6 +107,12 @@ impl Stage {
         | Stage::ComputeDistortion
         | Stage::ComputeRdCost
         | Stage::LfRdoSetup
+        | Stage::Diff
+        | Stage::IntraEdges
+        | Stage::CflAlpha
+        | Stage::InterModeScreen
+        | Stage::MvRefList
+        | Stage::QcoeffsZero
     )
   }
 

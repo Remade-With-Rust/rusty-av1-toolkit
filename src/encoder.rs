@@ -1474,20 +1474,23 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
   if mode.is_intra() {
     let bit_depth = fi.sequence.bit_depth;
     let mut edge_buf = Aligned::uninit_array();
-    let edge_buf = get_intra_edges(
-      &mut edge_buf,
-      &rec.as_const(),
-      tile_partition_bo,
-      bx,
-      by,
-      bsize,
-      po,
-      tx_size,
-      bit_depth,
-      Some(mode),
-      fi.sequence.enable_intra_edge_filter,
-      pred_intra_param,
-    );
+    let edge_buf = {
+      let _s = crate::prof::scope(crate::prof::Stage::IntraEdges);
+      get_intra_edges(
+        &mut edge_buf,
+        &rec.as_const(),
+        tile_partition_bo,
+        bx,
+        by,
+        bsize,
+        po,
+        tx_size,
+        bit_depth,
+        Some(mode),
+        fi.sequence.enable_intra_edge_filter,
+        pred_intra_param,
+      )
+    };
 
     mode.predict_intra(
       tile_rect,
@@ -1515,10 +1518,13 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
     Aligned::<[MaybeUninit<T::Coeff>; 32 * 32]>::uninit_array();
   let residual = &mut residual.data[..tx_size.area()];
   let coeffs = &mut coeffs.data[..tx_size.area()];
-  let qcoeffs = init_slice_repeat_mut(
-    &mut qcoeffs.data[..coded_tx_area],
-    T::Coeff::cast_from(0),
-  );
+  let qcoeffs = {
+    let _s = crate::prof::scope(crate::prof::Stage::QcoeffsZero);
+    init_slice_repeat_mut(
+      &mut qcoeffs.data[..coded_tx_area],
+      T::Coeff::cast_from(0),
+    )
+  };
   let rcoeffs = &mut rcoeffs.data[..coded_tx_area];
 
   let (visible_tx_w, visible_tx_h) = clip_visible_bsize(
@@ -1530,6 +1536,7 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
   );
 
   if visible_tx_w != 0 && visible_tx_h != 0 {
+    let _s = crate::prof::scope(crate::prof::Stage::Diff);
     diff(
       residual,
       &ts.input_tile.planes[p].subregion(area),
