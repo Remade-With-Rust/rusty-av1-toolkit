@@ -283,6 +283,17 @@ Validation (2026-07-02):
   8%", it's the bottom of this box's ±5% thermal band — the medians hold
   9.8-10% at QP 100.
 
+### Semantics remap (2026-07-02, same day): off/on/stock
+
+Operational decision: **`--racecar off` (the new default) = standard
+operations** — the byte-identical kernels, ~1.10× vs stock; **`--racecar
+on` = the 1.69× tx-domain-rate mode** (what the section below introduced
+as "nitro"); **`--racecar stock`** keeps the original rav1e code paths
+reachable as the measurement baseline. Validated after the remap: default,
+`off` and `stock` all emit the definitive artifact SHA `e6c294bb…`
+(262 180 B); `on` emits the tx-rate bitstream (419 010 B, deterministic).
+The section below predates the rename — read "nitro" as today's `on`.
+
 ### Nitro (2026-07-02): `--racecar nitro` — speed over compression
 
 Third position on the switch, for CPU/latency-bound non-bandwidth-limited

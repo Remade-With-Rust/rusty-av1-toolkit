@@ -255,17 +255,18 @@ pub struct CliOptions {
   /// Outputs a Y4M file containing the output from the decoder
   #[clap(long, short, value_parser, help_heading = "DEBUGGING")]
   pub reconstruction: Option<PathBuf>,
-  /// Speed mode. on = optimized "racecar" kernels, output byte-identical
-  /// to stock rav1e (default); off = the original stock code paths;
-  /// nitro = racecar kernels + estimated (table) coefficient rate in RDO
-  /// instead of real token coding — much faster, but CHANGES THE BITSTREAM
-  /// (larger output, lower quality). For CPU/latency-bound, non-bandwidth-
-  /// limited uses (see docs/entropy-bricks.md)
+  /// Racecar mode. off = standard operations (default): the optimized
+  /// kernels, output byte-identical to stock rav1e, ~1.10x. on = racecar:
+  /// kernels + estimated (table) coefficient rate in RDO instead of real
+  /// token coding — ~1.69x vs stock, but CHANGES THE BITSTREAM (larger
+  /// output, lower quality; pair with --tune Psnr). For CPU/latency-bound,
+  /// non-bandwidth-limited uses. stock = the original rav1e code paths
+  /// (measurement baseline only). See docs/entropy-bricks.md
   #[clap(
     long,
-    value_name = "off|on|nitro",
-    value_parser = ["off", "on", "nitro"],
-    default_value = "on",
+    value_name = "off|on|stock",
+    value_parser = ["off", "on", "stock"],
+    default_value = "off",
     help_heading = "ENCODE SETTINGS"
   )]
   pub racecar: String,
@@ -417,10 +418,12 @@ fn build_speed_long_help() -> Option<&'static str> {
 pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
   let matches = CliOptions::parse();
 
-  // Latch the kernel mode before any encoder code can read it.
-  // ("nitro" keeps the racecar kernels on and additionally flips the
-  // tx-domain-rate speed settings in the encoder config below.)
-  rav1e::racecar::set(matches.racecar != "off");
+  // Latch the kernel mode before any encoder code can read it. The
+  // byte-identical kernels run in BOTH "off" (standard ops) and "on"
+  // (racecar); only "stock" — the measurement baseline — disables them.
+  // "on" additionally flips the tx-domain-rate speed settings in the
+  // encoder config below.
+  rav1e::racecar::set(matches.racecar != "stock");
 
   #[cfg(feature = "serialize")]
   let mut save_config_path = None;
@@ -707,12 +710,13 @@ fn parse_config(matches: &CliOptions) -> Result<EncoderConfig, CliError> {
     cfg.speed_settings.transform.tx_domain_distortion = false;
   }
 
-  // Nitro: estimated (table) coefficient rate in RDO instead of real token
-  // coding — speed over compression (docs/entropy-bricks.md, "tx-domain
-  // rate probe"). Must be applied after the tune resolution above;
-  // tx_domain_distortion is forced back on because TxDistEstRate computes
-  // tx-block-level distortion regardless, and temporal_rdo() keys off it.
-  if matches.racecar == "nitro" {
+  // Racecar (--racecar on): estimated (table) coefficient rate in RDO
+  // instead of real token coding — speed over compression
+  // (docs/entropy-bricks.md, "tx-domain rate probe"). Must be applied
+  // after the tune resolution above; tx_domain_distortion is forced back
+  // on because TxDistEstRate computes tx-block-level distortion
+  // regardless, and temporal_rdo() keys off it.
+  if matches.racecar == "on" {
     cfg.speed_settings.transform.tx_domain_rate = true;
     cfg.speed_settings.transform.tx_domain_distortion = true;
   }

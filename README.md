@@ -79,11 +79,12 @@ rounds): median **7.588 s → 6.911 s = 1.098× = ~9.8% faster**, tight 1.072–
 byte-identical** (262 180 B, same SHA256). Content-dependent — denser content puts more of
 the encode in the entropy path, so the speedup grows.
 
-**Single-binary A/B:** `--racecar <off|on|nitro>` (default on) switches at runtime.
-`on` vs `off` = the kept bricks vs the resurrected stock code paths — byte-identical
-either way, 1.06-1.13× apart (QP-dependent). `nitro` = the kernels **plus** tx-domain
-rate estimation in RDO: **1.6-1.7× faster than stock but bitstream-changing** (+50-60%
-size, −1-2 dB) — for CPU-bound, non-bandwidth-limited uses; pair with `--tune Psnr`.
+**The racecar switch:** `--racecar <off|on|stock>` (default **off**).
+`off` = **standard operations**: the kept bricks, output byte-identical to stock rav1e,
+~1.10× (1.06-1.13× by QP). `on` = **racecar**: the kernels **plus** tx-domain rate
+estimation in RDO — **~1.69× vs stock but bitstream-changing** (+50-60% size, −1-2 dB);
+for CPU-bound, non-bandwidth-limited uses (pair with `--tune Psnr`). `stock` = the
+original rav1e code paths, kept as the measurement baseline that proves the 1.10×.
 `RAV1E_RACECAR=0` toggles the kernels for library/test builds. See "The racecar switch"
 in [docs/entropy-bricks.md](docs/entropy-bricks.md).
 
