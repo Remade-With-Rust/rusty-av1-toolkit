@@ -1,188 +1,126 @@
-# rav1e [![Actions Status][actions badge]][actions] [![CodeCov][codecov badge]][codecov]
+<!--
+  rusty_av1e — PROJECT BLUEPRINT (AV1 encoder, forked from rav1e for byte-identical speed).
+  Method / running log: docs/entropy-bricks.md (the brick ledger — every attempt, kept or reverted).
+  Profiler spine: src/prof.rs.  Harness + gate: tests/profile_encode.rs.
+-->
 
-The fastest and safest AV1 encoder.
+# rusty_av1e — Project Blueprint
 
-<details>
-<summary><b>Table of Content</b></summary>
+**Goal:** make [rav1e](https://github.com/xiph/rav1e) **measurably faster without
+changing a single output byte** — profile the encoder, find where the cycles actually
+go, and optimize the hot primitives one **brick** at a time, each gated **byte-identical**
+against the stock bitstream. The same disciplined, measured primitives seed the future
+AV2 encoder (`rav2e`, rav1e-derived). A separate **experimental** track
+(bitstream-changing, BD-rate-gated) explores speed/size trade-offs behind a flag.
 
-- [Overview](#overview)
-- [Features](#features)
-- [Documentation](#documentation)
-- [Releases](#releases)
-- [Building](#building)
-  - [Dependency: NASM](#dependency-nasm)
-  - [Release binary](#release-binary)
-  - [Unstable features](#unstable-features)
-  - [Target-specific builds](#target-specific-builds)
-  - [Building the C-API](#building-the-c-api)
-- [Usage](#usage)
-  - [Compressing video](#compressing-video)
-  - [Decompressing video](#decompressing-video)
-  - [Configuring](#configuring)
-    - [Features](#features-1)
-- [Contributing](#contributing)
-- [Getting in Touch](#getting-in-touch)
-</details>
+**Status (2026-07-01):** on branch `opt-entropy`, **~10% faster whole-encode than stock
+rav1e — byte-identical** (real CLI, 7-round interleaved A/B; both binaries emit the exact
+same file, SHA256 `e6c294bb…6ce2d`). Three kept bricks; the coefficient-entropy path
+(48% of encode) profiled to its irreducible serial floor.
 
-## Overview
-rav1e is an AV1 video encoder. It is designed to eventually cover all use cases, though in its current form it is most suitable for cases where libaom (the reference encoder) is too slow.
+## The ruleset (hard rules)
 
-## Features
-* Intra, inter, and switch frames
-* 64x64 superblocks
-* 4x4 to 64x64 RDO-selected square and rectangular blocks
-* DC, H, V, Paeth, smooth, and all directional prediction modes
-* DCT, (FLIP-)ADST and identity transforms (up to 64x64, 16x16 and 32x32 respectively)
-* 8-, 10- and 12-bit depth color
-* 4:2:0, 4:2:2 and 4:4:4 chroma sampling
-* 11 speed settings (0-10, exhaustive to near real-time)
-* Constant quantizer and target bitrate (single- and multi-pass) encoding modes
-* Still picture mode
+1. **Measure first — the profiler decides, never the code-size intuition.** Every brick
+   starts from a `src/prof.rs` measurement (rdtsc cycle buckets). Agent code-size surveys
+   repeatedly mis-ranked ROI here (a stage guessed at "20-30%" measured 1.4%; another
+   "10-15%" measured 2.6%) — the profiler refuted them every time. No optimization is
+   attempted on an unmeasured target.
+2. **The byte-identical gate is absolute.** A brick may not change one output byte. The
+   gate is an **FNV-1a hash of the bitstream** (`688d…95e`, pinned in
+   `tests/profile_encode.rs`) plus the 547-test lib suite; kept bricks are re-validated
+   against the stock CLI's SHA256. If the hash moves, it is not a brick — it is a bug or
+   an experiment (see rule 5).
+3. **One brick per commit; revert if not faster.** Each change is isolated, measured
+   against its own oracle, and **reverted the moment it fails to beat the baseline** — the
+   reverts are ledgered *do-not-retry* with the reason, so no session re-runs a dead end.
+4. **Stage-median is the verdict when whole-encode is noise-bound.** This box has ~±5%
+   thermal noise. A win worth <5% of encode is judged on its **non-overlapping per-stage
+   median** (baseline max < optimized min), not the noisy whole-encode number — with the
+   stage isolation documented so the claim is honest.
+5. **Bitstream changes are experiments, not bricks — gated on corpus BD-rate.** Anything
+   that changes the output (e.g. the `tx_domain_rate` fast-rate path) lives behind a flag
+   and is judged by BD-rate on a real-video corpus + a decoder round-trip, never on a
+   single synthetic clip. Prove the ceiling offline before paying integration cost.
 
-## Documentation
-Find the documentation in [`doc/`](doc/README.md)
+## Workspace
 
-## Releases
-For the foreseeable future, a weekly pre-release of rav1e will be [published](https://github.com/xiph/rav1e/releases) every Tuesday.
-
-## Building
-
-### Toolchain: Rust
-
-rav1e currently requires Rust 1.74.0 or later to build.
-
-### Dependency: NASM
-Some `x86_64`-specific optimizations require [NASM](https://nasm.us/) `2.14.02` or newer and are enabled by default.
-`strip` will be used if available to remove the local symbols from the asm objects.
-
-The CI is testing against `nasm 2.15.05`, so bugs for other versions might happen. If you find one please open an issue!
-
-<details>
-<summary>
-Install nasm
-</summary>
-
-**ubuntu 20.04** (`nasm 2.14.02`)
-```sh
-sudo apt install nasm
 ```
-**ubuntu 18.04** (`nasm 2.14.02`)
-```sh
-sudo apt install nasm-mozilla
-# link nasm into $PATH
-sudo ln /usr/lib/nasm-mozilla/bin/nasm /usr/local/bin/
-```
-**fedora 31, 32** (`nasm 2.14.02`)
-```sh
-sudo dnf install nasm
-```
-**windows** (`nasm 2.15.05`) <br/>
-Have a [NASM binary](https://www.nasm.us/pub/nasm/releasebuilds/) in your system PATH.
-```sh
-$NASM_VERSION="2.15.05" # or newer
-$LINK="https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/win64"
-curl --ssl-no-revoke -LO "$LINK/nasm-$NASM_VERSION-win64.zip"
-7z e -y "nasm-$NASM_VERSION-win64.zip" -o "C:\nasm"
-# set path for the current sessions
-set PATH="%PATH%;C:\nasm"
-```
-**macOS** (`nasm 2.15.05`)
-```sh
-brew install nasm
+src/prof.rs               feature-gated stage profiler (rdtsc buckets, is_rdo_child / is_info tiers).
+                          OFF by default = shipped byte-identical (ZST no-op scope guard, no Drop).
+tests/profile_encode.rs   the harness: bench_encode (honest Mpx/s), stage_breakdown (per-stage %),
+                          cache_probe (working-set sweep), and the FNV byte-identical gate.
+docs/entropy-bricks.md    THE BRICK LEDGER — every brick B1-B9 / F1-F2 / Q1-Q3 / glue / loop-filter,
+                          kept or reverted, with the measured deltas and the reason.
+src/context/…             the hot edit surface: write_coeffs_lv_map (coeff entropy/rate, 48%),
+src/quantize/…            the nz-map context stencil, the quantize main loop.
 ```
 
-</details>
-
-### Release binary
-To build release binary in `target/release/rav1e` run:
-
+Run:
 ```sh
-cargo build --release
+# honest throughput (profile OFF, all threads):
+cargo test --release --no-default-features --features asm,threading \
+  --test profile_encode -- --ignored --nocapture bench_encode
+# per-stage breakdown (profile ON, single-thread):
+cargo test --release --no-default-features --features asm,threading,profile \
+  --test profile_encode -- --ignored --nocapture --test-threads=1 stage_breakdown
 ```
 
-### Unstable features
-Experimental API and Features can be enabled by using the `unstable` feature.
+## The kept bricks (byte-identical wins on `opt-entropy`)
 
-```sh
-cargo build --features <feature>,unstable
-```
+| brick | what it does | measured | verdict |
+|---|---|---|---|
+| **B7a** | full-area, column-contiguous nz-map **context stencil** (the `TX_PAD` layout was built for this SIMD pattern); pure restructure — LLVM had never vectorized the scattered original | stencil 878 → 320 ms; **−8.3% whole encode** (interleaved 1T A/B) | **KEPT** |
+| **B7a-SIMD** | hand-AVX2 twin of that stencil — one `ymm` per ≤32-row column, `vpavgb ≡ (mag+1)>>1`, per-tx offset vectors; cached CPU-feature dispatch + hard bounds guard | stencil 320 → 96 ms (**−89% cumulative**); **~−4% whole encode** | **KEPT** |
+| **Q2** | **branchless** quantize main loop — kills the two data-dependent mispredicting branches in the serial (loop-carried) loop; the division was *not* the bottleneck | main loop 676 → 444 ms (**−35% stage**) | **KEPT** |
 
-#### Current unstable features
-- Channel API:
-```sh
-cargo build --features channel-api,unstable
-```
+**Definitive whole-encode A/B** (real `rav1e` CLI, `opt-entropy` HEAD vs stock rav1e
+`564ae3b0`, 640×480×60f, `--speed 6 --quantizer 100 --tiles 1 --threads 1`, 7 interleaved
+rounds): median **7.588 s → 6.911 s = 1.098× = ~9.8% faster**, tight 1.072–1.117×, **output
+byte-identical** (262 180 B, same SHA256). Content-dependent — denser content puts more of
+the encode in the entropy path, so the speedup grows.
 
+Reverted, ledgered *do-not-retry*: **B4** (levels scatter — already autovec'd), **F1**
+(update_cdf split-loop — LLVM already emits cmov), **F2** (fc_log dedup — a random side-table
+load costs more than the streaming copy it saved, +6-7%), **Q2-twopass** (division-hoist,
++15% — proved the branches, not the divide, were the cost), **LF-rate-hoist** (real
+redundancy but below the noise floor).
 
-Those Features and API are bound to change and evolve, do not rely on them staying the same over releases.
+## Campaign phases (the map so far)
 
-### Target-specific builds
-The rust compiler can produce a binary that is about 11%-13% faster if it can use `avx2`, `bmi1`, `bmi2`, `fma`, `lzcnt` and `popcnt` in the general code, you may allow it by issuing:
+- **P0 — Analyzer spine.** `src/prof.rs` + `tests/profile_encode.rs` + the FNV gate. The
+  measurement that turned "optimize the encoder" into a ranked target list.
+- **P1 — Coeff entropy/rate (48%).** The #1 target. `write_coeffs_lv_map` decomposed to the
+  last piece: **~77% is irreducibly serial arithmetic + sign coding** (CDF adaptation is
+  loop-carried — no SIMD, no threading); the one structural piece (the nz-map context
+  stencil) is exactly **B7a + B7a-SIMD**. **Path proven at its floor.**
+- **P2 — Quantize (12%).** Serial, loop-carried. **Q2** made the hot branches branchless.
+- **P3 — RDO glue (~27%).** Decomposed: loop-filter RDO search 8.3% (inherent trial search),
+  distortion 2.6%, rd-cost 0.1% — rav1e's glue is *tight* (stack ArrayVecs, cheap
+  checkpoints); the h264 glue-win patterns don't exist here. No byte-identical brick found.
+- **P4 — Experimental (parallel track).** `tx_domain_rate` measured at ~2× speed / +49% size
+  on the synthetic clip — a real lever, but it changes the bitstream, so it is parked behind
+  a flag pending a real-video BD-rate corpus.
 
-```sh
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-# or
-RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
-```
+## The core technique — the brick loop
 
-The resulting binary will not work on cpus that do not sport the same set of extensions enabled.
+For each measured target, in ROI order:
 
-> **NOTE** : You may use `rustc --print target-cpus` to check if the cpu is supported, if not `-C target-cpu=native` would be a no-op.
+1. **LOCATE** the cost with `prof.rs` (a stage scope; nest `is_rdo_child` scopes to
+   sub-divide). The biggest *measured* pure-compute cost, not the biggest-looking code.
+2. **ORACLE** — keep the slow, obviously-correct version as a test oracle (e.g. the scalar
+   nz-map kernel vs its AVX2 twin, checked at every raster position × tx size × class).
+3. **OPTIMIZE** — one technique: eliminate-redundancy → vectorize → hand-SIMD/asm. **Inspect
+   the emitted asm first** (`--emit asm`) — "the compiler already vectorized it" was *false*
+   for B7a-SIMD; the scalar kernel had zero SIMD.
+4. **GATE** — FNV bitstream hash unchanged **and** 547/547 lib tests **and** oracle-equal.
+5. **VERDICT** — interleaved whole-encode A/B if the win is >noise; otherwise the
+   non-overlapping stage median. **Revert if it doesn't beat baseline.**
+6. **RECORD** — one row in `docs/entropy-bricks.md` (kept or *do-not-retry*), so the ledger,
+   not memory, carries the campaign across sessions.
 
-### Building the C-API
-**rav1e** provides a C-compatible set of library, header and pkg-config file.
+The reverts are the point: this codebase is entropy-coding-bound and serial, so most
+"obvious" optimizations are already done by LLVM or below the noise floor. The wins came
+only from removing *structure* that blocked vectorization (B7a) or from killing branch
+mispredicts in a serial loop (Q2) — found by measuring, proven by the gate.
 
-To build and install it you can use [cargo-c](https://crates.io/crates/cargo-c):
-
-```sh
-cargo install cargo-c
-cargo cinstall --release
-```
-
-Please refer to the cargo-c [installation](https://github.com/lu-zero/cargo-c#installation) instructions.
-
-## Usage
-### Compressing video
-Input videos must be in [y4m format](https://wiki.multimedia.cx/index.php/YUV4MPEG2). The monochrome color format is not supported.
-
-```sh
-cargo run --release --bin rav1e -- input.y4m -o output.ivf
-```
-
-_(Find a y4m-file for testing at [`tests/small_input.y4m`](tests/small_input.y4m) or at http://ultravideo.cs.tut.fi/#testsequences)_
-
-### Decompressing video
-Encoder output should be compatible with any AV1 decoder compliant with the v1.0.0 specification. You can decode using [dav1d](https://code.videolan.org/videolan/dav1d), which is now packaged [![in over 40 repositories](https://repology.org/badge/tiny-repos/dav1d.svg)](https://repology.org/project/dav1d/versions).
-
-```sh
-dav1d -i output.ivf -o output.y4m
-```
-
-### Configuring
-rav1e has several optional features that can be enabled by passing `--features` to cargo. Passing `--all-features` is discouraged.
-
-#### Features
-Find a full list in feature-table in [`Cargo.toml`](Cargo.toml)
-
-* `asm` - enabled by default. When enabled, assembly is built for the platforms supporting it.
-  * `x86_64`: Requires [`nasm`](#dependency-nasm).
-  * `aarch64`
-    * Requires `gas`
-    * Alternative: Use `clang` assembler by setting `CC=clang`
-
-**NOTE**: `SSE2` is always enabled on `x86_64`, `neon` is always enabled for aarch64, you may set the environment variable `RAV1E_CPU_TARGET` to `rust` to disable all the assembly-optimized routines at the runtime.
-
-## Contributing
-Please read our guide to [contributing to rav1e](CONTRIBUTING.md).
-
-## Getting in Touch
-Come chat with us on the IRC channel #daala on [Libera.Chat](https://libera.chat/)! You can also use a [web client](https://web.libera.chat/?channel=#daala) to join with a web browser.
-
-
-<!-- Links -->
-[actions]: https://github.com/xiph/rav1e/actions
-[codecov]: https://codecov.io/gh/xiph/rav1e
-
-<!-- Badges -->
-[actions badge]: https://github.com/xiph/rav1e/workflows/rav1e/badge.svg
-[codecov badge]: https://codecov.io/gh/xiph/rav1e/branch/master/graph/badge.svg
+Full brick-by-brick history and numbers: **[docs/entropy-bricks.md](docs/entropy-bricks.md)**.
