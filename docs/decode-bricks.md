@@ -72,6 +72,58 @@ B7a does not exist; measurement proved it rather than assuming it.**
 Bricks refuted here (do-not-retry): levels memset (3.8 ms), get_lo_ctx restructure/SIMD
 (near-free + loop-carried, cannot batch), dequant vectorization (serial linked-list + asm signs).
 
+### Token loop — per-primitive brick audit (A·B·C·D, 07-01)
+
+Iterated EVERY primitive of `decode_coefs_class`. Attempted the ones with any pure-Rust
+surface (whole-decode A/B, md5-gated); documented the rest with their floor reason.
+
+**A — per-block setup (225k calls):**
+| prim | what | verdict |
+|---|---|---|
+| A1 | CDF pointer fetch (eob/lo/hi) | references, 0 cost — no brick |
+| A2 | scan/stride/lo_ctx_offsets | `const TX_CLASS` generic → compile-time resolved — no brick |
+| A3 | shift/mask/end constants | per-block integer math, bounds elided — no brick (cross-fn `tx2dszctx` recompute = 2 mins/block, sub-noise) |
+| A4 | `levels[..end].fill(0)` | 3.8 ms; region already minimal per tx size; `.fill` is memset — no brick |
+
+**B — EOB coefficient (once/block):**
+| prim | what | verdict |
+|---|---|---|
+| B1 | eob → (rc,x,y) map | once/block — no brick |
+| B2 | eob base token | **ASM** (`eob_base_tok` adapt4) — no brick |
+| B3 | eob hi token | **ASM** (`br_tok` hi_tok) — no brick |
+| B4 | record cf.set + levels write | 2 stores/block — no brick |
+
+**C — main AC loop (45M calls — the only place a flip could show):**
+| prim | what | verdict |
+|---|---|---|
+| C1 | scan→position (+ `%=32`) | table load + shift/mask, in MSAC shadow; `%=32` can't be safely elided (H/V OOB risk) — no brick |
+| C2 | level_off | trivial arithmetic — no brick |
+| C3 | **get_lo_ctx** | **TESTED: direct-index → −0.39% FLAT** (9-round A/B; measured ~0.5 ns/call, in shadow) — REVERTED |
+| C4 | base token | **ASM** (`base_tok` adapt4) — the dominant cost — no brick |
+| C5 | hi token (base-range) | **ASM** (`br_tok` hi_tok) — no brick |
+| C6 | branchless pack + linked-list | already branchless (debug_assert-verified), in shadow — no brick |
+
+**D — DC coefficient (once/block):**
+| prim | what | verdict |
+|---|---|---|
+| D1 | DC lo_ctx | once/block — no brick |
+| D2 | DC base token | **ASM** — no brick |
+| D3 | DC hi token + mag ctx | **ASM** — no brick |
+
+**Every primitive is at its floor.** Two structural facts, both now verified:
+1. **All six MSAC readers are asm** (SSE2, dav1d `msac.asm`, `target_feature="sse2"` → always
+   on x86_64, checkasm-verified). B2/B3/C4/C5/D2/D3 are off the pure-Rust table entirely.
+2. **The pure-Rust primitives run in the asm-MSAC shadow.** C3 — the *biggest* per-coefficient
+   pure-Rust op — went direct-index and moved whole-decode −0.39% (flat): out-of-order execution
+   overlaps the bookkeeping with the serial range-decode, so it's off the critical path. C1/C2/C6
+   are smaller than C3 ⟹ also flat. A/B/D run 225k× vs the loop's 45M× (~200× too small to move
+   whole-decode).
+
+The only lever left on the token loop is the **asm range decoder itself** (`msac.asm`) — a
+serial SSE2 kernel that doesn't parallelize with SIMD and is already checkasm-verified dav1d
+code. Outside the pure-Rust brick game; not attempted. Refuted do-not-retry (token loop): C3
+get_lo_ctx direct-index (flat), plus the earlier get_lo_ctx SIMD / levels memset / dequant.
+
 ## Mode-symbol path — full teardown (07-01, measured)
 
 The other pure-Rust budget: **mode-symbol decode + setup = 177 ms (~17% of decode)**. Scopes
@@ -140,3 +192,5 @@ restoration and no film grain — those asm kernels are untested here, though as
 | 07-01 | get_lo_ctx SIMD | (hypothesised: B7a-analog context stencil) | ~22 ms, ~0.5 ns/call; loop-carried (levels written incrementally) | n/a | **NOT A BRICK** — near-free + un-batchable; the decoder is not the encoder |
 | 07-01 | mode-symbol audit | MvRefsFind/VartxTree/ResetCtx scopes | refmvs_find 30 ms, vartx 9 ms, reset_context 0.18 ms | `c823cce7` ✔ | **KEPT (instrument)** — no brick; reset_context refuted |
 | 07-01 | **DQ1** | branchless conditional-negate on dequant sign (both AC loops) | **interleaved whole-decode A/B: −0.78% = FLAT** (9 rounds, base 1.0091 vs brick 1.0170, overlapping) | `c823cce7` ✔ | **REVERTED** — LLVM already emits the optimal negate (the F1 lesson); loop is bound by serial cf-read + asm sign-read, not sign application |
+| 07-01 | token-loop per-primitive audit | iterated A/B/C/D (all 18 primitives); see table above | — | `c823cce7` ✔ | every primitive at floor; MSAC readers all asm; pure-Rust in the asm shadow |
+| 07-01 | **C3** | get_lo_ctx direct-index (drop `\|y,x\| y*stride+x` closure) | **9-round A/B: −0.39% = FLAT** (base 1.0255 vs 1.0295) | `c823cce7` ✔ | **REVERTED** — biggest per-coef pure-Rust prim, in MSAC shadow; LLVM already inlines the closure optimally |
