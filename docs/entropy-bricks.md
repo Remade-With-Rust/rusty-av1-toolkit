@@ -153,6 +153,15 @@ cutting it byte-identically is not possible; count reduction = `experimental` la
 `iscan.iter().zip(coeffs).map(select).max()` over the ENTIRE tx area to find eob.
 Vectorizable select+max; verify codegen, consider early structure.
 
+### Q-split MEASURED 2026-07-01 (info scopes, s6 640×480×10f, post-B7a)
+quantize = **16.5% of RDO** (grew from 12.3% as B7a shrank the RDO denominator):
+- **Q1 eob-scan = 0.9%** (42-45 ms) — raster-order independent masked-max, already
+  efficient (auto-vec-shaped). **SKIP — not a brick** regardless of codegen.
+- **Q2 main loop = ~14% of RDO ≈ ~11% encode** (676-730 ms) — **the whole prize.**
+- DC + tail = ~1.5% (negligible).
+Q2 is provably NOT auto-vectorizable: loop-carried `level_mode` + scan-order
+gather/scatter. The two-pass restructure below is the byte-identical lever.
+
 ### Q2 — the main quant loop's serial `level_mode` (lines 318-340)
 `level_mode` feeds each iteration from the previous → **blocks auto-vectorization**
 (the classic pattern from the playbook). Byte-identical restructure candidates:
