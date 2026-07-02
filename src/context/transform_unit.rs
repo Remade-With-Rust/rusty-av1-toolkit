@@ -919,9 +919,14 @@ impl ContextWriter<'_> {
   /// (12-13% of encode). This kernel computes the context for EVERY raster
   /// position with column-contiguous u8 min/add loops over the padded
   /// `levels` buffer — the layout libaom designed for exactly this SIMD
-  /// access pattern (see `TX_PAD_END`) — which LLVM can auto-vectorize.
-  /// The offset tables saturate (2D at row/col 4; 1D at index 2), so each
-  /// column is a short scalar prologue plus a constant-offset vector tail.
+  /// access pattern (see `TX_PAD_END`). The offset tables saturate (2D at
+  /// row/col 4; 1D at index 2), so each column is a short scalar prologue
+  /// plus a constant-offset tail.
+  ///
+  /// NOTE (B7a-SIMD asm inspection): LLVM does NOT auto-vectorize these loops
+  /// (pure scalar codegen) — the restructure alone bought the −64%. This
+  /// scalar version is the oracle and the non-AVX2 fallback; the deployed
+  /// x86-64 path is `nz_map_area_kernel_avx2` below.
   ///
   /// Byte-identical to `get_nz_map_ctx` at every non-eob position — the
   /// scalar stays in-tree as the oracle (`nz_map_area_kernel_matches_scalar`)
@@ -1022,6 +1027,182 @@ impl ContextWriter<'_> {
     }
   }
 
+  /// Brick B7a-SIMD: AVX2 twin of `nz_map_area_kernel`.
+  ///
+  /// The coded height is ≤ 32, so ONE unaligned 32-lane ymm op covers an
+  /// entire column: 5 `vpminub`(3)+`vpaddb` stencil loads, `vpavgb(mag,0)`
+  /// (= exactly `(mag+1)>>1`), `vpminub`(4), `vpaddb` offset, one store.
+  /// Lanes ≥ height compute garbage from pad/next-column bytes; they land in
+  /// the NEXT column's `out` cells and are overwritten by that column's store
+  /// (columns are written in ascending order), or fall beyond `area` inside
+  /// the fixed 1024-byte array. Offset vectors (lane r = table[min(r,sat)])
+  /// are precomputed per tx_size in a lazy static.
+  ///
+  /// # Safety
+  ///
+  /// Caller must ensure AVX2 is available AND that
+  /// `(width+3)*(height+4) + 32 <= levels.len()` (the dispatch enforces this
+  /// with a hard check). That expression is the supremum of all loads across
+  /// the three class arms (HORIZ's last-column col+4 read dominates: 2D peaks
+  /// at `(w+1)*stride+32`, VERT at `w*stride+32`). For the production buffer
+  /// (`levels.len() = TX_PAD_2D − TX_PAD_TOP*stride = 1384 − 2*(h+4)`) it
+  /// holds for every coded size — binding case 32×32: 35*36+32 = 1292 ≤ 1312,
+  /// where the 16-byte `TX_PAD_END` provides the margin. All 32-byte stores
+  /// stay inside `out`: `(width−1)*height + 32 ≤ 1024` for every coded size
+  /// (equality only at 32×32, where the last store ends exactly at 1024).
+  #[cfg(target_arch = "x86_64")]
+  #[target_feature(enable = "avx2")]
+  unsafe fn nz_map_area_kernel_avx2(
+    levels: &[u8], height: usize, width: usize, tx_size: TxSize,
+    tx_class: TxClass, out: &mut [u8; MAX_CODED_TX_SQUARE],
+  ) {
+    use std::arch::x86_64::*;
+
+    let stride = height + TX_PAD_HOR;
+    debug_assert!(height <= 32 && width <= 32);
+    debug_assert!((width + 3) * stride + 32 <= levels.len());
+    debug_assert!((width - 1) * height + 32 <= MAX_CODED_TX_SQUARE);
+
+    // Per-tx-size offset vectors, lane r = av1_nz_map_ctx_offset[tx][min(r,4)][mc]
+    // (2D) and lane r = nz_map_ctx_offset_1d[min(r,2)] (VERT), built once.
+    struct OffTables {
+      two_d: [[[u8; 32]; 5]; TxSize::TX_SIZES_ALL],
+      vert: [u8; 32],
+    }
+    static OFF_TABLES: std::sync::OnceLock<OffTables> = std::sync::OnceLock::new();
+    let tables = OFF_TABLES.get_or_init(|| {
+      let mut t = OffTables {
+        two_d: [[[0; 32]; 5]; TxSize::TX_SIZES_ALL],
+        vert: [0; 32],
+      };
+      for ts in 0..TxSize::TX_SIZES_ALL {
+        for mc in 0..5 {
+          for r in 0..32 {
+            t.two_d[ts][mc][r] = av1_nz_map_ctx_offset[ts][r.min(4)][mc] as u8;
+          }
+        }
+      }
+      for r in 0..32 {
+        t.vert[r] = nz_map_ctx_offset_1d[r.min(2)] as u8;
+      }
+      t
+    });
+
+    let lp = levels.as_ptr();
+    let op = out.as_mut_ptr();
+    let zero = _mm256_setzero_si256();
+    let three = _mm256_set1_epi8(3);
+    let four = _mm256_set1_epi8(4);
+
+    // min(3, 32 bytes at p)
+    macro_rules! m3 {
+      ($p:expr) => {
+        _mm256_min_epu8(_mm256_loadu_si256($p as *const __m256i), three)
+      };
+    }
+
+    match tx_class {
+      TX_CLASS_2D => {
+        // stencil: {1,0} {2,0} in-column, {0,1} {1,1} col+1, {0,2} col+2
+        let offs = &tables.two_d[tx_size as usize];
+        for c in 0..width {
+          let p0 = lp.add(c * stride);
+          let p1 = p0.add(stride);
+          let p2 = p1.add(stride);
+          let mag = _mm256_add_epi8(
+            _mm256_add_epi8(
+              _mm256_add_epi8(m3!(p0.add(1)), m3!(p0.add(2))),
+              _mm256_add_epi8(m3!(p1), m3!(p1.add(1))),
+            ),
+            m3!(p2),
+          );
+          let base = _mm256_min_epu8(_mm256_avg_epu8(mag, zero), four);
+          let off =
+            _mm256_loadu_si256(offs[c.min(4)].as_ptr() as *const __m256i);
+          _mm256_storeu_si256(
+            op.add(c * height) as *mut __m256i,
+            _mm256_add_epi8(base, off),
+          );
+        }
+        // 2D DC: context is 0 regardless of stats (no later column rewrites
+        // out[0] — stores only move forward)
+        out[0] = 0;
+      }
+      TX_CLASS_HORIZ => {
+        // stencil: {1,0} in-column + cols +1..+4 same row; offset is
+        // column-constant
+        for c in 0..width {
+          let p0 = lp.add(c * stride);
+          let mag = _mm256_add_epi8(
+            _mm256_add_epi8(
+              _mm256_add_epi8(m3!(p0.add(1)), m3!(p0.add(stride))),
+              _mm256_add_epi8(m3!(p0.add(2 * stride)), m3!(p0.add(3 * stride))),
+            ),
+            m3!(p0.add(4 * stride)),
+          );
+          let base = _mm256_min_epu8(_mm256_avg_epu8(mag, zero), four);
+          let off = _mm256_set1_epi8(nz_map_ctx_offset_1d[c] as i8);
+          _mm256_storeu_si256(
+            op.add(c * height) as *mut __m256i,
+            _mm256_add_epi8(base, off),
+          );
+        }
+      }
+      TX_CLASS_VERT => {
+        // stencil: rows +1..+4 in-column + {0,1} col+1; offset saturates at
+        // row 2
+        let off =
+          _mm256_loadu_si256(tables.vert.as_ptr() as *const __m256i);
+        for c in 0..width {
+          let p0 = lp.add(c * stride);
+          let mag = _mm256_add_epi8(
+            _mm256_add_epi8(
+              _mm256_add_epi8(m3!(p0.add(1)), m3!(p0.add(2))),
+              _mm256_add_epi8(m3!(p0.add(3)), m3!(p0.add(4))),
+            ),
+            m3!(p0.add(stride)),
+          );
+          let base = _mm256_min_epu8(_mm256_avg_epu8(mag, zero), four);
+          _mm256_storeu_si256(
+            op.add(c * height) as *mut __m256i,
+            _mm256_add_epi8(base, off),
+          );
+        }
+      }
+    }
+  }
+
+  /// B7a dispatch: cached AVX2 detection (honours `RAV1E_CPU_TARGET` via
+  /// `CpuFeatureLevel::default()`, evaluated once).
+  #[inline(always)]
+  fn nz_map_area_kernel_dispatch(
+    levels: &[u8], height: usize, width: usize, tx_size: TxSize,
+    tx_class: TxClass, out: &mut [u8; MAX_CODED_TX_SQUARE],
+  ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+      use crate::cpu_features::CpuFeatureLevel;
+      static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+      // The hard length check makes the unsafe contract caller-proof in
+      // release builds too (a short `levels` slice falls back to the scalar
+      // kernel, which bounds-checks): one predictable branch per tx block.
+      if (width + 3) * (height + TX_PAD_HOR) + 32 <= levels.len()
+        && *HAS_AVX2
+          .get_or_init(|| CpuFeatureLevel::default() >= CpuFeatureLevel::AVX2)
+      {
+        // SAFETY: AVX2 presence and the in-bounds supremum are both checked
+        // above; the full bounds derivation is on the kernel's # Safety doc.
+        unsafe {
+          Self::nz_map_area_kernel_avx2(
+            levels, height, width, tx_size, tx_class, out,
+          );
+        }
+        return;
+      }
+    }
+    Self::nz_map_area_kernel(levels, height, width, tx_size, tx_class, out);
+  }
+
   /// `coeff_contexts_no_scan` is not in the scan order.
   /// Value for `pos = scan[i]` is at `coeff[i]`, not at `coeff[pos]`.
   pub fn get_nz_map_contexts<'c>(
@@ -1043,7 +1224,7 @@ impl ContextWriter<'_> {
     let height = 1usize << bhl;
     let width = area >> bhl;
     let mut ctx_area = [0u8; MAX_CODED_TX_SQUARE];
-    Self::nz_map_area_kernel(
+    Self::nz_map_area_kernel_dispatch(
       levels, height, width, tx_size, tx_class, &mut ctx_area,
     );
     let last = usize::from(eob) - 1;
@@ -1174,6 +1355,28 @@ mod nz_map_kernel_test {
             levels, height, width, ts, tc, &mut ctx_area,
           );
 
+          // The production entry point (guard + cpu dispatch) must agree too.
+          let mut ctx_dispatch = [0u8; MAX_CODED_TX_SQUARE];
+          ContextWriter::nz_map_area_kernel_dispatch(
+            levels, height, width, ts, tc, &mut ctx_dispatch,
+          );
+
+          // B7a-SIMD: the AVX2 twin must agree with the scalar kernel
+          // bit-for-bit at every raster position (integer kernel gate).
+          #[cfg(target_arch = "x86_64")]
+          let avx2_area = if std::arch::is_x86_feature_detected!("avx2") {
+            let mut a = [0u8; MAX_CODED_TX_SQUARE];
+            // SAFETY: AVX2 detected; kernel bounds documented + asserted.
+            unsafe {
+              ContextWriter::nz_map_area_kernel_avx2(
+                levels, height, width, ts, tc, &mut a,
+              );
+            }
+            Some(a)
+          } else {
+            None
+          };
+
           for pos in 0..area {
             let scalar = ContextWriter::get_nz_map_ctx(
               levels, pos, bhl, area, 1, false, ts, tc,
@@ -1187,6 +1390,23 @@ mod nz_map_kernel_test {
               ts as usize,
               tc as usize,
             );
+            assert_eq!(
+              ctx_dispatch[pos], ctx_area[pos],
+              "dispatch/scalar mismatch at pos {pos} ts={} tc={}",
+              ts as usize,
+              tc as usize,
+            );
+            #[cfg(target_arch = "x86_64")]
+            if let Some(a) = &avx2_area {
+              assert_eq!(
+                a[pos], ctx_area[pos],
+                "AVX2/scalar mismatch at pos {pos} (r={}, c={}) ts={} tc={}",
+                pos & (height - 1),
+                pos >> bhl,
+                ts as usize,
+                tc as usize,
+              );
+            }
           }
         }
       }
