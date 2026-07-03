@@ -1,0 +1,11 @@
+# GitHub Linguist overrides — keep the language bar reflecting our Rust work.
+#
+# The C sources under rusty_av1d/ are the upstream dav1d reference decoder,
+# carried alongside the Rust port for reference. They are NOT compiled
+# (build.rs only assembles the NASM .asm kernels), so exclude them from stats.
+rusty_av1d/**/*.c   linguist-vendored
+rusty_av1d/**/*.h   linguist-vendored
+
+# The doc notebooks are inherited verbatim from upstream rav1e; the large one
+# is mostly base64-embedded output plots. Treat as documentation, not source.
+*.ipynb             linguist-documentation
