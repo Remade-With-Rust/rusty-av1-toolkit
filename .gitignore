@@ -1,0 +1,8 @@
+# Rust build artifacts (each crate also carries its own .gitignore)
+target/
+**/target/
+
+# Editor / OS cruft
+*.orig
+*.swp
+.DS_Store

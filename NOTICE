@@ -1,0 +1,30 @@
+rusty-av1-toolkit — provenance and third-party notices
+======================================================
+
+This repository combines two independent, forked projects, each kept in its
+own subdirectory with its full commit history and its own upstream license
+files. Nothing in those upstream license files is removed or altered; the
+top-level LICENSE is an umbrella that points here.
+
+rusty_av1e/  — AV1 ENCODER
+    Fork of rav1e (https://github.com/xiph/rav1e), the AV1 encoder by the
+    Alliance for Open Media / rav1e contributors.
+    License: BSD 2-Clause  ->  rusty_av1e/LICENSE
+    Patents: Alliance for Open Media Patent License 1.0  ->  rusty_av1e/PATENTS
+    The AOM patent grant in rusty_av1e/PATENTS travels with the encoder and
+    must be retained in any redistribution.
+
+rusty_av1d/  — AV1 DECODER
+    Fork of rav1d (https://github.com/memorysafety/rav1d), the safe-Rust port
+    of dav1d by VideoLAN / the dav1d authors / Internet Security Research Group.
+    License: BSD 2-Clause  ->  rusty_av1d/COPYING
+
+Local modifications
+-------------------
+The encoder and decoder in this repository are modified from their upstreams
+(branches `opt-entropy` and `opt-coeffs` respectively). See each subdirectory's
+README/CHANGELOG and the git history for the specific changes.
+
+Both upstreams are BSD 2-Clause licensed; the combined work is distributed
+under the same terms (see LICENSE), with the additional AOM patent grant
+applying to the rusty_av1e subtree.
