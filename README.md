@@ -81,8 +81,10 @@ AV1 and doubles as the encoder's conformance oracle.
 
 **Remade With Rust** is an initiative by [Mata Network](https://www.mata.network)
 to rebuild essential C and C++ tools in Rust — for the memory safety, the
-predictable performance, and the freedom of a permissive license. Each project is a reimplementation, not a fork: same wire protocols and file formats,
-new code you can actually depend on.
+predictable performance, and the freedom of a permissive license. Most projects
+are clean reimplementations; this one forks and hardens the best
+permissively-licensed Rust AV1 codecs already out there — either way, new code
+you can actually depend on, no copyleft.
 
 We build the core to production grade and open-source it so the community can
 extend it. No copyleft. No surprises. Just the tools we rely on, made faster and
