@@ -52,27 +52,48 @@ pub fn emit(line: &str) {
 // multiplier; `MI:MP` = separate intra/inter multipliers; `i:M` / `p:M` =
 // scale only intra / only inter frames.
 
-static LAMBDA_MULT: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+static LAMBDA_MULT: OnceLock<Option<LambdaMult>> = OnceLock::new();
 
-/// (intra_mult, inter_mult) for the λ probe, or `None` when off.
-pub fn lambda_mult() -> Option<(f64, f64)> {
+/// λ probe configuration (prom_av1e002/009).
+#[derive(Clone, Copy)]
+pub enum LambdaMult {
+  /// (intra_mult, inter_mult)
+  Kind(f64, f64),
+  /// Per-pyramid-level multipliers, indexed by `pyramid_level.min(3)`;
+  /// intra frames use index 0. The frame-role axis (prom_av1e009) —
+  /// SVT shapes λ by layer (~1.17-1.41× on high layers); rav1e's stock λ
+  /// is role-uniform.
+  Level([f64; 4]),
+}
+
+/// The λ probe, or `None` when off. `M` | `MI:MP` | `i:M` | `p:M` |
+/// `l:M0:M1:M2:M3` (per pyramid level).
+pub fn lambda_mult() -> Option<LambdaMult> {
   *LAMBDA_MULT.get_or_init(|| {
     let v = std::env::var("RAV1E_LAMBDA_MULT").ok()?;
     let s = v.trim();
     if s.is_empty() || s == "0" || s == "off" {
       return None;
     }
+    if let Some(rest) = s.strip_prefix("l:") {
+      let ms: Vec<f64> =
+        rest.split(':').filter_map(|x| x.trim().parse().ok()).collect();
+      if ms.len() == 4 {
+        return Some(LambdaMult::Level([ms[0], ms[1], ms[2], ms[3]]));
+      }
+      return None;
+    }
     if let Some(m) = s.strip_prefix("i:") {
-      return Some((m.parse().ok()?, 1.0));
+      return Some(LambdaMult::Kind(m.parse().ok()?, 1.0));
     }
     if let Some(m) = s.strip_prefix("p:") {
-      return Some((1.0, m.parse().ok()?));
+      return Some(LambdaMult::Kind(1.0, m.parse().ok()?));
     }
     if let Some((mi, mp)) = s.split_once(':') {
-      return Some((mi.parse().ok()?, mp.parse().ok()?));
+      return Some(LambdaMult::Kind(mi.parse().ok()?, mp.parse().ok()?));
     }
     let m: f64 = s.parse().ok()?;
-    Some((m, m))
+    Some(LambdaMult::Kind(m, m))
   })
 }
 
@@ -80,7 +101,9 @@ pub fn lambda_mult() -> Option<(f64, f64)> {
 //
 // One switch for the campaign's kept knobs (individual envs still override):
 //   RAV1E_FAST=clean → MODE_TOPK=6                       (+25.8% @ +0.024% BD)
-//   RAV1E_FAST=fast  → + LRF gate + partition gate       (+29.6% @ +0.213% BD)
+//   RAV1E_FAST=fast  → + PD0 proxy gate (-999:0.134)     (+38.1% @ +0.096% BD)
+// (Full-length 6-clip × 4-QP ladders. The earlier LRF+partition-gate bundle
+// is DOMINATED by pd0+topk — those knobs remain as individual levers.)
 // Unset = stock rav1e (byte-identical; FNV-proven). Deliberately NOT part of
 // --racecar, whose contract is byte-identical kernel swaps only.
 
@@ -154,15 +177,7 @@ static PART_GATE: OnceLock<Option<(f64, f64, f64)>> = OnceLock::new();
 /// Per-bsize (64, 32, 16) thresholds for the partition-split gate.
 pub fn part_gate() -> Option<(f64, f64, f64)> {
   *PART_GATE.get_or_init(|| {
-    let v = match std::env::var("RAV1E_PART_GATE") {
-      Ok(v) => v,
-      Err(_) if fast_tier() == FastTier::Fast => {
-        return Some((300.0, -1.0, -1.0))
-      }
-      Err(_) => return None,
-    };
-    let v: Option<String> = Some(v);
-    let v = v?;
+    let v = std::env::var("RAV1E_PART_GATE").ok()?;
     let s = v.trim();
     if s.is_empty() || s == "0" || s == "off" {
       return None;
@@ -172,6 +187,36 @@ pub fn part_gate() -> Option<(f64, f64, f64)> {
     let t32 = it.next()?.trim().parse().ok()?;
     let t16 = it.next()?.trim().parse().ok()?;
     Some((t64, t32, t16))
+  })
+}
+
+// --- prom_av1e010: PD0 proxy margin gates -----------------------------------
+//
+// A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)
+// gates BOTH partition arms by its dimensionless margin m = (node−kids)/node:
+// m < TN ⇒ NONE-confident, skip the split subtree; m > TS ⇒ split-confident,
+// skip the fresh 64×64 NONE full trial. `RAV1E_PD0_GATE=TN:TS`; unset = off.
+
+static PD0_GATE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+
+/// (TN, TS) margin thresholds for the PD0 proxy gates, or `None` when off.
+pub fn pd0_gate() -> Option<(f64, f64)> {
+  *PD0_GATE.get_or_init(|| {
+    let v = match std::env::var("RAV1E_PD0_GATE") {
+      Ok(v) => v,
+      Err(_) if fast_tier() == FastTier::Fast => {
+        return Some((-999.0, 0.134))
+      }
+      Err(_) => return None,
+    };
+    let v: Option<String> = Some(v);
+    let v = v?;
+    let s = v.trim();
+    if s.is_empty() || s == "0" || s == "off" {
+      return None;
+    }
+    let (tn, ts) = s.split_once(':')?;
+    Some((tn.trim().parse().ok()?, ts.trim().parse().ok()?))
   })
 }
 
@@ -221,13 +266,7 @@ static LRF_GATE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
 /// Per-plane (Y, UV) thresholds for the LRF solve gate, or `None` when off.
 pub fn lrf_gate() -> Option<(f64, f64)> {
   *LRF_GATE.get_or_init(|| {
-    let v = match std::env::var("RAV1E_LRF_GATE") {
-      Ok(v) => v,
-      Err(_) if fast_tier() == FastTier::Fast => return Some((800.0, 200.0)),
-      Err(_) => return None,
-    };
-    let v: Option<String> = Some(v);
-    let v = v?;
+    let v = std::env::var("RAV1E_LRF_GATE").ok()?;
     match v.as_str() {
       "" | "0" | "off" => None,
       "1" | "on" => Some((800.0, 200.0)),

@@ -1120,6 +1120,56 @@ pub fn rdo_mode_decision<T: Pixel>(
   }
 }
 
+/// prom_av1e010 — PD0-style block proxy cost: ONE NEARESTMV(LAST) prediction
+/// + SATD, scaled like compute_mv_rd's cost units. No transforms, no entropy,
+/// no context writes; scribbles the prediction into ts.rec exactly like the
+/// inter mode screen does (trials/final encode overwrite it).
+fn pd0_proxy_cost<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
+) -> u64 {
+  if tile_bo.0.x >= ts.mi_width || tile_bo.0.y >= ts.mi_height {
+    return 0;
+  }
+  let ref_frames = [LAST_FRAME, NONE_FRAME];
+  let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+  let _ = cw.find_mvrefs(tile_bo, ref_frames, &mut mv_stack, bsize, fi, false);
+  let mv = if mv_stack.is_empty() {
+    MotionVector::default()
+  } else {
+    mv_stack[0].this_mv
+  };
+
+  let tile_rect = ts.tile_rect();
+  let rec = &mut ts.rec.planes[0];
+  let po = tile_bo.plane_offset(rec.plane_cfg);
+  let mut rec_region =
+    rec.subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+  PredictionMode::NEARESTMV.predict_inter(
+    fi,
+    tile_rect,
+    0,
+    po,
+    &mut rec_region,
+    bsize.width(),
+    bsize.height(),
+    ref_frames,
+    [mv, MotionVector::default()],
+    &mut ts.inter_compound_buffers,
+  );
+  let plane_org =
+    ts.input_tile.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+  let satd = get_satd(
+    &plane_org,
+    &rec_region.as_const(),
+    bsize.width(),
+    bsize.height(),
+    fi.sequence.bit_depth,
+    fi.cpu_feature_level,
+  );
+  256 * satd as u64
+}
+
 #[profiling::function]
 fn inter_frame_rdo_mode_decision<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
@@ -2012,6 +2062,48 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   let w_pre_checkpoint = w_pre_cdef.checkpoint();
   let w_post_checkpoint = w_post_cdef.checkpoint();
 
+  // prom_av1e010: PD0 proxy costs + margin gates. The proxy tree (node vs
+  // 4-children SATD, one NEARESTMV prediction each) yields a dimensionless
+  // margin m = (node − kids)/node: large ⇒ split-confident (skip the fresh
+  // NONE full trial — only fresh at 64), small/negative ⇒ NONE-confident
+  // (skip the split subtree). Inter frames only; off unless harvesting or
+  // RAV1E_PD0_GATE is set.
+  let pd0_gate = crate::harvest::pd0_gate();
+  // Shipped gate form is 64×64-only (the ceiling: below 64 the NONE arm is
+  // cached — skipping saves nothing; and the skip-SPLIT direction is
+  // dominated by the av1e005 none_rd gate). Harvest still taps all levels.
+  let pd0_active = fi.frame_type.has_inter()
+    && bsize.is_sqr()
+    && bsize >= BlockSize::BLOCK_16X16
+    && bsize <= BlockSize::BLOCK_64X64
+    && (crate::harvest::enabled()
+      || (pd0_gate.is_some() && bsize == BlockSize::BLOCK_64X64));
+  let (mut pd0_node, mut pd0_kids) = (0u64, 0u64);
+  if pd0_active {
+    pd0_node = pd0_proxy_cost(fi, ts, cw, bsize, tile_bo);
+    if let Ok(subsize) = bsize.subsize(PARTITION_SPLIT) {
+      let hbsw = subsize.width_mi();
+      let hbsh = subsize.height_mi();
+      for (dx, dy) in [(0, 0), (hbsw, 0), (0, hbsh), (hbsw, hbsh)] {
+        let bo = TileBlockOffset(BlockOffset {
+          x: tile_bo.0.x + dx,
+          y: tile_bo.0.y + dy,
+        });
+        pd0_kids += pd0_proxy_cost(fi, ts, cw, subsize, bo);
+      }
+    }
+  }
+  let pd0_margin = if pd0_active && pd0_node > 0 {
+    (pd0_node as f64 - pd0_kids as f64) / (pd0_node as f64)
+  } else {
+    0.0
+  };
+  let (mut pd0_skip_none, mut pd0_skip_split) = (false, false);
+  if let (true, Some((t_none, t_split))) = (pd0_active, pd0_gate) {
+    pd0_skip_split = pd0_margin < t_none;
+    pd0_skip_none = pd0_margin > t_split;
+  }
+
   // prom_av1e005: the NONE arm's RD cost, for the partition-split gate
   // (see harvest::part_gate) and the harvest tap. NONE runs first (caller
   // passes [NONE, SPLIT]), so this is populated before any split trial.
@@ -2029,6 +2121,19 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
       if partition == PARTITION_NONE {
         none_rd_seen = Some(cached_block.rd_cost);
       }
+      continue;
+    }
+
+    // prom_av1e010 margin gates: proxy-confident directions skip an arm.
+    // skip_none only saves work where NONE is FRESH (64×64); at 32/16 the
+    // cached NONE costs nothing to keep as the fallback.
+    if pd0_skip_none
+      && partition == PARTITION_NONE
+      && partition != cached_block.part_type
+    {
+      continue;
+    }
+    if pd0_skip_split && partition != PARTITION_NONE {
       continue;
     }
 
@@ -2137,7 +2242,7 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
         }
       }
       crate::harvest::emit(&format!(
-        "PART,{},{},{:.4},{:.4},{},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4}",
+        "PART,{},{},{:.4},{:.4},{},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{},{}",
         fi.input_frameno,
         bsize.width(),
         none_rd,
@@ -2149,6 +2254,8 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
         qvars[2],
         qvars[3],
         split_rd_seen.unwrap_or(-1.0),
+        pd0_node,
+        pd0_kids,
       ));
     }
   }

@@ -1254,10 +1254,18 @@ impl<T: Pixel> FrameInvariants<T> {
     }
     self.lambda =
       qps.lambda * ((1 << (2 * (self.sequence.bit_depth - 8))) as f64);
-    // prom_av1e002: experimental λ probe (env RAV1E_LAMBDA_MULT; unset =
+    // prom_av1e002/009: experimental λ probe (env RAV1E_LAMBDA_MULT; unset =
     // baseline). me_lambda derives from the scaled value below.
-    if let Some((m_intra, m_inter)) = crate::harvest::lambda_mult() {
-      self.lambda *= if self.intra_only { m_intra } else { m_inter };
+    match crate::harvest::lambda_mult() {
+      Some(crate::harvest::LambdaMult::Kind(m_intra, m_inter)) => {
+        self.lambda *= if self.intra_only { m_intra } else { m_inter };
+      }
+      Some(crate::harvest::LambdaMult::Level(ms)) => {
+        let lvl =
+          if self.intra_only { 0 } else { (self.pyramid_level as usize).min(3) };
+        self.lambda *= ms[lvl];
+      }
+      None => {}
     }
     self.me_lambda = self.lambda.sqrt();
     self.dist_scale = qps.dist_scale.map(DistortionScale::from);
