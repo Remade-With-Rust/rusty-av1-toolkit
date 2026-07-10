@@ -87,6 +87,7 @@ stages! {
   IntraEdges       => "get_intra_edges [info]",
   CflAlpha         => "rdo_cfl_alpha [info]",
   InterModeScreen  => "inter mode screen/SATD [info]",
+  FinalEncode      => "final encode (winner recode) [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
   // entropy-path internal audit (inside EntropyRate/write_coeffs_lv_map):
@@ -116,6 +117,7 @@ impl Stage {
         | Stage::IntraEdges
         | Stage::CflAlpha
         | Stage::InterModeScreen
+        | Stage::FinalEncode
         | Stage::MvRefList
         | Stage::QcoeffsZero
         | Stage::TxbCtx

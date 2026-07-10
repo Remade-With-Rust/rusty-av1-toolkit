@@ -86,6 +86,8 @@ mod activity;
 pub(crate) mod asm;
 mod dist;
 #[doc(hidden)]
+pub mod harvest;
+#[doc(hidden)]
 pub mod prof;
 #[doc(hidden)]
 pub mod racecar;

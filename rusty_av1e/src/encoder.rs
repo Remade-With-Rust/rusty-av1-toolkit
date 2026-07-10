@@ -929,7 +929,11 @@ impl<T: Pixel> FrameInvariants<T> {
       use_tx_domain_rate,
       idx_in_group_output: 0,
       pyramid_level: 0,
-      enable_early_exit: true,
+      // prom_av1e008 harvest aid: RAV1E_NO_EARLY_EXIT=1 disables the split
+      // trial's early exit so harvested split costs are COMPLETE (regret
+      // analysis needs them). Unset = stock behaviour.
+      enable_early_exit: std::env::var("RAV1E_NO_EARLY_EXIT")
+        .map_or(true, |v| v.trim() != "1"),
       tx_mode_select: false,
       default_filter: FilterMode::REGULAR,
       cpu_feature_level: Default::default(),
@@ -1250,6 +1254,11 @@ impl<T: Pixel> FrameInvariants<T> {
     }
     self.lambda =
       qps.lambda * ((1 << (2 * (self.sequence.bit_depth - 8))) as f64);
+    // prom_av1e002: experimental λ probe (env RAV1E_LAMBDA_MULT; unset =
+    // baseline). me_lambda derives from the scaled value below.
+    if let Some((m_intra, m_inter)) = crate::harvest::lambda_mult() {
+      self.lambda *= if self.intra_only { m_intra } else { m_inter };
+    }
     self.me_lambda = self.lambda.sqrt();
     self.dist_scale = qps.dist_scale.map(DistortionScale::from);
 
@@ -2975,7 +2984,11 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
       bsize,
       tile_bo,
       &rdo_output,
-      &[PartitionType::PARTITION_SPLIT, PartitionType::PARTITION_NONE],
+      // prom_av1e005: NONE evaluated FIRST — its cost both feeds the
+      // partition gate and gives rdo_partition_simple a real early-exit
+      // bound. Order affects output only on exact RD ties (verified
+      // byte-identical on the corpus + FNV clip).
+      &[PartitionType::PARTITION_NONE, PartitionType::PARTITION_SPLIT],
       rdo_type,
       inter_cfg,
     );
@@ -2996,6 +3009,9 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
 
   match partition {
     PartitionType::PARTITION_NONE => {
+      // prom_av1e007 (brick ②) measurement: the winner-recode tax — this arm
+      // re-derives tx size/type and re-encodes the already-decided block.
+      let _prof_fe = crate::prof::scope(crate::prof::Stage::FinalEncode);
       let rdo_decision;
       let part_decision =
         if let Some(part_mode) = rdo_output.part_modes.first() {

@@ -1734,6 +1734,14 @@ impl ContextWriter<'_> {
       MotionVector { row: mv.row - ref_mv.row, col: mv.col - ref_mv.col };
     let j: MvJointType = av1_get_mv_joint(diff);
 
+    // Prometheus harvest (prom_av1e004): true adaptive-entropy MV cost, to
+    // calibrate me.rs::get_mv_rate's 2·ilog model. Observe-only.
+    let harvest_t0 = if crate::harvest::enabled() {
+      Some(w.tell_frac())
+    } else {
+      None
+    };
+
     let cdf = &self.fc.nmv_context.joints_cdf;
     symbol_with_update!(self, w, j as u32, cdf);
 
@@ -1742,6 +1750,16 @@ impl ContextWriter<'_> {
     }
     if mv_joint_horizontal(j) {
       self.encode_mv_component(w, diff.col as i32, 1, mv_precision);
+    }
+
+    if let Some(t0) = harvest_t0 {
+      // frac bits are in 1/8-bit units (OD_BITRES).
+      crate::harvest::emit(&format!(
+        "MV,{},{},{}",
+        diff.row,
+        diff.col,
+        w.tell_frac() - t0
+      ));
     }
   }
 

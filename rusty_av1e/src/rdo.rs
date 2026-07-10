@@ -43,7 +43,7 @@ use crate::predict::{
 use crate::rdo_tables::*;
 use crate::tiling::*;
 use crate::transform::{TxSet, TxSize, TxType, RAV1E_TX_TYPES};
-use crate::util::{init_slice_repeat_mut, Aligned, Pixel};
+use crate::util::{init_slice_repeat_mut, Aligned, CastFromPrimitive, Pixel};
 use crate::write_tx_blocks;
 use crate::write_tx_tree;
 use crate::Tune;
@@ -1281,6 +1281,22 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     9 // This number is determined by AWCY test
   };
 
+  // prom_av1e006/008b: cap full trials at K in TRUE SATD order — per-bsize
+  // (SATD is a better oracle at big blocks). At s6 the stock screen is
+  // dormant (num_modes_rdo >= set len), so the knob also FORCES the SATD
+  // compute + sort. Off unless RAV1E_MODE_TOPK is set.
+  let topk_006 = crate::harvest::mode_topk();
+  let force_screen_006 = topk_006.is_some();
+  let num_full_006 = topk_006.map_or(num_modes_rdo, |ks| {
+    let k = match bsize.width().max(bsize.height()) {
+      64.. => ks[0],
+      32.. => ks[1],
+      16.. => ks[2],
+      _ => ks[3],
+    };
+    num_modes_rdo.min(k)
+  });
+
   inter_mode_set.iter().for_each(|&(luma_mode, i)| {
     let mvs = match luma_mode {
       PredictionMode::NEWMV | PredictionMode::NEW_NEWMV => mvs_from_me[i],
@@ -1321,7 +1337,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     mvs_set.push(mvs);
 
     // Calculate SATD for each mode
-    if num_modes_rdo != inter_mode_set.len() {
+    if force_screen_006 || num_modes_rdo != inter_mode_set.len() {
       let _prof = crate::prof::scope(crate::prof::Stage::InterModeScreen);
       let tile_rect = ts.tile_rect();
       let rec = &mut ts.rec.planes[0];
@@ -1362,13 +1378,21 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
 
   let mut sorted =
     izip!(inter_mode_set, mvs_set, satds).collect::<ArrayVec<_, 20>>();
-  if num_modes_rdo != sorted.len() {
+  if force_screen_006 || num_modes_rdo != sorted.len() {
     sorted.sort_by_key(|((_mode, _i), _mvs, satd)| *satd);
   }
 
-  sorted.iter().take(num_modes_rdo).for_each(
+  // prom_av1e006 harvest: the improvement sequence in screen order lets the
+  // offline sweep reconstruct the exact top-K regret curve. Observe-only.
+  let harvest_on = crate::harvest::enabled();
+  let n_enum = sorted.len();
+  let mut harvest_idx = 0usize;
+  let mut harvest_imps = String::new();
+
+  sorted.iter().take(num_full_006).for_each(
     |&((luma_mode, i), mvs, _satd)| {
       let mode_set_chroma = ArrayVec::from([luma_mode]);
+      let prev_rd = best.rd_cost;
 
       luma_chroma_mode_rdo(
         luma_mode,
@@ -1388,8 +1412,29 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         &mv_stacks[i],
         AngleDelta::default(),
       );
+
+      if harvest_on {
+        if best.rd_cost < prev_rd {
+          use std::fmt::Write as _;
+          let _ =
+            write!(harvest_imps, "{}:{:.2}|", harvest_idx, best.rd_cost);
+        }
+        harvest_idx += 1;
+      }
     },
   );
+
+  if harvest_on {
+    crate::harvest::emit(&format!(
+      "MODE,{},{},{},{},{:.4},{}",
+      fi.input_frameno,
+      bsize.width(),
+      n_enum,
+      harvest_idx,
+      fi.lambda,
+      harvest_imps,
+    ));
+  }
 
   best
 }
@@ -1967,17 +2012,51 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   let w_pre_checkpoint = w_pre_cdef.checkpoint();
   let w_post_checkpoint = w_post_cdef.checkpoint();
 
+  // prom_av1e005: the NONE arm's RD cost, for the partition-split gate
+  // (see harvest::part_gate) and the harvest tap. NONE runs first (caller
+  // passes [NONE, SPLIT]), so this is populated before any split trial.
+  let mut none_rd_seen: Option<f64> = None;
+  // prom_av1e008: the SPLIT arm's completed cost (win or lose) — regret
+  // analysis for the split-confidence gate needs the LOSING split cost too
+  // (harvest runs disable early-exit so it completes).
+  let mut split_rd_seen: Option<f64> = None;
+
   for &partition in partition_types {
     // Do not re-encode results we already have
     if partition == cached_block.part_type {
+      // prom_av1e005: at 32×32/16×16 the NONE arm arrives CACHED from the
+      // parent's split trial — it is still the gate's null-arm cost.
+      if partition == PARTITION_NONE {
+        none_rd_seen = Some(cached_block.rd_cost);
+      }
       continue;
+    }
+
+    // prom_av1e005 gate: when the whole-block (NONE) cost is already below
+    // the per-bsize threshold (rate-normalized by λ), skip trialing the
+    // split/rect candidates — their subtrees are the expensive arm. Off
+    // unless RAV1E_PART_GATE is set; the VP9 G1 pattern.
+    if partition != PARTITION_NONE {
+      if let (Some(none_rd), Some(ts_gate)) =
+        (none_rd_seen, crate::harvest::part_gate())
+      {
+        let t = match bsize {
+          BlockSize::BLOCK_64X64 => ts_gate.0,
+          BlockSize::BLOCK_32X32 => ts_gate.1,
+          BlockSize::BLOCK_16X16 => ts_gate.2,
+          _ => f64::NEG_INFINITY,
+        };
+        if none_rd / fi.lambda < t {
+          continue;
+        }
+      }
     }
 
     let mut child_modes = ArrayVec::<_, 4>::new();
 
     let cost = match partition {
       PARTITION_NONE if bsize <= BlockSize::BLOCK_64X64 => {
-        Some(rdo_partition_none(
+        let rd = rdo_partition_none(
           fi,
           ts,
           cw,
@@ -1985,7 +2064,9 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
           tile_bo,
           inter_cfg,
           &mut child_modes,
-        ))
+        );
+        none_rd_seen = Some(rd);
+        Some(rd)
       }
       PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
         rdo_partition_simple(
@@ -2009,6 +2090,9 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
     };
 
     if let Some(rd) = cost {
+      if partition == PARTITION_SPLIT {
+        split_rd_seen = Some(rd);
+      }
       if rd < best_rd {
         best_rd = rd;
         best_partition = partition;
@@ -2021,6 +2105,53 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   }
 
   assert!(best_rd >= 0_f64);
+
+  // prom_av1e005/008 harvest: one row per partition decision (observe-only).
+  // 008 adds pre-trial source features: the four quadrant variances of the
+  // block's luma source — the split-confidence signal candidates.
+  if crate::harvest::enabled() {
+    if let Some(none_rd) = none_rd_seen {
+      let mut qvars = [0f64; 4];
+      {
+        let bw = bsize.width();
+        let half = bw / 2;
+        let src = ts.input_tile.planes[0]
+          .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        for (qi, (qy, qx)) in
+          [(0, 0), (0, half), (half, 0), (half, half)].iter().enumerate()
+        {
+          let (mut s, mut s2, mut n) = (0u64, 0u64, 0u64);
+          for y in *qy..(qy + half).min(src.rect().height) {
+            let row = &src[y];
+            for x in *qx..(qx + half).min(row.len()) {
+              let v = u64::from(u32::cast_from(row[x]));
+              s += v;
+              s2 += v * v;
+              n += 1;
+            }
+          }
+          if n > 0 {
+            let m = s as f64 / n as f64;
+            qvars[qi] = s2 as f64 / n as f64 - m * m;
+          }
+        }
+      }
+      crate::harvest::emit(&format!(
+        "PART,{},{},{:.4},{:.4},{},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4}",
+        fi.input_frameno,
+        bsize.width(),
+        none_rd,
+        best_rd,
+        best_partition as usize,
+        fi.lambda,
+        qvars[0],
+        qvars[1],
+        qvars[2],
+        qvars[3],
+        split_rd_seen.unwrap_or(-1.0),
+      ));
+    }
+  }
 
   PartitionGroupParameters {
     rd_cost: best_rd,
@@ -2622,6 +2753,9 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
               let mut best_new_lrf = best_lrf[lru_y * lru_w[pli] + lru_x][pli];
               let mut best_cost =
                 best_lrf_cost[lru_y * lru_w[pli] + lru_x][pli];
+              // Prometheus harvest: the None-arm RD cost, captured for the
+              // per-LRU skip-gate dataset (prom_av1e001). Observe-only.
+              let mut harvest_none_cost = f64::NAN;
 
               // Check the no filter option
               {
@@ -2645,6 +2779,7 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                 );
 
                 let cost = compute_rd_cost(fi, rate, err);
+                harvest_none_cost = cost;
                 // Was this choice actually an improvement?
                 if best_cost < 0. || cost < best_cost {
                   best_cost = cost;
@@ -2664,6 +2799,21 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                   - loop_sbo.plane_offset(&lrf_ref.planes[pli].cfg).y as usize,
               );
 
+              // prom_av1e001 — LRF solve gate. Harvested over 4 Derf clips ×
+              // q60..200 (23 779 LRU decisions): 83.8% of sgrproj solves end
+              // in None, and none_cost/λ below a per-plane threshold marks
+              // them. Skipping the solve keeps the running best (usually
+              // None) — the integral image + per-set solve/filter/SSE are
+              // never computed. Off unless RAV1E_LRF_GATE is set.
+              let gate_skip = match crate::harvest::lrf_gate() {
+                Some((t_y, t_uv)) => {
+                  harvest_none_cost / fi.lambda
+                    < if pli == 0 { t_y } else { t_uv }
+                }
+                None => false,
+              };
+
+              if !gate_skip {
               // todo: experiment with borrowing border pixels
               // rather than edge-extending. Right now this is
               // hard-clipping to the superblock boundary.
@@ -2732,6 +2882,46 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                   best_lrf_cost[lru_y * lru_w[pli] + lru_x][pli] = cost;
                   best_new_lrf = current_lrf;
                 }
+              }
+              } // !gate_skip (prom_av1e001)
+
+              // Prometheus harvest (prom_av1e001): one row per LRU decision.
+              // Features are all PRE-solve quantities (what a skip gate could
+              // see); outcome is what the solve actually bought over None.
+              if crate::harvest::enabled() {
+                let s = lrf_in_plane.slice(lrf_po);
+                let (mut sum, mut sum2, mut n) = (0u64, 0u64, 0u64);
+                for row in s.rows_iter().take(vis_height) {
+                  for &px in &row[..vis_width] {
+                    let v = u64::from(u32::cast_from(px));
+                    sum += v;
+                    sum2 += v * v;
+                    n += 1;
+                  }
+                }
+                let mean = sum as f64 / n as f64;
+                let var = sum2 as f64 / n as f64 - mean * mean;
+                let chosen = match best_new_lrf {
+                  RestorationFilter::None => -1i32,
+                  RestorationFilter::Sgrproj { set, .. } => set as i32,
+                  RestorationFilter::Wiener { .. } => -2,
+                };
+                crate::harvest::emit(&format!(
+                  "LRF,{},{},{},{},{},{},{},{:.2},{:.2},{:.4},{:.4},{},{:.4}",
+                  fi.input_frameno,
+                  fi.base_q_idx,
+                  u8::from(!fi.intra_only),
+                  fi.pyramid_level,
+                  pli,
+                  vis_width,
+                  vis_height,
+                  mean,
+                  var,
+                  harvest_none_cost,
+                  best_cost,
+                  chosen,
+                  fi.lambda,
+                ));
               }
 
               if best_lrf[lru_y * lru_w[pli] + lru_x][pli]
