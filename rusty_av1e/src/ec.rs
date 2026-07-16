@@ -509,6 +509,14 @@ where
   /// - `val`: The value to encode (`false` or `true`).
   /// - `f`: The probability that the `val` is `true`, scaled by `32768`.
   fn bit(&mut self, bit: u16) {
+    // prom_av1e012: on counting writers a flat bit costs exactly 1 bit by
+    // construction — account it instead of running the EC store. Covers every
+    // flat-bit site in the rate path (signs, eob extras, golomb/quniform via
+    // literal, MV bits). BD-gated via RAV1E_FASTRATE (rng drift epsilons).
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+      self.add_bits_frac(8);
+      return;
+    }
     self.bool(bit == 1, 16384);
   }
   // fake add bits
@@ -521,6 +529,12 @@ where
   /// - 'bits': Length of bitstring
   /// - 's': Bit string to encode
   fn literal(&mut self, bits: u8, s: u32) {
+    // prom_av1e012: see bit() — one accounting add replaces `bits` EC stores
+    // on counting writers.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+      self.add_bits_frac(8 * u32::from(bits));
+      return;
+    }
     for bit in (0..bits).rev() {
       self.bit((1 & (s >> bit)) as u16);
     }
