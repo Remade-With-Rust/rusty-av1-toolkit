@@ -88,6 +88,14 @@ stages! {
   CflAlpha         => "rdo_cfl_alpha [info]",
   InterModeScreen  => "inter mode screen/SATD [info]",
   FinalEncode      => "final encode (winner recode) [info]",
+  // glue decomposition v2 (av1e013+): inclusive function-granularity scopes;
+  // subtract the scoped kernels inside them to get each layer's own glue.
+  EncodeBlockPost  => "encode_block_post_cdef incl [info]",
+  WriteTxBlocks    => "  write_tx_blocks incl [info]",
+  WriteTxTree      => "  write_tx_tree incl [info]",
+  MotionCompensate => "  motion_compensate incl [info]",
+  RdoTxSizeType    => "rdo_tx_size_type [info]",
+  Replay           => "recorder replay->encoder [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
   // entropy-path internal audit (inside EntropyRate/write_coeffs_lv_map):
@@ -118,6 +126,12 @@ impl Stage {
         | Stage::CflAlpha
         | Stage::InterModeScreen
         | Stage::FinalEncode
+        | Stage::EncodeBlockPost
+        | Stage::WriteTxBlocks
+        | Stage::WriteTxTree
+        | Stage::MotionCompensate
+        | Stage::RdoTxSizeType
+        | Stage::Replay
         | Stage::MvRefList
         | Stage::QcoeffsZero
         | Stage::TxbCtx

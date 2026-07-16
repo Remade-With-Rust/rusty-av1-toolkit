@@ -209,6 +209,14 @@ impl WriterEncoder {
 impl StorageBackend for WriterBase<WriterCounter> {
   #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
+    // prom_av1e015: cost by prob→bits table instead of simulating the range
+    // coder (the libaom av1_prob_cost structure). See harvest::fastsym().
+    if crate::harvest::fastsym() {
+      let w =
+        usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
+      self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
+      return;
+    }
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -244,6 +252,17 @@ impl StorageBackend for WriterBase<WriterCounter> {
 impl StorageBackend for WriterBase<WriterRecorder> {
   #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
+    // prom_av1e015: the recorder's range tracking exists only to report rate
+    // (replay re-runs the real coding from the stored tokens), so under
+    // fastsym the cost comes from the prob→bits table instead. The token
+    // push is untouched — replay integrity does not depend on rng/bits.
+    if crate::harvest::fastsym() {
+      let w =
+        usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
+      self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
+      self.s.storage.push((fl, fh, nms));
+      return;
+    }
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 

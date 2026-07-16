@@ -1694,6 +1694,7 @@ pub fn motion_compensate<T: Pixel>(
   mvs: [MotionVector; 2], bsize: BlockSize, tile_bo: TileBlockOffset,
   luma_only: bool,
 ) {
+  let _prof = crate::prof::scope(crate::prof::Stage::MotionCompensate);
   let _prof = crate::prof::scope(crate::prof::Stage::Predict);
   debug_assert!(!luma_mode.is_intra());
 
@@ -1969,6 +1970,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   rdo_type: RDOType, need_recon_pixel: bool,
   enc_stats: Option<&mut EncoderStats>,
 ) -> (bool, ScaledDistortion) {
+  let _prof = crate::prof::scope(crate::prof::Stage::EncodeBlockPost);
   let planes =
     if fi.sequence.chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
   let is_inter = !luma_mode.is_intra();
@@ -2273,6 +2275,7 @@ pub fn write_tx_blocks<T: Pixel, W: Writer>(
   tx_type: TxType, skip: bool, cfl: CFLParams, luma_only: bool,
   rdo_type: RDOType, need_recon_pixel: bool,
 ) -> (bool, ScaledDistortion) {
+  let _prof = crate::prof::scope(crate::prof::Stage::WriteTxBlocks);
   let bw = bsize.width_mi() / tx_size.width_mi();
   let bh = bsize.height_mi() / tx_size.height_mi();
   let qidx = get_qidx(fi, ts, cw, tile_bo);
@@ -2441,6 +2444,7 @@ pub fn write_tx_tree<T: Pixel, W: Writer>(
   if skip {
     return (false, ScaledDistortion::zero());
   }
+  let _prof = crate::prof::scope(crate::prof::Stage::WriteTxTree);
   let bw = bsize.width_mi() / tx_size.width_mi();
   let bh = bsize.height_mi() / tx_size.height_mi();
   let qidx = get_qidx(fi, ts, cw, tile_bo);
@@ -3489,13 +3493,19 @@ fn check_lf_queue<T: Pixel>(
           }
         }
         // Now that loop restoration is coded, we can replay the initial block bits
-        qe.w_pre_cdef.replay(w);
+        {
+          let _prof = crate::prof::scope(crate::prof::Stage::Replay);
+          qe.w_pre_cdef.replay(w);
+        }
         // Now code CDEF into the middle of the block
         if qe.cdef_coded {
           let cdef_index = cw.bc.blocks.get_cdef(qe.sbo);
           cw.write_cdef(w, cdef_index, fi.cdef_bits);
           // Code queued symbols that come after the CDEF index
-          qe.w_post_cdef.replay(w);
+          {
+            let _prof = crate::prof::scope(crate::prof::Stage::Replay);
+            qe.w_post_cdef.replay(w);
+          }
         }
         sbs_q.pop_front();
       }

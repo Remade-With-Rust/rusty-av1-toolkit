@@ -213,6 +213,44 @@ pub fn fastrate() -> bool {
   })
 }
 
+// --- prom_av1e015: table-costed counter symbols ------------------------------
+//
+// libaom/SVT never run the range coder for RDO costing: adaptive symbols are
+// costed by a prob→bits table (av1_prob_cost). Our WriterCounter instead runs
+// lr_compute + lzcnt + rng tracking per symbol (192M calls/10f) purely to
+// count bits. `RAV1E_FASTSYM=1` replaces the counter's store() with an ideal
+// −log2(width) lookup in tell_frac units (1/8 bit — the same resolution RDO
+// already consumes). CDF adaptation (log.push + update_cdf) is untouched, so
+// context evolution is preserved; only the coder-state rounding epsilons
+// differ from true bits ⇒ decisions can drift ⇒ BD-gated.
+
+static FASTSYM: OnceLock<bool> = OnceLock::new();
+
+/// True when counter symbols are costed by table instead of the range coder.
+#[inline]
+pub fn fastsym() -> bool {
+  *FASTSYM.get_or_init(|| {
+    matches!(std::env::var("RAV1E_FASTSYM").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
+/// Cost in 1/8-bit units of a symbol whose bracket width is `w` in the
+/// 9-bit (Q15 >> EC_PROB_SHIFT) domain, 0..=512. Ideal −log2(w/512); w = 0
+/// (possible after the >>6 quantization) costs as the EC_MIN_PROB floor
+/// (4/32768 ⇒ 13 bits).
+#[inline]
+pub fn sym_cost_frac(w: usize) -> u32 {
+  static TABLE: OnceLock<[u16; 513]> = OnceLock::new();
+  let t = TABLE.get_or_init(|| {
+    let mut t = [104u16; 513]; // 13 bits × 8 — the w=0 / EC_MIN_PROB floor
+    for w in 1..=512usize {
+      t[w] = ((9.0 - (w as f64).log2()) * 8.0).round() as u16;
+    }
+    t
+  });
+  u32::from(t[w])
+}
+
 // --- prom_av1e010: PD0 proxy margin gates -----------------------------------
 //
 // A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)
