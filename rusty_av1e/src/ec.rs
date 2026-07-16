@@ -35,6 +35,8 @@ type ec_window = u32;
 /// (using a new `WriterEncoder` as a `Writer`).  A `WriterRecorder`'s
 /// contents can be replayed into a `WriterEncoder`.
 pub trait Writer {
+  /// See `StorageBackend::COUNTS_ONLY` — true only for counting writers.
+  const COUNTS_ONLY: bool = false;
   /// Write a symbol `s`, using the passed in cdf reference; leaves `cdf` unchanged
   fn symbol<const CDF_LEN: usize>(&mut self, s: u32, cdf: &[u16; CDF_LEN]);
   /// return approximate number of fractional bits in `OD_BITRES`
@@ -101,6 +103,20 @@ pub trait Writer {
 /// implementation's storage to the generic `Writer`.  It would be
 /// private, but Rust is deprecating 'private trait in a public
 /// interface' support.
+/// Compile-time marker for counting-only writers (prom_av1e011 B8 fast
+/// path). Kept OFF `StorageBackend` so that trait stays dyn-compatible for
+/// the Recorder's `replay(&mut dyn StorageBackend)`. True only where the
+/// backend never materializes bits (WriterCounter); false wherever bit
+/// VALUES matter (Encoder writes them, Recorder replays them).
+pub trait CountsOnly {
+  const COUNTS_ONLY: bool = false;
+}
+impl CountsOnly for WriterBase<WriterCounter> {
+  const COUNTS_ONLY: bool = true;
+}
+impl CountsOnly for WriterBase<WriterRecorder> {}
+impl CountsOnly for WriterBase<WriterEncoder> {}
+
 pub trait StorageBackend {
   /// Store partially-computed range code into given storage backend
   fn store(&mut self, fl: u16, fh: u16, nms: u16);
@@ -477,8 +493,9 @@ impl WriterBase<WriterEncoder> {
 /// (ie, `Encoder`s and `Recorder`s)
 impl<S> Writer for WriterBase<S>
 where
-  WriterBase<S>: StorageBackend,
+  WriterBase<S>: StorageBackend + CountsOnly,
 {
+  const COUNTS_ONLY: bool = <WriterBase<S> as CountsOnly>::COUNTS_ONLY;
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
   /// `f`: The probability that the val is one, scaled by 32768.

@@ -101,7 +101,7 @@ pub fn lambda_mult() -> Option<LambdaMult> {
 //
 // One switch for the campaign's kept knobs (individual envs still override):
 //   RAV1E_FAST=clean → MODE_TOPK=6                       (+25.8% @ +0.024% BD)
-//   RAV1E_FAST=fast  → + PD0 proxy gate (-999:0.134)     (+38.1% @ +0.096% BD)
+//   RAV1E_FAST=fast  → + PD0 gate + FASTRATE             (~+38%  @ +0.099% BD)
 // (Full-length 6-clip × 4-QP ladders. The earlier LRF+partition-gate bundle
 // is DOMINATED by pd0+topk — those knobs remain as individual levers.)
 // Unset = stock rav1e (byte-identical; FNV-proven). Deliberately NOT part of
@@ -187,6 +187,29 @@ pub fn part_gate() -> Option<(f64, f64, f64)> {
     let t32 = it.next()?.trim().parse().ok()?;
     let t16 = it.next()?.trim().parse().ok()?;
     Some((t64, t32, t16))
+  })
+}
+
+// --- prom_av1e011: fast rate accounting (B8 counter path) -------------------
+//
+// On counting writers, AC-sign and golomb bits are flat-probability — their
+// exact LENGTH is known without running the range coder. `RAV1E_FASTRATE=1`
+// accounts them via fake-bits (tell_frac-visible) instead of per-bit EC
+// stores. Rate totals are exact in bits; only the counter's internal rng
+// drift differs (rounding epsilons on later symbols) ⇒ BD-gated.
+
+static FASTRATE: OnceLock<bool> = OnceLock::new();
+
+/// True when the B8 counter fast path is enabled.
+#[inline]
+pub fn fastrate() -> bool {
+  *FASTRATE.get_or_init(|| {
+    match std::env::var("RAV1E_FASTRATE") {
+      Ok(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"),
+      // tier fallback: fast tier includes fastrate (BD-negative standalone:
+      // -0.117% mean; stack-measured +0.099% total)
+      Err(_) => fast_tier() == FastTier::Fast,
+    }
   })
 }
 

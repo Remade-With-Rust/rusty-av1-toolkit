@@ -2014,6 +2014,43 @@ impl ContextWriter<'_> {
     &mut self, coeffs: &[T], w: &mut W, plane_type: usize, txb_ctx: TXB_CTX,
     orig_cul_level: u32,
   ) -> u32 {
+    // prom_av1e011 B8 fast path (counting writers only, env RAV1E_FASTRATE):
+    // AC signs and golomb suffixes are flat-probability — their LENGTH is
+    // exact by construction (1 bit/sign; 2·len−1 bits/golomb, mirroring
+    // write_golomb). Account them via fake-bits instead of running the full
+    // EC store() per bit. The DC sign stays on the exact CDF path (its
+    // adaptation must evolve identically). Approximation: the counter's rng
+    // no longer drifts through these stores, so LATER symbol costs differ by
+    // rounding epsilons ⇒ BD-gated, not byte-identical.
+    if W::COUNTS_ONLY && crate::harvest::fastrate() {
+      let mut frac_bits: u32 = 0;
+      for (c, &v) in coeffs.iter().enumerate() {
+        if v == T::cast_from(0) {
+          continue;
+        }
+        let level = v.abs();
+        if c == 0 {
+          let sign = u32::from(v < T::cast_from(0));
+          let cdf = &self.fc.dc_sign_cdf[plane_type][txb_ctx.dc_sign_ctx];
+          symbol_with_update!(self, w, sign, cdf);
+        } else {
+          frac_bits += 8;
+        }
+        if level > T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS) {
+          let x = u32::cast_from(
+            level - T::cast_from(COEFF_BASE_RANGE + NUM_BASE_LEVELS + 1),
+          ) + 1;
+          frac_bits += 8 * (2 * (32 - x.leading_zeros()) - 1);
+        }
+      }
+      w.add_bits_frac(frac_bits);
+
+      let mut new_cul_level =
+        cmp::min(COEFF_CONTEXT_MASK as u32, orig_cul_level);
+      BlockContext::set_dc_sign(&mut new_cul_level, i32::cast_from(coeffs[0]));
+      return new_cul_level;
+    }
+
     // Loop to code all signs in the transform block,
     // starting with the sign of DC (if applicable)
     for (c, &v) in coeffs.iter().enumerate() {
