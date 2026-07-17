@@ -609,6 +609,18 @@ where
         self.print_backtrace(s);
       }
     }
+    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
+    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
+    // counter neither snapshots the undo log nor adapts the CDF — the cost
+    // reads the current (final-encode-evolved) distribution. Counter-only:
+    // recorder tokens are replayed into the real bitstream and must carry
+    // spec-adaptive brackets.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::frozen()
+    {
+      let cdf = fc.read(cdf);
+      self.symbol(s, cdf);
+      return;
+    }
     let cdf = log.push(fc, cdf);
     self.symbol(s, cdf);
 

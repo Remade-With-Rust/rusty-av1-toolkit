@@ -553,6 +553,21 @@ impl CDFContext {
       phantom: PhantomData,
     }
   }
+
+  /// Resolve an offset to a read-only CDF reference WITHOUT touching the
+  /// undo log — the frozen-trial costing path (prom_av1e016). Mirrors the
+  /// pointer math in `CDFContextLogPartition::push`.
+  #[inline(always)]
+  pub fn read<const CDF_LEN: usize>(
+    &self, cdf: CDFOffset<CDF_LEN>,
+  ) -> &[u16; CDF_LEN] {
+    // SAFETY: `cdf.offset` was produced by `Self::offset` from a valid
+    // in-bounds field pointer of this struct.
+    unsafe {
+      let base = self as *const _ as *const u8;
+      &*(base.add(cdf.offset) as *const [u16; CDF_LEN])
+    }
+  }
 }
 
 impl fmt::Debug for CDFContext {

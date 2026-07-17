@@ -251,6 +251,37 @@ pub fn sym_cost_frac(w: usize) -> u32 {
   u32::from(t[w])
 }
 
+// --- prom_av1e016: frozen-CDF trial costing ----------------------------------
+//
+// SVT's MD stages cost from per-frame rate tables and never touch CDFs;
+// only the final encode adapts them. Our counter trials instead run
+// log.push (a 10-34B undo-log snapshot per symbol, no dedup) + update_cdf
+// per symbol, then roll every update back — the net effect on the CDF
+// context is zero BY CONSTRUCTION (rollback is what makes trials legal),
+// so skipping both changes only the cost estimates. `RAV1E_FROZEN=1`
+// freezes COUNTER (CountsOnly) writers only: recorders MUST stay adaptive —
+// their tokens are replayed into the real bitstream and stale brackets
+// would desync the decoder. Costs drift within a block (no intra-trial
+// adaptation) ⇒ BD-gated.
+
+static FROZEN: OnceLock<bool> = OnceLock::new();
+
+/// True when counter trials neither log nor update CDFs (frozen costing).
+#[inline]
+pub fn frozen() -> bool {
+  *FROZEN.get_or_init(|| {
+    match std::env::var("RAV1E_FROZEN") {
+      Ok(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"),
+      // tier fallback: frozen composes cleanly with the fast tier — BD
+      // 0.099% → 0.056% vs off while adding ~15% same-ladder speed
+      // (349.9s vs 419.8s; trial14). NOTE fastsym does NOT get this
+      // fallback: it leaks with both frozen (+0.201%) and the tier
+      // (+0.313%) — approximations compose sub-additively in BD.
+      Err(_) => fast_tier() == FastTier::Fast,
+    }
+  })
+}
+
 // --- prom_av1e010: PD0 proxy margin gates -----------------------------------
 //
 // A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)
