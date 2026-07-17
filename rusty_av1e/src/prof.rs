@@ -101,6 +101,7 @@ stages! {
   ChromaDupTrial   => "  chroma 2nd-iter re-code [info]",
   AngleRefine      => "  intra angle refinement [info]",
   RecLogPush       => "cdf undo-log push [info]",
+  TxDistLoop       => "tx-domain dist loop [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
   // entropy-path internal audit (inside EntropyRate/write_coeffs_lv_map):
@@ -141,6 +142,7 @@ impl Stage {
         | Stage::ChromaDupTrial
         | Stage::AngleRefine
         | Stage::RecLogPush
+        | Stage::TxDistLoop
         | Stage::MvRefList
         | Stage::QcoeffsZero
         | Stage::TxbCtx

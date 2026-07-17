@@ -1638,6 +1638,7 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
     );
   }
 
+  let _txd = crate::prof::scope(crate::prof::Stage::TxDistLoop);
   let tx_dist =
     if rdo_type.needs_tx_dist() && visible_tx_w != 0 && visible_tx_h != 0 {
       // Store tx-domain distortion of this block
