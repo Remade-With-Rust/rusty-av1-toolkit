@@ -806,6 +806,87 @@ pub fn rdo_tx_size_type<T: Pixel>(
   (best_tx_size, best_tx_type)
 }
 
+/// prom_av1e020: pick ONE chroma mode by prediction SATD instead of
+/// full-coding every candidate through the trial encoder — the chroma-mode
+/// loop re-runs the whole block encode per candidate (13-14% of tier RDO)
+/// while the candidates differ only in chroma prediction. Mirrors the real
+/// chroma prediction (per-plane edges, edge-filter params, angle) so the
+/// SATD ranking matches what the trial would code. Decision-space reduction
+/// (the TOPK class) ⇒ BD-gated; rate accounting stays exact.
+fn chroma_mode_presel<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  tile_bo: TileBlockOffset, bsize: BlockSize, modes: &[PredictionMode],
+  angle_delta_uv: i8,
+) -> PredictionMode {
+  let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
+  let uv_tx_size = bsize.largest_chroma_tx_size(xdec, ydec);
+  let tile_rect = ts.tile_rect().decimated(xdec, ydec);
+  let ief_info = if fi.sequence.enable_intra_edge_filter {
+    Some((
+      ts.above_block_info(tile_bo, xdec, ydec),
+      ts.left_block_info(tile_bo, xdec, ydec),
+    ))
+  } else {
+    None
+  };
+
+  let mut best = (u64::MAX, modes[0]);
+  for &m in modes {
+    let mut satd_sum = 0u64;
+    for p in 1..3 {
+      let rec = &mut ts.rec.planes[p];
+      let input = &ts.input_tile.planes[p];
+      let po = tile_bo.plane_offset(rec.plane_cfg);
+      let mut edge_buf = Aligned::uninit_array();
+      let edge_buf = get_intra_edges(
+        &mut edge_buf,
+        &rec.as_const(),
+        tile_bo,
+        0,
+        0,
+        bsize,
+        po,
+        uv_tx_size,
+        fi.sequence.bit_depth,
+        Some(m),
+        fi.sequence.enable_intra_edge_filter,
+        IntraParam::AngleDelta(angle_delta_uv),
+      );
+      let ief_params = if m.is_directional() {
+        ief_info
+          .map(|(above, left)| IntraEdgeFilterParameters::new(p, above, left))
+      } else {
+        None
+      };
+      let mut rec_region =
+        rec.subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+      m.predict_intra(
+        tile_rect,
+        &mut rec_region,
+        uv_tx_size,
+        fi.sequence.bit_depth,
+        &[],
+        IntraParam::AngleDelta(angle_delta_uv),
+        ief_params,
+        &edge_buf,
+        fi.cpu_feature_level,
+      );
+      satd_sum += get_satd(
+        &input.subregion(Area::BlockStartingAt { bo: tile_bo.0 }),
+        &rec_region.as_const(),
+        uv_tx_size.width(),
+        uv_tx_size.height(),
+        fi.sequence.bit_depth,
+        fi.cpu_feature_level,
+      ) as u64;
+    }
+    if satd_sum < best.0 {
+      best = (satd_sum, m);
+    }
+  }
+  best.1
+}
+
 #[inline]
 const fn dmv_in_range(mv: MotionVector, ref_mv: MotionVector) -> bool {
   let diff_row = mv.row as i32 - ref_mv.row as i32;
@@ -855,6 +936,26 @@ fn luma_chroma_mode_rdo<T: Pixel>(
       return;
     }
   }
+
+  // prom_av1e020: optionally collapse the chroma-mode set to the SATD winner
+  // before the trial loop — one full trial instead of one per candidate.
+  let presel_holder;
+  let mode_set_chroma: &[PredictionMode] = if crate::harvest::chroma_presel()
+    && mode_set_chroma.len() > 1
+    && is_chroma_block
+  {
+    presel_holder = [chroma_mode_presel(
+      fi,
+      ts,
+      tile_bo,
+      bsize,
+      mode_set_chroma,
+      angle_delta.uv,
+    )];
+    &presel_holder
+  } else {
+    mode_set_chroma
+  };
 
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
@@ -1659,6 +1760,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   if fi.config.speed_settings.prediction.fine_directional_intra
     && bsize >= BlockSize::BLOCK_8X8
   {
+    let _prof = crate::prof::scope(crate::prof::Stage::AngleRefine);
     // Find the best angle delta for the current best prediction mode
     let luma_deltas = best.pred_mode_luma.angle_delta_count();
     let chroma_deltas = best.pred_mode_chroma.angle_delta_count();

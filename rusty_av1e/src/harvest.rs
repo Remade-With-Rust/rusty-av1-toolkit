@@ -304,6 +304,25 @@ pub fn luma_reuse() -> bool {
   })
 }
 
+// --- prom_av1e020: chroma-mode SATD pre-selection ----------------------------
+//
+// The intra chroma-mode loop full-codes the whole block per candidate;
+// `RAV1E_CHROMA_PRESEL=1` collapses the set to the per-plane prediction-SATD
+// winner before the loop (decision-space reduction, the TOPK class).
+
+static CHROMA_PRESEL: OnceLock<bool> = OnceLock::new();
+
+/// True when the intra chroma-mode set is pre-selected by SATD.
+#[inline]
+pub fn chroma_presel() -> bool {
+  *CHROMA_PRESEL.get_or_init(|| {
+    matches!(
+      std::env::var("RAV1E_CHROMA_PRESEL").as_deref().map(str::trim),
+      Ok("1")
+    )
+  })
+}
+
 // --- prom_av1e010: PD0 proxy margin gates -----------------------------------
 //
 // A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)

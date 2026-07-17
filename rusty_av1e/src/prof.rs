@@ -99,6 +99,7 @@ stages! {
   // brick-P/D2 prize measures (av1e017+):
   IntraModeRdo     => "intra mode RDO family [info]",
   ChromaDupTrial   => "  chroma 2nd-iter re-code [info]",
+  AngleRefine      => "  intra angle refinement [info]",
   RecLogPush       => "cdf undo-log push [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
@@ -138,6 +139,7 @@ impl Stage {
         | Stage::Replay
         | Stage::IntraModeRdo
         | Stage::ChromaDupTrial
+        | Stage::AngleRefine
         | Stage::RecLogPush
         | Stage::MvRefList
         | Stage::QcoeffsZero
