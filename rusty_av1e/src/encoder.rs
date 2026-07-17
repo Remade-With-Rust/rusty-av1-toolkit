@@ -1961,6 +1961,49 @@ pub fn encode_block_pre_cdef<T: Pixel, W: Writer>(
   cw.bc.cdef_coded
 }
 
+/// prom_av1e026 trial audit (profile builds): the work-count × per-trial-tax
+/// matrix. Buckets encode_block_post_cdef cycles and calls by block-size
+/// class × writer class (counter trial / recorder encode). Dumped at each
+/// tile end alongside SBSKIP.
+#[cfg(feature = "profile")]
+pub(crate) mod trial_audit {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  pub static CY: [[AtomicU64; 2]; 4] =
+    [const { [const { AtomicU64::new(0) }; 2] }; 4];
+  pub static N: [[AtomicU64; 2]; 4] =
+    [const { [const { AtomicU64::new(0) }; 2] }; 4];
+
+  #[inline]
+  pub fn bucket(dim: usize) -> usize {
+    match dim {
+      64.. => 0,
+      32.. => 1,
+      16.. => 2,
+      _ => 3,
+    }
+  }
+
+  pub fn record(b: usize, counts_only: bool, dt: u64) {
+    let w = usize::from(!counts_only);
+    CY[b][w].fetch_add(dt, Ordering::Relaxed);
+    N[b][w].fetch_add(1, Ordering::Relaxed);
+  }
+
+  pub fn dump() {
+    let names = ["64", "32", "16", "8-"];
+    for b in 0..4 {
+      let (tn, tc) =
+        (N[b][0].load(Ordering::Relaxed), CY[b][0].load(Ordering::Relaxed));
+      let (rn, rc) =
+        (N[b][1].load(Ordering::Relaxed), CY[b][1].load(Ordering::Relaxed));
+      eprintln!(
+        "TRIALAUDIT bsize={} trials={} trial_cy={} enc={} enc_cy={}",
+        names[b], tn, tc, rn, rc
+      );
+    }
+  }
+}
+
 /// # Panics
 ///
 /// - If chroma and luma do not match for inter modes
@@ -1977,6 +2020,29 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   enc_stats: Option<&mut EncoderStats>, luma_reuse: Option<&mut LumaReuse>,
 ) -> (bool, ScaledDistortion) {
   let _prof = crate::prof::scope(crate::prof::Stage::EncodeBlockPost);
+  #[cfg(feature = "profile")]
+  let audit_t0 = unsafe { core::arch::x86_64::_rdtsc() };
+  #[cfg(feature = "profile")]
+  let audit_guard = {
+    struct AuditGuard {
+      t0: u64,
+      b: usize,
+      counts_only: bool,
+    }
+    impl Drop for AuditGuard {
+      fn drop(&mut self) {
+        let dt = unsafe { core::arch::x86_64::_rdtsc() } - self.t0;
+        trial_audit::record(self.b, self.counts_only, dt);
+      }
+    }
+    AuditGuard {
+      t0: audit_t0,
+      b: trial_audit::bucket(bsize.width().max(bsize.height())),
+      counts_only: W::COUNTS_ONLY,
+    }
+  };
+  #[cfg(feature = "profile")]
+  let _ = &audit_guard;
   let planes =
     if fi.sequence.chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
   let is_inter = !luma_mode.is_intra();
@@ -3716,6 +3782,7 @@ fn encode_tile<'a, T: Pixel>(
             REST_N.load(Ordering::Relaxed),
             100.0 * sc as f64 / (sc + rc).max(1) as f64
           );
+          trial_audit::dump();
         }
       }
 
