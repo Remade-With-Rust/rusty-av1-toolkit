@@ -323,6 +323,22 @@ pub fn chroma_presel() -> bool {
   })
 }
 
+// --- prom_av1e023: SB-level early skip ---------------------------------------
+//
+// `RAV1E_SB_SKIP=k` bypasses the whole 64×64 partition/mode RDO when the
+// NEARESTMV(LAST) proxy SATD < k/256 quantizer steps per pixel — the SVT
+// depth-removal analog for static/smooth superblocks. Unset = off.
+
+static SB_SKIP: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Some(k) when the SB early-skip gate is enabled.
+#[inline]
+pub fn sb_skip() -> Option<u64> {
+  *SB_SKIP.get_or_init(|| {
+    std::env::var("RAV1E_SB_SKIP").ok().and_then(|v| v.trim().parse().ok())
+  })
+}
+
 // --- prom_av1e010: PD0 proxy margin gates -----------------------------------
 //
 // A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)

@@ -1245,6 +1245,50 @@ pub fn rdo_mode_decision<T: Pixel>(
 /// + SATD, scaled like compute_mv_rd's cost units. No transforms, no entropy,
 /// no context writes; scribbles the prediction into ts.rec exactly like the
 /// inter mode screen does (trials/final encode overwrite it).
+/// prom_av1e023: SB-level early skip (the SVT depth-removal analog). When
+/// the 64×64 NEARESTMV(LAST) proxy SATD says the block predicts to (near)
+/// zero at this quantizer, bypass the ENTIRE partition/mode RDO for the
+/// superblock and encode it as one 64×64 NEARESTMV skip block. Ceiling
+/// measured first: all-skip SBs carry 11.8% of SB cycles (pedestrian 1080p).
+/// Fires only when the proxy error per pixel is below k/256 quantizer steps
+/// ⇒ decision-space reduction, BD-gated.
+pub(crate) fn sb_skip_probe<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, tile_bo: TileBlockOffset, k: u64,
+) -> Option<PartitionParameters> {
+  use crate::segmentation::select_segment;
+  let bsize = BlockSize::BLOCK_64X64;
+  let ref_frames = [LAST_FRAME, NONE_FRAME];
+  let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+  let _ = cw.find_mvrefs(tile_bo, ref_frames, &mut mv_stack, bsize, fi, false);
+  // The final-encode arm remaps modes against mv_stack[0]; never force a
+  // NEARESTMV block the remap could not reproduce.
+  if mv_stack.is_empty() {
+    return None;
+  }
+  let satd = pd0_proxy_cost(fi, ts, cw, bsize, tile_bo);
+  let acq =
+    crate::quantize::ac_q(fi.base_q_idx, 0, fi.sequence.bit_depth).get()
+      as u64;
+  if satd.saturating_mul(256) >= k.saturating_mul(acq) * (64 * 64) {
+    return None;
+  }
+  let sidx = select_segment(fi, ts, tile_bo, bsize, true).next().unwrap_or(0);
+  Some(PartitionParameters {
+    rd_cost: 0.0,
+    bo: tile_bo,
+    bsize,
+    pred_mode_luma: PredictionMode::NEARESTMV,
+    pred_mode_chroma: PredictionMode::NEARESTMV,
+    ref_frames,
+    mvs: [mv_stack[0].this_mv, MotionVector::default()],
+    skip: true,
+    has_coeff: false,
+    sidx,
+    ..PartitionParameters::default()
+  })
+}
+
 fn pd0_proxy_cost<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,

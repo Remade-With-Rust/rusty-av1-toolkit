@@ -3025,24 +3025,44 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
   } else if can_split {
     debug_assert!(bsize.is_sqr());
 
-    // Blocks of sizes within the supported range are subjected to a partitioning decision
-    rdo_output = rdo_partition_decision(
-      fi,
-      ts,
-      cw,
-      w_pre_cdef,
-      w_post_cdef,
-      bsize,
-      tile_bo,
-      &rdo_output,
-      // prom_av1e005: NONE evaluated FIRST — its cost both feeds the
-      // partition gate and gives rdo_partition_simple a real early-exit
-      // bound. Order affects output only on exact RD ties (verified
-      // byte-identical on the corpus + FNV clip).
-      &[PartitionType::PARTITION_NONE, PartitionType::PARTITION_SPLIT],
-      rdo_type,
-      inter_cfg,
-    );
+    // prom_av1e023: SB early skip — at the 64×64 root, a near-zero
+    // NEARESTMV proxy bypasses the whole partition/mode RDO below.
+    let mut forced_skip = false;
+    if bsize == BlockSize::BLOCK_64X64
+      && fi.frame_type.has_inter()
+      && rdo_output.part_modes.is_empty()
+    {
+      if let Some(k) = crate::harvest::sb_skip() {
+        if let Some(forced) =
+          crate::rdo::sb_skip_probe(fi, ts, cw, tile_bo, k)
+        {
+          rdo_output.part_modes.push(forced);
+          rdo_output.part_type = PartitionType::PARTITION_NONE;
+          rdo_output.rd_cost = 0.0;
+          forced_skip = true;
+        }
+      }
+    }
+    if !forced_skip {
+      // Blocks of sizes within the supported range are subjected to a partitioning decision
+      rdo_output = rdo_partition_decision(
+        fi,
+        ts,
+        cw,
+        w_pre_cdef,
+        w_post_cdef,
+        bsize,
+        tile_bo,
+        &rdo_output,
+        // prom_av1e005: NONE evaluated FIRST — its cost both feeds the
+        // partition gate and gives rdo_partition_simple a real early-exit
+        // bound. Order affects output only on exact RD ties (verified
+        // byte-identical on the corpus + FNV clip).
+        &[PartitionType::PARTITION_NONE, PartitionType::PARTITION_SPLIT],
+        rdo_type,
+        inter_cfg,
+      );
+    }
     rdo_output.part_type
   } else {
     // Blocks of sizes below the supported range are encoded directly
@@ -3600,6 +3620,13 @@ fn encode_tile<'a, T: Pixel>(
       let is_straddle_sby =
         tile_bo.0.y + BlockSize::BLOCK_64X64.height_mi() > ts.mi_height;
 
+      // brick-③ ceiling measure (profile builds only): how much SB encode
+      // time lands on SBs whose FINAL outcome is all-skip — the population an
+      // SVT-style depth-removal gate could shortcut. Measured BEFORE building
+      // the gate (av1e007 law).
+      #[cfg(feature = "profile")]
+      let sb_t0 = unsafe { core::arch::x86_64::_rdtsc() };
+
       // Encode SuperBlock
       if fi.config.speed_settings.partition.encode_bottomup
         || is_straddle_sbx
@@ -3630,6 +3657,41 @@ fn encode_tile<'a, T: Pixel>(
           inter_cfg,
           &mut enc_stats,
         );
+      }
+
+      #[cfg(feature = "profile")]
+      {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SKIP_CY: AtomicU64 = AtomicU64::new(0);
+        static REST_CY: AtomicU64 = AtomicU64::new(0);
+        static SKIP_N: AtomicU64 = AtomicU64::new(0);
+        static REST_N: AtomicU64 = AtomicU64::new(0);
+        let dt = unsafe { core::arch::x86_64::_rdtsc() } - sb_t0;
+        let mut all_skip = true;
+        'chk: for y in tile_bo.0.y..(tile_bo.0.y + 16).min(ts.mi_height) {
+          for x in tile_bo.0.x..(tile_bo.0.x + 16).min(ts.mi_width) {
+            if !cw.bc.blocks[y][x].skip {
+              all_skip = false;
+              break 'chk;
+            }
+          }
+        }
+        if all_skip {
+          SKIP_CY.fetch_add(dt, Ordering::Relaxed);
+          SKIP_N.fetch_add(1, Ordering::Relaxed);
+        } else {
+          REST_CY.fetch_add(dt, Ordering::Relaxed);
+          REST_N.fetch_add(1, Ordering::Relaxed);
+        }
+        if sby + 1 == ts.sb_height && sbx + 1 == ts.sb_width {
+          let (sc, rc) = (SKIP_CY.load(Ordering::Relaxed), REST_CY.load(Ordering::Relaxed));
+          eprintln!(
+            "SBSKIP allskip_sbs={} rest_sbs={} allskip_cy_pct={:.2}",
+            SKIP_N.load(Ordering::Relaxed),
+            REST_N.load(Ordering::Relaxed),
+            100.0 * sc as f64 / (sc + rc).max(1) as f64
+          );
+        }
       }
 
       {
