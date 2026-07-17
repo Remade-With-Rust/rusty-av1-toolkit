@@ -335,7 +335,16 @@ static SB_SKIP: OnceLock<Option<u64>> = OnceLock::new();
 #[inline]
 pub fn sb_skip() -> Option<u64> {
   *SB_SKIP.get_or_init(|| {
-    std::env::var("RAV1E_SB_SKIP").ok().and_then(|v| v.trim().parse().ok())
+    match std::env::var("RAV1E_SB_SKIP") {
+      Ok(v) => match v.trim() {
+        "0" | "off" => None,
+        s => s.parse().ok(),
+      },
+      // tier fallback: k=8 passed the composition gate CLEAN on both
+      // resolutions — 1080p BD −0.001% @ +12.8% wall, CIF +0.000% @ +2.2%
+      // (trial18/19; rotated arms). First clean tier leg since frozen.
+      Err(_) => (fast_tier() == FastTier::Fast).then_some(8),
+    }
   })
 }
 
