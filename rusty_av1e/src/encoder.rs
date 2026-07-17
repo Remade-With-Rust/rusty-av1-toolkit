@@ -1923,7 +1923,12 @@ pub fn encode_block_pre_cdef<T: Pixel, W: Writer>(
   seq: &Sequence, ts: &TileStateMut<'_, T>, cw: &mut ContextWriter, w: &mut W,
   bsize: BlockSize, tile_bo: TileBlockOffset, skip: bool,
 ) -> bool {
-  cw.bc.blocks.set_skip(tile_bo, bsize, skip);
+  // prom_av1e024: see the post_cdef fills — own-cell skip flags are not read
+  // within a counting trial (write_skip's ctx reads neighbors; the symbol
+  // takes the param).
+  if !W::COUNTS_ONLY {
+    cw.bc.blocks.set_skip(tile_bo, bsize, skip);
+  }
   if ts.segmentation.enabled
     && ts.segmentation.update_map
     && ts.segmentation.preskip
@@ -1983,7 +1988,9 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
     BlockSize::BLOCK_64X64
   };
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
-  if skip {
+  // prom_av1e024: a skip trial codes no coefficients, so the zeroed coeff
+  // contexts are never read within the trial — final/recorder paths keep it.
+  if skip && !W::COUNTS_ONLY {
     cw.bc.reset_skip_context(
       tile_bo,
       bsize,
@@ -1992,11 +1999,21 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
       fi.sequence.chroma_sampling,
     );
   }
-  cw.bc.blocks.set_block_size(tile_bo, bsize);
-  cw.bc.blocks.set_mode(tile_bo, bsize, luma_mode);
-  cw.bc.blocks.set_tx_size(tile_bo, bsize, tx_size);
+  // prom_av1e024 (RDO-glue): on counting writers these rectangle fills
+  // (bsize_mi² cells each, per trial) are write-only — nothing in the trial
+  // reads the block's OWN cells for these fields; context derivations read
+  // NEIGHBOR cells (above_of/left_of) and the coded values travel as
+  // parameters. The final/recorder paths still write them. set_ref_frames
+  // stays: write_ref_frames reads the own-cell value (with
+  // neighbors_ref_counts) during the trial. Byte-identical class — any
+  // hidden in-trial reader would flip decisions and break the FNV gate.
+  if !W::COUNTS_ONLY {
+    cw.bc.blocks.set_block_size(tile_bo, bsize);
+    cw.bc.blocks.set_mode(tile_bo, bsize, luma_mode);
+    cw.bc.blocks.set_tx_size(tile_bo, bsize, tx_size);
+    cw.bc.blocks.set_motion_vectors(tile_bo, bsize, mvs);
+  }
   cw.bc.blocks.set_ref_frames(tile_bo, bsize, ref_frames);
-  cw.bc.blocks.set_motion_vectors(tile_bo, bsize, mvs);
 
   //write_q_deltas();
   if cw.bc.code_deltas
@@ -2160,7 +2177,9 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
     if bsize > BlockSize::BLOCK_4X4 && (!is_inter || !skip) {
       if !is_inter {
         cw.write_tx_size_intra(w, tile_bo, bsize, tx_size);
-        cw.bc.update_tx_size_context(tile_bo, bsize, tx_size, false);
+        if !W::COUNTS_ONLY {
+          cw.bc.update_tx_size_context(tile_bo, bsize, tx_size, false);
+        }
       } else {
         // write var_tx_size
         // if here, bsize > BLOCK_4X4 && is_inter && !skip && !Lossless
@@ -2190,7 +2209,9 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
       }
     } else {
       debug_assert!(bsize == BlockSize::BLOCK_4X4 || (is_inter && skip));
-      cw.bc.update_tx_size_context(tile_bo, bsize, tx_size, is_inter && skip);
+      if !W::COUNTS_ONLY {
+        cw.bc.update_tx_size_context(tile_bo, bsize, tx_size, is_inter && skip);
+      }
     }
   }
 
@@ -2205,7 +2226,10 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
     }
   }
 
-  if fi.sequence.enable_intra_edge_filter {
+  // prom_av1e024: coded_block_info is only read by FUTURE blocks as their
+  // neighbor (above/left_block_info) — a counter trial's own-cell writes are
+  // never consumed. Skip the bsize_mi²×3 fill on counting writers.
+  if fi.sequence.enable_intra_edge_filter && !W::COUNTS_ONLY {
     for y in 0..bsize.height_mi() {
       if tile_bo.0.y + y >= ts.mi_height {
         continue;
