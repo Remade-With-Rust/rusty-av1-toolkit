@@ -282,6 +282,28 @@ pub fn frozen() -> bool {
   })
 }
 
+// --- prom_av1e017: luma reuse across intra chroma-mode trials ----------------
+//
+// The intra chroma loop re-codes the ENTIRE block (all luma planes) per
+// chroma mode — 13.3% of tier RDO measured for the 2nd iteration alone.
+// Only the chroma coding differs between iterations, so the luma tx section
+// is cached from iteration 1 and skipped afterwards (rate re-injected via
+// fake-bits). Exact under frozen costing up to counter-rng epsilons ⇒
+// BD-gated. `RAV1E_LUMA_REUSE=1`; unset = off (tier fold pending gates).
+
+static LUMA_REUSE: OnceLock<bool> = OnceLock::new();
+
+/// True when the intra chroma loop reuses iteration-1 luma results.
+#[inline]
+pub fn luma_reuse() -> bool {
+  *LUMA_REUSE.get_or_init(|| {
+    matches!(
+      std::env::var("RAV1E_LUMA_REUSE").as_deref().map(str::trim),
+      Ok("1")
+    )
+  })
+}
+
 // --- prom_av1e010: PD0 proxy margin gates -----------------------------------
 //
 // A cheap SATD proxy tree (node vs 4 children, one NEARESTMV prediction each)

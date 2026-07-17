@@ -684,6 +684,9 @@ impl CDFContextLog {
   pub fn push<const CDF_LEN: usize>(
     &mut self, fc: &mut CDFContext, cdf: CDFOffset<CDF_LEN>,
   ) -> &mut [u16; CDF_LEN] {
+    // brick-D2 prize measure: under the frozen tier, counters never push,
+    // so this call count = the recorder-path undo-log volume.
+    let _prof = crate::prof::scope(crate::prof::Stage::RecLogPush);
     if CDF_LEN <= CDF_LEN_SMALL {
       self.small.push(fc, cdf)
     } else {

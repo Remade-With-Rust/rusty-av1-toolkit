@@ -96,6 +96,10 @@ stages! {
   MotionCompensate => "  motion_compensate incl [info]",
   RdoTxSizeType    => "rdo_tx_size_type [info]",
   Replay           => "recorder replay->encoder [info]",
+  // brick-P/D2 prize measures (av1e017+):
+  IntraModeRdo     => "intra mode RDO family [info]",
+  ChromaDupTrial   => "  chroma 2nd-iter re-code [info]",
+  RecLogPush       => "cdf undo-log push [info]",
   MvRefList        => "find_mvrefs [info]",
   QcoeffsZero      => "qcoeffs zeroing [info]",
   // entropy-path internal audit (inside EntropyRate/write_coeffs_lv_map):
@@ -132,6 +136,9 @@ impl Stage {
         | Stage::MotionCompensate
         | Stage::RdoTxSizeType
         | Stage::Replay
+        | Stage::IntraModeRdo
+        | Stage::ChromaDupTrial
+        | Stage::RecLogPush
         | Stage::MvRefList
         | Stage::QcoeffsZero
         | Stage::TxbCtx

@@ -566,6 +566,7 @@ pub struct RawDistortion(u64);
 pub struct Distortion(pub u64);
 
 #[repr(transparent)]
+#[derive(Copy, Clone)]
 pub struct ScaledDistortion(u64);
 
 impl DistortionScale {
@@ -867,7 +868,20 @@ fn luma_chroma_mode_rdo<T: Pixel>(
       let (tx_size, tx_type) = rdo_tx_size_type(
         fi, ts, cw, bsize, tile_bo, luma_mode, ref_frames, mvs, skip,
       );
-      for &chroma_mode in mode_set_chroma.iter() {
+      // prom_av1e017: across chroma-mode iterations only the chroma coding
+      // differs — cache the luma tx section from iteration 1 and skip it on
+      // later ones. Reset per sidx (segment qidx changes luma quant).
+      let mut luma_reuse = (crate::harvest::luma_reuse()
+        && mode_set_chroma.len() > 1)
+        .then(crate::encoder::LumaReuse::new);
+      for (ci, &chroma_mode) in mode_set_chroma.iter().enumerate() {
+        // brick-P prize measure: everything below on the 2nd+ chroma
+        // iteration re-codes the (invariant) luma planes too.
+        let _dup = if ci > 0 {
+          Some(crate::prof::scope(crate::prof::Stage::ChromaDupTrial))
+        } else {
+          None
+        };
         let wr = &mut WriterCounter::new();
         let tell = wr.tell_frac();
 
@@ -906,6 +920,7 @@ fn luma_chroma_mode_rdo<T: Pixel>(
           rdo_type,
           need_recon_pixel,
           None,
+          luma_reuse.as_mut(),
         );
 
         let rate = wr.tell_frac() - tell;
@@ -1039,6 +1054,8 @@ pub fn rdo_mode_decision<T: Pixel>(
       true,
       rdo_type,
       true,
+    
+      None,
     );
     cw.rollback(&cw_checkpoint);
     if fi.sequence.chroma_sampling != ChromaSampling::Cs400 {
@@ -1075,6 +1092,8 @@ pub fn rdo_mode_decision<T: Pixel>(
           &[],
           rdo_type,
           true, // For CFL, luma should be always reconstructed.
+          None,
+        
           None,
         );
 
@@ -1497,6 +1516,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   cw_checkpoint: &ContextWriterCheckpoint, rdo_type: RDOType,
   mut best: PartitionParameters, is_chroma_block: bool,
 ) -> PartitionParameters {
+  let _prof = crate::prof::scope(crate::prof::Stage::IntraModeRdo);
   let mut modes = ArrayVec::<_, INTRA_MODES>::new();
 
   // Reduce number of prediction modes at higher speed levels
@@ -1880,6 +1900,7 @@ pub fn rdo_tx_type_decision<T: Pixel>(
         true,
         rdo_type,
         need_recon_pixel,
+        None,
       )
     };
 

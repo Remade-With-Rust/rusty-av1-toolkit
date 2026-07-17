@@ -1968,7 +1968,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   tile_bo: TileBlockOffset, skip: bool, cfl: CFLParams, tx_size: TxSize,
   tx_type: TxType, mode_context: usize, mv_stack: &[CandidateMV],
   rdo_type: RDOType, need_recon_pixel: bool,
-  enc_stats: Option<&mut EncoderStats>,
+  enc_stats: Option<&mut EncoderStats>, luma_reuse: Option<&mut LumaReuse>,
 ) -> (bool, ScaledDistortion) {
   let _prof = crate::prof::scope(crate::prof::Stage::EncodeBlockPost);
   let planes =
@@ -2260,6 +2260,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
       false,
       rdo_type,
       need_recon_pixel,
+      luma_reuse,
     )
   }
 }
@@ -2267,6 +2268,24 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
 /// # Panics
 ///
 /// - If attempting to encode a lossless block (not yet supported)
+/// prom_av1e017: cached luma tx-coding results for the intra chroma-mode
+/// loop. Iteration 1 fills it; iterations 2+ skip plane-0 prediction and
+/// coding entirely and re-inject the cached rate via the fake-bits ledger.
+/// Legal in the trial estimator: the iterations differ only in chroma mode,
+/// the luma tx section reads no chroma state, and its bc/CDF inputs are
+/// identical after the per-iteration rollback (exact under frozen costing,
+/// rng-epsilon-exact otherwise) — BD-gated like every estimator change.
+#[derive(Default)]
+pub struct LumaReuse {
+  cached: Option<(u32, ScaledDistortion, bool)>,
+}
+
+impl LumaReuse {
+  pub fn new() -> Self {
+    Self::default()
+  }
+}
+
 pub fn write_tx_blocks<T: Pixel, W: Writer>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, w: &mut W, luma_mode: PredictionMode,
@@ -2274,6 +2293,7 @@ pub fn write_tx_blocks<T: Pixel, W: Writer>(
   tile_bo: TileBlockOffset, bsize: BlockSize, tx_size: TxSize,
   tx_type: TxType, skip: bool, cfl: CFLParams, luma_only: bool,
   rdo_type: RDOType, need_recon_pixel: bool,
+  luma_reuse: Option<&mut LumaReuse>,
 ) -> (bool, ScaledDistortion) {
   let _prof = crate::prof::scope(crate::prof::Stage::WriteTxBlocks);
   let bw = bsize.width_mi() / tx_size.width_mi();
@@ -2301,40 +2321,57 @@ pub fn write_tx_blocks<T: Pixel, W: Writer>(
     0,
   );
 
-  for by in 0..bh {
-    for bx in 0..bw {
-      let tx_bo = TileBlockOffset(BlockOffset {
-        x: tile_bo.0.x + bx * tx_size.width_mi(),
-        y: tile_bo.0.y + by * tx_size.height_mi(),
-      });
-      if tx_bo.0.x >= ts.mi_width || tx_bo.0.y >= ts.mi_height {
-        continue;
-      }
-      let po = tx_bo.plane_offset(&ts.input.planes[0].cfg);
-      let (has_coeff, dist) = encode_tx_block(
-        fi,
-        ts,
-        cw,
-        w,
-        0,
-        tile_bo,
-        bx,
-        by,
-        tx_bo,
-        luma_mode,
-        tx_size,
-        tx_type,
-        bsize,
-        po,
-        skip,
-        qidx,
-        &[],
-        IntraParam::AngleDelta(angle_delta.y),
-        rdo_type,
-        need_recon_pixel,
-      );
+  match luma_reuse {
+    Some(reuse) if reuse.cached.is_some() => {
+      // Skip the whole plane-0 section: account the cached rate through
+      // the fake-bits ledger so the caller's tell_frac delta is unchanged.
+      let (rate_frac, dist, has_coeff) = reuse.cached.unwrap();
+      w.add_bits_frac(rate_frac);
       partition_has_coeff |= has_coeff;
       tx_dist += dist;
+    }
+    luma_reuse => {
+      let tell = w.tell_frac();
+      for by in 0..bh {
+        for bx in 0..bw {
+          let tx_bo = TileBlockOffset(BlockOffset {
+            x: tile_bo.0.x + bx * tx_size.width_mi(),
+            y: tile_bo.0.y + by * tx_size.height_mi(),
+          });
+          if tx_bo.0.x >= ts.mi_width || tx_bo.0.y >= ts.mi_height {
+            continue;
+          }
+          let po = tx_bo.plane_offset(&ts.input.planes[0].cfg);
+          let (has_coeff, dist) = encode_tx_block(
+            fi,
+            ts,
+            cw,
+            w,
+            0,
+            tile_bo,
+            bx,
+            by,
+            tx_bo,
+            luma_mode,
+            tx_size,
+            tx_type,
+            bsize,
+            po,
+            skip,
+            qidx,
+            &[],
+            IntraParam::AngleDelta(angle_delta.y),
+            rdo_type,
+            need_recon_pixel,
+          );
+          partition_has_coeff |= has_coeff;
+          tx_dist += dist;
+        }
+      }
+      if let Some(reuse) = luma_reuse {
+        reuse.cached =
+          Some((w.tell_frac() - tell, tx_dist, partition_has_coeff));
+      }
     }
   }
 
@@ -2656,6 +2693,8 @@ pub fn encode_block_with_modes<T: Pixel, W: Writer>(
     rdo_type,
     true,
     enc_stats,
+  
+    None,
   );
 }
 
@@ -3181,7 +3220,9 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
         RDOType::PixelDistRealRate,
         true,
         Some(enc_stats),
-      );
+      
+    None,
+  );
     }
     PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
       if !rdo_output.part_modes.is_empty() {
