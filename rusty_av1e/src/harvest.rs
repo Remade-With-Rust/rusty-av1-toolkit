@@ -322,6 +322,25 @@ pub fn luma_reuse() -> bool {
 // the real coder always codes every coefficient, so the bitstream is
 // unchanged; only the RDO rate estimate is subsampled ⇒ BD-gated.
 
+// --- prom_av1e037: adaptive-K mode full-trials -------------------------------
+//
+// The SATD screen ranks all candidates; the tier then full-transforms the top
+// K (=6). But when the best screen cost is confidently below the rest, the
+// winner is nearly certain and full-trialing 6 wastes ~5 transforms.
+// `RAV1E_ADAPTK=M` (percent) full-trials only the candidates whose screen key
+// is within +M% of the best (clamped to [1, K]) — content-adaptive work.
+// Decision-space change ⇒ BD-gated.
+
+static ADAPTK: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Some(M) enables adaptive-K with a +M% screen-cost margin.
+#[inline]
+pub fn adaptk() -> Option<u64> {
+  *ADAPTK.get_or_init(|| {
+    std::env::var("RAV1E_ADAPTK").ok().and_then(|v| v.trim().parse().ok())
+  })
+}
+
 static FASTCOEFF: OnceLock<Option<usize>> = OnceLock::new();
 
 /// Some(N) subsamples the counter-trial coefficient cost to ~eob/N coeffs.

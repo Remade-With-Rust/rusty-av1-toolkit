@@ -1667,9 +1667,24 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   let mut harvest_idx = 0usize;
   let mut harvest_imps = String::new();
 
+  // prom_av1e037: adaptive-K — shrink the full-trial count when the screen is
+  // confident (best cost far below the rest), so we don't transform 6 modes
+  // to pick one obvious winner. Screen must be on (sorted by screen key).
+  let num_full = if let (Some(margin), true) =
+    (crate::harvest::adaptk(), force_screen_006)
+  {
+    let best = sorted.first().map(|&(_, _, sk)| sk).unwrap_or(0) as u64;
+    let thresh = best.saturating_mul(100 + margin) / 100;
+    let cnt =
+      sorted.iter().take_while(|&&(_, _, sk)| sk as u64 <= thresh).count();
+    cnt.clamp(1, num_full_006)
+  } else {
+    num_full_006
+  };
+
   #[cfg(feature = "profile")]
-  fulltrial_audit::add(0, num_full_006.min(sorted.len()) as u64);
-  sorted.iter().take(num_full_006).for_each(
+  fulltrial_audit::add(0, num_full.min(sorted.len()) as u64);
+  sorted.iter().take(num_full).for_each(
     |&((luma_mode, i), mvs, _satd)| {
       let mode_set_chroma = ArrayVec::from([luma_mode]);
       let prev_rd = best.rd_cost;
