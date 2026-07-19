@@ -312,6 +312,29 @@ pub fn luma_reuse() -> bool {
 // re-coded exactly at final encode, so only the ranking uses estimated rate.
 // Decision-space change (estimate vs exact rate) ⇒ BD-gated.
 
+// --- prom_av1e035: SVT-style subsampled coefficient cost ---------------------
+//
+// SVT's coefficient-structure-aware fast cost walks the real quantized levels
+// but SUBSAMPLES: it costs the DC, the last-eob coefficient, and the first
+// eob/N low-frequency coefficients in full (base + range), and skips the
+// base/range of the high-frequency middle (their tiny levels contribute
+// little rate). `RAV1E_FASTCOEFF=N` applies this to COUNTER trials only —
+// the real coder always codes every coefficient, so the bitstream is
+// unchanged; only the RDO rate estimate is subsampled ⇒ BD-gated.
+
+static FASTCOEFF: OnceLock<Option<usize>> = OnceLock::new();
+
+/// Some(N) subsamples the counter-trial coefficient cost to ~eob/N coeffs.
+#[inline]
+pub fn fastcoeff() -> Option<usize> {
+  *FASTCOEFF.get_or_init(|| {
+    std::env::var("RAV1E_FASTCOEFF")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .filter(|&n: &usize| n >= 1)
+  })
+}
+
 static TXRATE: OnceLock<bool> = OnceLock::new();
 
 /// True when RDO trials cost rate by table instead of the coefficient coder.

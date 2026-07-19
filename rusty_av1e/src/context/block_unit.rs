@@ -1963,11 +1963,28 @@ impl ContextWriter<'_> {
 
     let bhl = Self::get_txb_bhl(tx_size);
 
+    // prom_av1e035: SVT-style subsampled coefficient cost for counter trials.
+    // Cost DC (c==0), last-eob (c==eob-1), and the first eob/N low-frequency
+    // coefficients in full; skip the base/range symbols of the high-frequency
+    // middle. Real coding (non-COUNTS_ONLY) always codes every coefficient.
+    let fast_hi = if W::COUNTS_ONLY {
+      crate::harvest::fastcoeff()
+        .map(|n| (usize::from(eob) / n).max(1))
+        .unwrap_or(usize::MAX)
+    } else {
+      usize::MAX
+    };
+
     let scan_with_ctx =
       scan.iter().copied().zip(coeff_contexts.iter().copied());
     for (c, ((pos, coeff_ctx), v)) in
       scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev()
     {
+      // Skip the base/range cost of the high-frequency middle coefficients
+      // (kept: DC, last-eob, and the low-frequency head up to eob/N).
+      if c != 0 && c + 1 != usize::from(eob) && c > fast_hi {
+        continue;
+      }
       let pos = pos as usize;
       let coeff_ctx = coeff_ctx as usize;
       let level = v.abs();
