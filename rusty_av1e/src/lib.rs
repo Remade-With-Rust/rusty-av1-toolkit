@@ -99,6 +99,7 @@ mod rdo;
 mod rdo_tables;
 #[macro_use]
 mod util;
+mod varpart;
 mod cdef;
 #[doc(hidden)]
 pub mod context;
