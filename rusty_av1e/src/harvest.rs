@@ -177,7 +177,21 @@ static PART_GATE: OnceLock<Option<(f64, f64, f64)>> = OnceLock::new();
 /// Per-bsize (64, 32, 16) thresholds for the partition-split gate.
 pub fn part_gate() -> Option<(f64, f64, f64)> {
   *PART_GATE.get_or_init(|| {
-    let v = std::env::var("RAV1E_PART_GATE").ok()?;
+    let v = match std::env::var("RAV1E_PART_GATE") {
+      Ok(v) => v,
+      // tier fallback (prom_av1e038): the MULTI-LEVEL accurate NONE-cost gate.
+      // The av1e005 keeper gated only 64×64 (believing 32/16 leaked); the
+      // av1e038 ladder disproved that — conservative per-level thresholds
+      // 300:150:75 skip the split subtree at 64/32/16 for −12.2% forward
+      // transforms at +0.126% mean BD (akiyo/foreman/mobile actually IMPROVE),
+      // additive on top of the fast tier's pd0 gate. Unlike the refuted
+      // variance/SATD partition PROXIES, the ACCURATE none_rd cost stays the
+      // arbiter, so the prune only fires where full RD would also pick NONE.
+      Err(_) if fast_tier() == FastTier::Fast => {
+        return Some((300.0, 150.0, 75.0))
+      }
+      Err(_) => return None,
+    };
     let s = v.trim();
     if s.is_empty() || s == "0" || s == "off" {
       return None;
