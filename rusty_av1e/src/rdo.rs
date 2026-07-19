@@ -2366,6 +2366,46 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
     pd0_skip_none = pd0_margin > t_split;
   }
 
+  // prom_av1e039: PD0 REAL-cost margin (SVT's PD0 done with a real RD screen).
+  // Computed for every splittable square node so the ceiling instrument can
+  // compare its NONE/SPLIT prediction to the full-RD decision, and so the
+  // shipping gate (pd0_real) can prune the confident arm at all levels.
+  let pd0_real_on =
+    crate::harvest::pd0_ceil() || crate::harvest::pd0_real().is_some();
+  let (mut pd0r_node, mut pd0r_kids, mut pd0r_margin) = (0.0f64, 0.0f64, 0.0f64);
+  let mut pd0r_skip_none = false;
+  let mut pd0r_skip_split = false;
+  if pd0_real_on
+    && bsize.is_sqr()
+    && bsize >= BlockSize::BLOCK_8X8
+    && bsize <= BlockSize::BLOCK_64X64
+    && fi.frame_type.has_inter()
+  {
+    pd0r_node = crate::encoder::pd0_real_cost(fi, ts, cw, bsize, tile_bo);
+    if let Ok(subsize) = bsize.subsize(PARTITION_SPLIT) {
+      let hbsw = subsize.width_mi();
+      let hbsh = subsize.height_mi();
+      for (dx, dy) in [(0, 0), (hbsw, 0), (0, hbsh), (hbsw, hbsh)] {
+        let bo = TileBlockOffset(BlockOffset {
+          x: tile_bo.0.x + dx,
+          y: tile_bo.0.y + dy,
+        });
+        pd0r_kids += crate::encoder::pd0_real_cost(fi, ts, cw, subsize, bo);
+      }
+    }
+    pd0r_margin = if pd0r_node > 0.0 {
+      (pd0r_node - pd0r_kids) / pd0r_node
+    } else {
+      0.0
+    };
+    if let Some((t_none, t_split)) = crate::harvest::pd0_real() {
+      // margin < t_none ⇒ node-confident (kids barely cheaper) ⇒ skip split;
+      // margin > t_split ⇒ split-confident ⇒ skip the fresh NONE full trial.
+      pd0r_skip_split = pd0r_margin < t_none;
+      pd0r_skip_none = pd0r_margin > t_split && bsize == BlockSize::BLOCK_64X64;
+    }
+  }
+
   // prom_av1e005: the NONE arm's RD cost, for the partition-split gate
   // (see harvest::part_gate) and the harvest tap. NONE runs first (caller
   // passes [NONE, SPLIT]), so this is populated before any split trial.
@@ -2396,6 +2436,17 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
       continue;
     }
     if pd0_skip_split && partition != PARTITION_NONE {
+      continue;
+    }
+
+    // prom_av1e039: PD0 real-cost margin gate (all levels).
+    if pd0r_skip_none
+      && partition == PARTITION_NONE
+      && partition != cached_block.part_type
+    {
+      continue;
+    }
+    if pd0r_skip_split && partition != PARTITION_NONE {
       continue;
     }
 
@@ -2520,6 +2571,20 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
         pd0_kids,
       ));
     }
+  }
+
+  // prom_av1e039 ceiling: PD0 real-cost prediction vs the actual full-RD
+  // decision. margin>0 ⇒ PD0 predicts SPLIT (kids cheaper), ≤0 ⇒ NONE. Emit
+  // one row per splittable node for offline agreement (within-±1 accuracy).
+  if crate::harvest::pd0_ceil() && pd0_real_on && pd0r_node > 0.0 {
+    crate::harvest::emit(&format!(
+      "PD0CEIL,{},{:.6},{:.6},{:.6},{}",
+      bsize.width(),
+      pd0r_node,
+      pd0r_kids,
+      pd0r_margin,
+      best_partition as usize,
+    ));
   }
 
   PartitionGroupParameters {

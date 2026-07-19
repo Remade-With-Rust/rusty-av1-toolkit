@@ -569,6 +569,39 @@ pub fn pd0_gate() -> Option<(f64, f64)> {
   })
 }
 
+// --- prom_av1e039: PD0 real-cost partition screen ---------------------------
+//
+// SVT's PD0 predicts the partition depth with a fast REAL RD cost (1 candidate
+// + transform + quant + coeff-rate), then full RD refines within a band. Our
+// prior screens (SATD pd0_gate av1e010, variance flatskip av1e038) used cheap
+// PROXIES as the arbiter and leaked BD. pd0_real_cost is the real screen.
+// `RAV1E_PD0_CEIL=1` = isolation instrument only: at each square node emit the
+// PD0 node/kids real RD + the actual full-RD decision, for offline agreement.
+static PD0_CEIL: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn pd0_ceil() -> bool {
+  *PD0_CEIL.get_or_init(|| {
+    matches!(std::env::var("RAV1E_PD0_CEIL").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
+// `RAV1E_PD0_REAL=TN:TS` = the SHIPPING gate: skip the split subtree when the
+// PD0 real-cost margin m=(node-kids)/node < TN (node-confident), skip the
+// fresh NONE full trial when m > TS (split-confident). Unset = off.
+static PD0_REAL: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+#[inline]
+pub fn pd0_real() -> Option<(f64, f64)> {
+  *PD0_REAL.get_or_init(|| {
+    let v = std::env::var("RAV1E_PD0_REAL").ok()?;
+    let s = v.trim();
+    if s.is_empty() || s == "0" || s == "off" {
+      return None;
+    }
+    let (tn, ts) = s.split_once(':')?;
+    Some((tn.trim().parse().ok()?, ts.trim().parse().ok()?))
+  })
+}
+
 // --- prom_av1e004: calibrated MV-cost model for the motion search ----------
 //
 // me.rs::get_mv_rate prices an MV diff at 2·ilog(|d|) bits/axis; the harvested

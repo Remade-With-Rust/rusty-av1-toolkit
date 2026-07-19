@@ -1419,6 +1419,205 @@ fn get_qidx<T: Pixel>(
   qidx
 }
 
+/// prom_av1e039 — PD0 real cheap-RD block cost (SVT's PD0 screen, done with a
+/// REAL RD cost instead of the SATD proxy that made the NONE-skip direction
+/// catastrophic, av1e022). ONE NEARESTMV(LAST) prediction, the block's inter
+/// tx tiling, LUMA only, DCT_DCT: predict → diff → forward_transform →
+/// quantize → dequantize → tx-domain distortion + `estimate_rate` → RD.
+/// Self-contained by design: touches only rec pixels (the real trials
+/// overwrite them, exactly like `pd0_proxy_cost`) + `ts.qc` (re-set per real
+/// tx block) + local buffers — NO CDF, NO writer, NO block-info writes, so it
+/// is state-safe to call as a pre-pass in the partition search. Returns the
+/// RD cost in `compute_rd_cost` units so node-vs-kids compares apples to
+/// apples with the full search.
+pub(crate) fn pd0_real_cost<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
+) -> f64 {
+  if tile_bo.0.x >= ts.mi_width || tile_bo.0.y >= ts.mi_height {
+    return 0.0;
+  }
+  let ref_frames = [LAST_FRAME, NONE_FRAME];
+  let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+  let _ = cw.find_mvrefs(tile_bo, ref_frames, &mut mv_stack, bsize, fi, false);
+  let mut pmv = [MotionVector::default(); 2];
+  if !mv_stack.is_empty() {
+    pmv[0] = mv_stack[0].this_mv;
+  }
+  if mv_stack.len() > 1 {
+    pmv[1] = mv_stack[1].this_mv;
+  }
+
+  // Real (light) motion search — the ingredient SVT's PD0 has and the
+  // NEARESTMV-only cost lacked (ceiling: coin-flip at 32/16 without it). This
+  // is the expensive part of PD0; it makes the residual, hence the RD, faithful
+  // to what the full search would find, so the NONE/SPLIT margin predicts.
+  let me_res = estimate_motion(
+    fi,
+    ts,
+    bsize.width(),
+    bsize.height(),
+    tile_bo,
+    ref_frames[0],
+    Some(pmv),
+    MVSamplingMode::CORNER { right: true, bottom: true },
+    false,
+    0,
+    None,
+  );
+  let (mode, mv) = match me_res {
+    Some(r) => (PredictionMode::NEWMV, r.mv),
+    None => (PredictionMode::NEARESTMV, pmv[0]),
+  };
+  // MV signaling + mode-flag rate (frac bits) — makes the split overhead (4
+  // MVs/mode-flags vs 1) real in the margin, so NONE stays competitive.
+  // get_mv_rate is whole bits; shift into OD_BITRES frac units. The +4-bit
+  // constant approximates the per-block mode/ref/skip flag cost.
+  let mv_bits = if mode == PredictionMode::NEWMV {
+    u64::from(get_mv_rate(mv, pmv[0], fi.allow_high_precision_mv))
+  } else {
+    0
+  };
+  let block_rate = (mv_bits + 4) << crate::ec::OD_BITRES;
+
+  let tile_rect = ts.tile_rect();
+  {
+    let rec = &mut ts.rec.planes[0];
+    let po = tile_bo.plane_offset(rec.plane_cfg);
+    let mut rec_region =
+      rec.subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+    mode.predict_inter(
+      fi,
+      tile_rect,
+      0,
+      po,
+      &mut rec_region,
+      bsize.width(),
+      bsize.height(),
+      ref_frames,
+      [mv, MotionVector::default()],
+      &mut ts.inter_compound_buffers,
+    );
+  }
+
+  // Inter tx tiling, mirroring rdo_tx_size_type's inter path.
+  let mut tx_size = max_txsize_rect_lookup[bsize as usize];
+  if fi.enable_inter_txfm_split {
+    tx_size = sub_tx_size_map[tx_size as usize];
+  }
+  let tx_type = TxType::DCT_DCT;
+  let qidx = get_qidx(fi, ts, cw, tile_bo);
+  ts.qc.update(
+    qidx,
+    tx_size,
+    false,
+    fi.sequence.bit_depth,
+    fi.dc_delta_q[0],
+    fi.ac_delta_q[0],
+  );
+
+  let bw = bsize.width_mi() / tx_size.width_mi();
+  let bh = bsize.height_mi() / tx_size.height_mi();
+  let coded_tx_area = av1_get_coded_tx_size(tx_size).area();
+  let sb = 2 * (3 - get_log_tx_scale(tx_size));
+
+  let mut residual = Aligned::<[MaybeUninit<i16>; 64 * 64]>::uninit_array();
+  let mut coeffs = Aligned::<[MaybeUninit<T::Coeff>; 64 * 64]>::uninit_array();
+  let mut qcoeffs =
+    Aligned::<[MaybeUninit<T::Coeff>; 32 * 32]>::uninit_array();
+  let mut rcoeffs =
+    Aligned::<[MaybeUninit<T::Coeff>; 32 * 32]>::uninit_array();
+
+  let mut dist = ScaledDistortion::zero();
+  let mut rate = 0u64;
+
+  for by in 0..bh {
+    for bx in 0..bw {
+      let tx_bo = TileBlockOffset(BlockOffset {
+        x: tile_bo.0.x + bx * tx_size.width_mi(),
+        y: tile_bo.0.y + by * tx_size.height_mi(),
+      });
+      if tx_bo.0.x >= ts.mi_width || tx_bo.0.y >= ts.mi_height {
+        continue;
+      }
+      let area = Area::BlockRect {
+        bo: tx_bo.0,
+        width: tx_size.width(),
+        height: tx_size.height(),
+      };
+      let residual = &mut residual.data[..tx_size.area()];
+      let coeffs = &mut coeffs.data[..tx_size.area()];
+      let qcoeffs = init_slice_repeat_mut(
+        &mut qcoeffs.data[..coded_tx_area],
+        T::Coeff::cast_from(0),
+      );
+      let rcoeffs = &mut rcoeffs.data[..coded_tx_area];
+
+      {
+        let rec = &ts.rec.planes[0];
+        diff(
+          residual,
+          &ts.input_tile.planes[0].subregion(area),
+          &rec.subregion(area),
+        );
+      }
+      // SAFETY: diff inits tx_size.area() elements.
+      let residual = unsafe { slice_assume_init_mut(residual) };
+      forward_transform(
+        residual,
+        coeffs,
+        tx_size.width(),
+        tx_size,
+        tx_type,
+        fi.sequence.bit_depth,
+        fi.cpu_feature_level,
+      );
+      // SAFETY: forward_transform initialized coeffs.
+      let coeffs = unsafe { slice_assume_init_mut(coeffs) };
+      let eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type);
+      dequantize(
+        qidx,
+        qcoeffs,
+        eob,
+        rcoeffs,
+        tx_size,
+        fi.sequence.bit_depth,
+        fi.dc_delta_q[0],
+        fi.ac_delta_q[0],
+        fi.cpu_feature_level,
+      );
+      // SAFETY: dequantize initialized rcoeffs.
+      let rcoeffs = unsafe { slice_assume_init_mut(rcoeffs) };
+
+      let mut raw = coeffs
+        .iter()
+        .zip(rcoeffs.iter())
+        .map(|(&a, &b)| {
+          let c = i32::cast_from(a) - i32::cast_from(b);
+          (c * c) as u64
+        })
+        .sum::<u64>()
+        + coeffs[rcoeffs.len()..]
+          .iter()
+          .map(|&a| {
+            let c = i32::cast_from(a);
+            (c * c) as u64
+          })
+          .sum::<u64>();
+      raw = (raw + (1 << (sb - 1))) >> sb;
+      rate += estimate_rate(fi.base_q_idx, tx_size, raw);
+      // spatiotemporal_scale (not distortion_scale) is the >8×8-safe perceptual
+      // bias — matches the default Psychovisual pixel-domain weighting and does
+      // not assert on large blocks.
+      let bias =
+        spatiotemporal_scale(fi, ts.to_frame_block_offset(tx_bo), bsize);
+      dist += RawDistortion::new(raw) * bias * fi.dist_scale[0];
+    }
+  }
+
+  compute_rd_cost(fi, (rate + block_rate) as u32, dist)
+}
+
 /// For a transform block,
 /// predict, transform, quantize, write coefficients to a bitstream,
 /// dequantize, inverse-transform.
