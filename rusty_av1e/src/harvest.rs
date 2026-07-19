@@ -321,7 +321,14 @@ static FASTRD: OnceLock<bool> = OnceLock::new();
 #[inline]
 pub fn fastrd() -> bool {
   *FASTRD.get_or_init(|| {
-    matches!(std::env::var("RAV1E_FASTRD").as_deref().map(str::trim), Ok("1"))
+    match std::env::var("RAV1E_FASTRD") {
+      Ok(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"),
+      // tier fallback: rate-aware ranking is the CORRECT screen (ME has
+      // always ranked SATD+rate); at the tier's K=6 it is a free BD win
+      // (−0.039% mean, ~0 speed; trial22) ⇒ folded on. RAV1E_FASTRD=0 opts
+      // out.
+      Err(_) => fast_tier() == FastTier::Fast,
+    }
   })
 }
 
