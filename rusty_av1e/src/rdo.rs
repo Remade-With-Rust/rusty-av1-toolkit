@@ -135,7 +135,15 @@ pub fn estimate_rate(qindex: u8, ts: TxSize, fast_distortion: u64) -> u64 {
   let y0 = RDO_RATE_TABLE[q_bin_idx][bs_index][bin_idx_down as usize] as i64;
   let y1 = RDO_RATE_TABLE[q_bin_idx][bs_index][bin_idx_up as usize] as i64;
   let slope = ((y1 - y0) << 8) / (x1 - x0);
-  (y0 + (((fast_distortion as i64 - x0) * slope) >> 8)).max(0) as u64
+  let r = (y0 + (((fast_distortion as i64 - x0) * slope) >> 8)).max(0) as u64;
+  // prom_av1e034: empirical recalibration multiplier (percent) for the
+  // estimate-rate 2-tier funnel — the stock table underestimates coded rate
+  // for our config, so the encoder over-picks high-rate modes. RAV1E_TXRATE_MUL
+  // scales the estimate; 100 = stock.
+  match crate::harvest::txrate_mul() {
+    Some(m) => r * m / 100,
+    None => r,
+  }
 }
 
 #[allow(unused)]

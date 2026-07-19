@@ -845,9 +845,18 @@ impl<T: Pixel> FrameInvariants<T> {
       render_width != width || render_height != height;
 
     let use_reduced_tx_set = config.speed_settings.transform.reduced_tx_set;
-    let use_tx_domain_distortion = config.tune == Tune::Psnr
-      && config.speed_settings.transform.tx_domain_distortion;
-    let use_tx_domain_rate = config.speed_settings.transform.tx_domain_rate;
+    // prom_av1e034: 2-tier funnel lever. Estimate coefficient rate from
+    // tx-domain distortion in the RDO trials (TxDistEstRate) instead of
+    // running the full coefficient coder (TxDistRealRate) per candidate —
+    // the winner is re-coded exactly at final encode, so only the RANKING
+    // uses estimated rate. Directly removes the ~19.5% in-trial entropy.
+    // estimate_rate needs tx-domain distortion, so txrate forces both on
+    // (they are a pair; the pixel-distortion path has no tx_dist to estimate).
+    let use_tx_domain_rate = config.speed_settings.transform.tx_domain_rate
+      || crate::harvest::txrate();
+    let use_tx_domain_distortion = use_tx_domain_rate
+      || (config.tune == Tune::Psnr
+        && config.speed_settings.transform.tx_domain_distortion);
 
     let w_in_b = 2 * config.width.align_power_of_two_and_shift(3); // MiCols, ((width+7)/8)<<3 >> MI_SIZE_LOG2
     let h_in_b = 2 * config.height.align_power_of_two_and_shift(3); // MiRows, ((height+7)/8)<<3 >> MI_SIZE_LOG2

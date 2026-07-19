@@ -304,6 +304,34 @@ pub fn luma_reuse() -> bool {
   })
 }
 
+// --- prom_av1e034: estimated-rate RDO trials (2-tier funnel) ------------------
+//
+// `RAV1E_TXRATE=1` makes mode-decision trials cost coefficient rate from a
+// table (estimate_rate on tx-domain distortion) instead of running the full
+// range coder per candidate — the SVT MDS0/MDS1 "fast cost". The winner is
+// re-coded exactly at final encode, so only the ranking uses estimated rate.
+// Decision-space change (estimate vs exact rate) ⇒ BD-gated.
+
+static TXRATE: OnceLock<bool> = OnceLock::new();
+
+/// True when RDO trials cost rate by table instead of the coefficient coder.
+#[inline]
+pub fn txrate() -> bool {
+  *TXRATE.get_or_init(|| {
+    matches!(std::env::var("RAV1E_TXRATE").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
+static TXRATE_MUL: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Some(percent) scales the estimate_rate output (empirical recalibration).
+#[inline]
+pub fn txrate_mul() -> Option<u64> {
+  *TXRATE_MUL.get_or_init(|| {
+    std::env::var("RAV1E_TXRATE_MUL").ok().and_then(|v| v.trim().parse().ok())
+  })
+}
+
 // --- prom_av1e031/032: content-adaptive dispatch (variance partition) --------
 //
 // `RAV1E_VARPART=T` forces the variance-partition alternative ON for every SB
