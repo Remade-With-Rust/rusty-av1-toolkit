@@ -322,6 +322,18 @@ pub fn txrate() -> bool {
   })
 }
 
+static RATEHARVEST: OnceLock<bool> = OnceLock::new();
+
+/// True when encode_tx_block emits (q, tx_size, tx_dist, real_rate) pairs to
+/// the harvest sink for refitting estimate_rate's table.
+#[inline]
+pub fn rateharvest() -> bool {
+  *RATEHARVEST.get_or_init(|| {
+    matches!(std::env::var("RAV1E_RATEHARVEST").as_deref().map(str::trim), Ok("1"))
+      && enabled()
+  })
+}
+
 static TXRATE_MUL: OnceLock<Option<u64>> = OnceLock::new();
 
 /// Some(percent) scales the estimate_rate output (empirical recalibration).

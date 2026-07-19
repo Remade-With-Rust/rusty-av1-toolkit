@@ -1588,6 +1588,11 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
 
   let eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type);
 
+  // prom_av1e034 rate-table harvest: capture the REAL coefficient rate the
+  // RDO uses, to refit estimate_rate's table. Tier at tune=Psnr already runs
+  // both write_coeffs (rate) and the tx_dist below.
+  let rate_harvest = crate::harvest::rateharvest();
+  let rh_tell0 = if rate_harvest { w.tell_frac() } else { 0 };
   let has_coeff = if need_recon_pixel || rdo_type.needs_coeff_rate() {
     debug_assert!((((fi.w_in_b - frame_bo.0.x) << MI_SIZE_LOG2) >> xdec) >= 4);
     debug_assert!((((fi.h_in_b - frame_bo.0.y) << MI_SIZE_LOG2) >> ydec) >= 4);
@@ -1683,6 +1688,14 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
         let estimated_rate =
           estimate_rate(fi.base_q_idx, tx_size, raw_tx_dist);
         w.add_bits_frac(estimated_rate as u32);
+      }
+
+      if rate_harvest && W::COUNTS_ONLY {
+        let real_rate = w.tell_frac().saturating_sub(rh_tell0);
+        crate::harvest::emit(&format!(
+          "RATE,{},{},{},{}",
+          fi.base_q_idx, tx_size as usize, raw_tx_dist, real_rate
+        ));
       }
 
       let bias = distortion_scale(fi, ts.to_frame_block_offset(tx_bo), bsize);
