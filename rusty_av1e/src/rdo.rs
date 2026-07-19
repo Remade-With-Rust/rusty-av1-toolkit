@@ -965,6 +965,8 @@ fn luma_chroma_mode_rdo<T: Pixel>(
     mode_set_chroma
   };
 
+  #[cfg(feature = "profile")]
+  let _fp = crate::encoder::fwd_phase::enter(0);
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
     use crate::segmentation::select_segment;
@@ -2046,6 +2048,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
   bsize: BlockSize, tile_bo: TileBlockOffset, tx_size: TxSize, tx_set: TxSet,
   tx_types: &[TxType], cur_best_rd: f64,
 ) -> (TxType, f64) {
+  #[cfg(feature = "profile")]
+  let _fp = crate::encoder::fwd_phase::enter(1);
   let mut best_type = TxType::DCT_DCT;
   let mut best_rd = f64::MAX;
 

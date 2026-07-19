@@ -1574,6 +1574,8 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
   // SAFETY: `diff()` inits `tx_size.area()` elements when it matches size of `subregion(area)`
   let residual = unsafe { slice_assume_init_mut(residual) };
 
+  #[cfg(feature = "profile")]
+  fwd_phase::count(W::COUNTS_ONLY);
   forward_transform(
     residual,
     coeffs,
@@ -3141,6 +3143,44 @@ fn varpart_route_sb(v64: i64) -> bool {
   })
 }
 
+// prom_av1e036: attribute every forward_transform (the full-price kernel) to
+// its RDO phase to find the 68×-vs-SVT redundancy. Phase set by the RDO entry
+// points; counts split trial (counter) vs final (real coder).
+#[cfg(feature = "profile")]
+pub(crate) mod fwd_phase {
+  use std::cell::Cell;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  thread_local! { pub static PHASE: Cell<usize> = const { Cell::new(2) }; }
+  // [phase][counts_only]: phase 0=mode-trial 1=tx-search 2=final/other
+  pub static N: [[AtomicU64; 2]; 3] =
+    [const { [const { AtomicU64::new(0) }; 2] }; 3];
+
+  pub struct Guard(usize);
+  pub fn enter(p: usize) -> Guard {
+    Guard(PHASE.with(|c| c.replace(p)))
+  }
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      PHASE.with(|c| c.set(self.0));
+    }
+  }
+  pub fn count(counts_only: bool) {
+    let p = PHASE.with(|c| c.get());
+    N[p][usize::from(!counts_only)].fetch_add(1, Ordering::Relaxed);
+  }
+  pub fn dump() {
+    let names = ["mode-trial", "tx-search ", "final/othr"];
+    let mut tot = 0u64;
+    for p in 0..3 {
+      let t = N[p][0].load(Ordering::Relaxed);
+      let f = N[p][1].load(Ordering::Relaxed);
+      tot += t + f;
+      eprintln!("FWDPHASE {} trial={} final={}", names[p], t, f);
+    }
+    eprintln!("FWDPHASE TOTAL {}", tot);
+  }
+}
+
 /// prom_av1e031/032: build the 64×64 residual variance tree for the SB at
 /// `tile_bo` — source vs the co-located LAST reference (zero-MV residual =
 /// coding difficulty). Falls back to source variance when LAST is absent
@@ -3971,6 +4011,7 @@ fn encode_tile<'a, T: Pixel>(
           );
           trial_audit::dump();
           crate::rdo::fulltrial_audit::dump();
+          fwd_phase::dump();
         }
       }
 
