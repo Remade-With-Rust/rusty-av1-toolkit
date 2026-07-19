@@ -323,6 +323,36 @@ pub fn varpart() -> Option<i64> {
   })
 }
 
+// Brick 3: the per-frame PERCENTILE dispatcher. `RAV1E_DISPATCH_Q=q` routes
+// the fraction q of SBs (by root residual variance) to the variance
+// partition; the rest keep the full RD search. Direction: default routes the
+// LOW-variance (easy) SBs to varpart (quality-optimal — keeps RD where it
+// helps); `RAV1E_DISPATCH_HI=1` routes the HIGH-variance (most-expensive) SBs
+// instead (time-capping). The same percentile threshold drives both routing
+// and the routed SB's internal NONE/SPLIT decision (content-invariant dial).
+
+static DISPATCH_Q: OnceLock<Option<f64>> = OnceLock::new();
+static DISPATCH_HI: OnceLock<bool> = OnceLock::new();
+
+/// Some(q) enables the percentile dispatcher with routed fraction q∈[0,1].
+#[inline]
+pub fn dispatch_q() -> Option<f64> {
+  *DISPATCH_Q.get_or_init(|| {
+    std::env::var("RAV1E_DISPATCH_Q")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .filter(|q: &f64| *q > 0.0 && *q <= 1.0)
+  })
+}
+
+/// True routes HIGH-variance SBs to varpart (time-capping) instead of low.
+#[inline]
+pub fn dispatch_hi() -> bool {
+  *DISPATCH_HI.get_or_init(|| {
+    matches!(std::env::var("RAV1E_DISPATCH_HI").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
 // --- prom_av1e029: intra full-trial cap --------------------------------------
 //
 // The aggressive MODE_TOPK knob caps INTER mode trials but the intra path

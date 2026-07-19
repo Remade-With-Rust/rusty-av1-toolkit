@@ -135,6 +135,25 @@ pub fn build_var_tree<T: Pixel>(
   VarTree { v8, v16, v32, v64: l64[0] }
 }
 
+/// Cheap root-only signal: the `256 · per-sample variance` of the whole
+/// 64×64 residual, without building the full tree. Used by the dispatcher's
+/// per-frame percentile pre-pass (Brick 3).
+pub fn sb_root_variance<T: Pixel>(
+  src: &PlaneRegion<'_, T>, refr: Option<&PlaneRegion<'_, T>>, w: usize,
+  h: usize,
+) -> i64 {
+  let mut buf = [0i32; SB * SB];
+  load_residual(src, refr, w, h, &mut buf);
+  let mut sum = 0i64;
+  let mut sse = 0i64;
+  for &d in buf.iter() {
+    let d = d as i64;
+    sum += d;
+    sse += d * d;
+  }
+  VarNode { sum, sse, log2_count: 12 }.variance()
+}
+
 impl VarTree {
   /// `256 · per-sample variance` of the square node of side `dim` pixels at
   /// pixel offset `(ox, oy)` within the SB. Only square 8/16/32/64 nodes are

@@ -3073,6 +3073,52 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
   rdo_output
 }
 
+// prom_av1e033 (Brick 3): the per-tile dispatch threshold, set by the
+// per-frame percentile pre-pass. `Some((thresh, route_hi))` ⇒ dispatch mode;
+// `None` ⇒ not in dispatch mode (force-on or off). Thread-local so each tile
+// thread carries its own frame threshold.
+thread_local! {
+  // (routing_thresh, route_hi, internal_split_t) when in dispatch mode.
+  static VARPART_DISPATCH: std::cell::Cell<Option<(i64, bool, i64)>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// The threshold for the routed SB's INTERNAL NONE/SPLIT decision — the
+/// quantizer-derived value (dispatch mode) or the fixed `RAV1E_VARPART`
+/// value (force-on). This is SEPARATE from the routing percentile: the
+/// routing percentile decides WHICH SBs use varpart, this decides HOW they
+/// partition (tuned to coding difficulty, not to the SB population).
+#[inline]
+fn varpart_split_threshold() -> i64 {
+  VARPART_DISPATCH
+    .with(|c| c.get())
+    .map(|(_, _, t)| t)
+    .or_else(crate::harvest::varpart)
+    .unwrap_or(i64::MAX)
+}
+
+/// Whether any SB should build the variance tree at all (force-on or in
+/// dispatch mode).
+#[inline]
+fn varpart_sb_active() -> bool {
+  crate::harvest::varpart().is_some()
+    || VARPART_DISPATCH.with(|c| c.get()).is_some()
+}
+
+/// Route THIS SB (whose root variance is `v64`) to the variance partition?
+/// Force-on ⇒ always; dispatch ⇒ low-variance (or high, if `route_hi`) side
+/// of the frame routing percentile.
+#[inline]
+fn varpart_route_sb(v64: i64) -> bool {
+  VARPART_DISPATCH.with(|c| c.get()).map_or(true, |(thresh, route_hi, _)| {
+    if route_hi {
+      v64 >= thresh
+    } else {
+      v64 <= thresh
+    }
+  })
+}
+
 /// prom_av1e031/032: build the 64×64 residual variance tree for the SB at
 /// `tile_bo` — source vs the co-located LAST reference (zero-MV residual =
 /// coding difficulty). Falls back to source variance when LAST is absent
@@ -3099,6 +3145,29 @@ fn build_sb_var_tree<T: Pixel>(
   }
 }
 
+/// Root-only residual variance for the SB at `tile_bo` (the dispatch
+/// pre-pass signal — cheaper than the full tree).
+fn sb_root_var<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &TileStateMut<'_, T>, tile_bo: TileBlockOffset,
+) -> i64 {
+  let vis_w = ((ts.mi_width - tile_bo.0.x) * MI_SIZE).min(64);
+  let vis_h = ((ts.mi_height - tile_bo.0.y) * MI_SIZE).min(64);
+  let src =
+    ts.input_tile.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+  let last = fi.rec_buffer.frames
+    [fi.ref_frames[LAST_FRAME.to_index()] as usize]
+    .as_ref();
+  if let Some(rec) = last {
+    let frame_bo = ts.to_frame_block_offset(tile_bo);
+    let po = frame_bo.to_luma_plane_offset();
+    let refr =
+      rec.frame.planes[0].region(Area::StartingAt { x: po.x, y: po.y });
+    crate::varpart::sb_root_variance(&src, Some(&refr), vis_w, vis_h)
+  } else {
+    crate::varpart::sb_root_variance(&src, None, vis_w, vis_h)
+  }
+}
+
 fn encode_partition_topdown<T: Pixel, W: Writer>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, w_pre_cdef: &mut W, w_post_cdef: &mut W,
@@ -3116,10 +3185,15 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
   let owned_vt;
   let vt = if vt.is_none()
     && bsize == BlockSize::BLOCK_64X64
-    && crate::harvest::varpart().is_some()
+    && varpart_sb_active()
   {
     owned_vt = build_sb_var_tree(fi, ts, tile_bo);
-    Some(&owned_vt)
+    // Route this SB by its root variance (dispatch) or always (force-on).
+    if varpart_route_sb(owned_vt.v64.variance()) {
+      Some(&owned_vt)
+    } else {
+      None
+    }
   } else {
     vt
   };
@@ -3153,12 +3227,13 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
 
   let partition = if must_split {
     PartitionType::PARTITION_SPLIT
-  } else if let (Some(vt), Some(t)) = (vt, crate::harvest::varpart()) {
-    // prom_av1e031/032: variance-partition alternative — SPLIT iff this
-    // node's residual variance exceeds T; the 8×8 floor never splits. No RD
-    // search runs; part_modes stays empty so the NONE arm falls through to
-    // rdo_mode_decision (the identical leaf).
+  } else if let Some(vt) = vt {
+    // prom_av1e031/032/033: variance-partition alternative — SPLIT iff this
+    // node's residual variance exceeds the (percentile or fixed) threshold;
+    // the 8×8 floor never splits. No RD search runs; part_modes stays empty
+    // so the NONE arm falls through to rdo_mode_decision (the identical leaf).
     debug_assert!(bsize.is_sqr());
+    let t = varpart_split_threshold();
     let dim = bsize.width();
     let ox = (tile_bo.0.x % 16) * MI_SIZE;
     let oy = (tile_bo.0.y % 16) * MI_SIZE;
@@ -3415,8 +3490,8 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
           );
         }
       } else {
-        // varpart (prom_av1e031/032) reaches SPLIT with empty part_modes too.
-        debug_assert!(must_split || crate::harvest::varpart().is_some());
+        // varpart (prom_av1e031/032/033) reaches SPLIT with empty part_modes.
+        debug_assert!(must_split || varpart_sb_active());
         let hbsw = subsize.width_mi(); // Half the block size width in blocks
         let hbsh = subsize.height_mi(); // Half the block size height in blocks
         let four_partitions = [
@@ -3742,6 +3817,38 @@ fn encode_tile<'a, T: Pixel>(
   let mut last_lru_ready = [-1; 3];
   let mut last_lru_rdoed = [-1; 3];
   let mut last_lru_coded = [-1; 3];
+
+  // prom_av1e033 (Brick 3): per-frame percentile dispatch. Pre-pass the
+  // root residual variance of every SB in this tile, then set the cutoff at
+  // the percentile that routes the target fraction q — so the routed
+  // fraction (hence the RD/variance work split) is content-invariant. The
+  // same threshold drives the routed SBs' internal NONE/SPLIT decision.
+  if let Some(q) = crate::harvest::dispatch_q() {
+    let mut vars = Vec::with_capacity(ts.sb_width * ts.sb_height);
+    for sby in 0..ts.sb_height {
+      for sbx in 0..ts.sb_width {
+        let sbo = TileSuperBlockOffset(SuperBlockOffset { x: sbx, y: sby });
+        vars.push(sb_root_var(fi, ts, sbo.block_offset(0, 0)));
+      }
+    }
+    vars.sort_unstable();
+    let route_hi = crate::harvest::dispatch_hi();
+    let n = vars.len();
+    let idx = if route_hi {
+      (((1.0 - q) * n as f64) as usize).min(n.saturating_sub(1))
+    } else {
+      ((q * n as f64) as usize).min(n.saturating_sub(1))
+    };
+    let thresh = vars.get(idx).copied().unwrap_or(i64::MAX);
+    // Internal split threshold: tuned to coding difficulty (quantizer²),
+    // independent of the SB routing percentile. RAV1E_VARPART overrides.
+    let q_idx = fi.base_q_idx as i64;
+    let internal_t =
+      crate::harvest::varpart().unwrap_or(2 * q_idx * q_idx);
+    VARPART_DISPATCH.with(|c| c.set(Some((thresh, route_hi, internal_t))));
+  } else {
+    VARPART_DISPATCH.with(|c| c.set(None));
+  }
 
   // main loop
   for sby in 0..ts.sb_height {
