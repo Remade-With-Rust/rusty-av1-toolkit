@@ -304,6 +304,27 @@ pub fn luma_reuse() -> bool {
   })
 }
 
+// --- prom_av1e028: rate-aware mode screen ------------------------------------
+//
+// THE FRONTIER FIX. Our inter-mode screen ranked candidates by SATD alone —
+// blind to the mv-residual rate that separates NEWMV (cheap SATD, dear bits)
+// from NEAREST/NEAR (dearer SATD, ~free bits). av1e027 proved cutting K on a
+// distortion-only ranking blows BD up (+2.2%). `RAV1E_FASTRD=1` adds the
+// mv-rate term to the screen key using ME's own calibration
+// (cost/256 = SATD + rate·me_lambda·0.5), so the top-K after sorting are the
+// real RD leaders and K can drop toward the ~2 frontier. Decision-space
+// reduction ⇒ BD-gated; also forces the screen on like MODE_TOPK.
+
+static FASTRD: OnceLock<bool> = OnceLock::new();
+
+/// True when the inter-mode screen ranks by SATD + mv-rate instead of SATD.
+#[inline]
+pub fn fastrd() -> bool {
+  *FASTRD.get_or_init(|| {
+    matches!(std::env::var("RAV1E_FASTRD").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
 // --- prom_av1e020: chroma-mode SATD pre-selection ----------------------------
 //
 // The intra chroma-mode loop full-codes the whole block per candidate;

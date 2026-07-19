@@ -1535,7 +1535,7 @@ fn full_search<T: Pixel>(
 }
 
 #[inline(always)]
-fn get_mv_rate(
+pub(crate) fn get_mv_rate(
   a: MotionVector, b: MotionVector, allow_high_precision_mv: bool,
 ) -> u32 {
   #[inline(always)]

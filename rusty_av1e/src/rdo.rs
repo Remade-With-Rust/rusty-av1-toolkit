@@ -1501,7 +1501,8 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   // dormant (num_modes_rdo >= set len), so the knob also FORCES the SATD
   // compute + sort. Off unless RAV1E_MODE_TOPK is set.
   let topk_006 = crate::harvest::mode_topk();
-  let force_screen_006 = topk_006.is_some();
+  let fastrd_028 = crate::harvest::fastrd();
+  let force_screen_006 = topk_006.is_some() || fastrd_028;
   let num_full_006 = topk_006.map_or(num_modes_rdo, |ks| {
     let k = match bsize.width().max(bsize.height()) {
       64.. => ks[0],
@@ -1585,7 +1586,45 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         fi.sequence.bit_depth,
         fi.cpu_feature_level,
       );
-      satds.push(satd);
+
+      // prom_av1e028: fold the mv-residual rate into the screen key so the
+      // ranking is RD, not distortion-only. Mirrors write_mv exactly
+      // (ref_mv = mv_stack[0], the components each mode actually codes NEW)
+      // and ME's calibration (satd-domain rate coeff = me_lambda·0.5).
+      let screen_key = if fastrd_028 {
+        let ref_mvs = if !mv_stacks[i].is_empty() {
+          [mv_stacks[i][0].this_mv, mv_stacks[i][0].comp_mv]
+        } else {
+          [MotionVector::default(); 2]
+        };
+        let mut mv_rate = 0u32;
+        if matches!(
+          luma_mode,
+          PredictionMode::NEWMV
+            | PredictionMode::NEW_NEWMV
+            | PredictionMode::NEW_NEARESTMV
+        ) {
+          mv_rate += crate::me::get_mv_rate(
+            mvs[0],
+            ref_mvs[0],
+            fi.allow_high_precision_mv,
+          );
+        }
+        if matches!(
+          luma_mode,
+          PredictionMode::NEW_NEWMV | PredictionMode::NEAREST_NEWMV
+        ) {
+          mv_rate += crate::me::get_mv_rate(
+            mvs[1],
+            ref_mvs[1],
+            fi.allow_high_precision_mv,
+          );
+        }
+        satd.saturating_add((mv_rate as f64 * fi.me_lambda * 0.5) as u32)
+      } else {
+        satd
+      };
+      satds.push(screen_key);
     } else {
       satds.push(0);
     }
