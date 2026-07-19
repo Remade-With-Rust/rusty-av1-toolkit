@@ -3073,16 +3073,56 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
   rdo_output
 }
 
+/// prom_av1e031/032: build the 64×64 residual variance tree for the SB at
+/// `tile_bo` — source vs the co-located LAST reference (zero-MV residual =
+/// coding difficulty). Falls back to source variance when LAST is absent
+/// (e.g. intra frames). Edge SBs clamp-fill to the visible extent.
+fn build_sb_var_tree<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &TileStateMut<'_, T>, tile_bo: TileBlockOffset,
+) -> crate::varpart::VarTree {
+  let vis_w = ((ts.mi_width - tile_bo.0.x) * MI_SIZE).min(64);
+  let vis_h = ((ts.mi_height - tile_bo.0.y) * MI_SIZE).min(64);
+  let src =
+    ts.input_tile.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+
+  let last = fi.rec_buffer.frames
+    [fi.ref_frames[LAST_FRAME.to_index()] as usize]
+    .as_ref();
+  if let Some(rec) = last {
+    let frame_bo = ts.to_frame_block_offset(tile_bo);
+    let po = frame_bo.to_luma_plane_offset();
+    let refr =
+      rec.frame.planes[0].region(Area::StartingAt { x: po.x, y: po.y });
+    crate::varpart::build_var_tree(&src, Some(&refr), vis_w, vis_h)
+  } else {
+    crate::varpart::build_var_tree(&src, None, vis_w, vis_h)
+  }
+}
+
 fn encode_partition_topdown<T: Pixel, W: Writer>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, w_pre_cdef: &mut W, w_post_cdef: &mut W,
   bsize: BlockSize, tile_bo: TileBlockOffset,
   block_output: &Option<PartitionGroupParameters>, inter_cfg: &InterConfig,
-  enc_stats: &mut EncoderStats,
+  enc_stats: &mut EncoderStats, vt: Option<&crate::varpart::VarTree>,
 ) {
   if tile_bo.0.x >= ts.mi_width || tile_bo.0.y >= ts.mi_height {
     return;
   }
+  // prom_av1e031/032: content-adaptive dispatch. At the 64×64 root under
+  // RAV1E_VARPART, build the residual variance tree once and thread it down
+  // the recursion; each square node reads its NONE/SPLIT decision from it
+  // instead of running rdo_partition_decision.
+  let owned_vt;
+  let vt = if vt.is_none()
+    && bsize == BlockSize::BLOCK_64X64
+    && crate::harvest::varpart().is_some()
+  {
+    owned_vt = build_sb_var_tree(fi, ts, tile_bo);
+    Some(&owned_vt)
+  } else {
+    vt
+  };
   let is_square = bsize.is_sqr();
   let rdo_type = RDOType::PixelDistRealRate;
   let hbs = bsize.width_mi() / 2;
@@ -3113,6 +3153,20 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
 
   let partition = if must_split {
     PartitionType::PARTITION_SPLIT
+  } else if let (Some(vt), Some(t)) = (vt, crate::harvest::varpart()) {
+    // prom_av1e031/032: variance-partition alternative — SPLIT iff this
+    // node's residual variance exceeds T; the 8×8 floor never splits. No RD
+    // search runs; part_modes stays empty so the NONE arm falls through to
+    // rdo_mode_decision (the identical leaf).
+    debug_assert!(bsize.is_sqr());
+    let dim = bsize.width();
+    let ox = (tile_bo.0.x % 16) * MI_SIZE;
+    let oy = (tile_bo.0.y % 16) * MI_SIZE;
+    if bsize > BlockSize::BLOCK_8X8 && vt.node_variance(dim, ox, oy) > t {
+      PartitionType::PARTITION_SPLIT
+    } else {
+      PartitionType::PARTITION_NONE
+    }
   } else if can_split {
     debug_assert!(bsize.is_sqr());
 
@@ -3357,10 +3411,12 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
             }),
             inter_cfg,
             enc_stats,
+            vt,
           );
         }
       } else {
-        debug_assert!(must_split);
+        // varpart (prom_av1e031/032) reaches SPLIT with empty part_modes too.
+        debug_assert!(must_split || crate::harvest::varpart().is_some());
         let hbsw = subsize.width_mi(); // Half the block size width in blocks
         let hbsh = subsize.height_mi(); // Half the block size height in blocks
         let four_partitions = [
@@ -3392,6 +3448,7 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
             &None,
             inter_cfg,
             enc_stats,
+            vt,
           );
         });
       }
@@ -3747,6 +3804,7 @@ fn encode_tile<'a, T: Pixel>(
           &None,
           inter_cfg,
           &mut enc_stats,
+          None,
         );
       }
 

@@ -8,7 +8,6 @@
 //!
 //! This module is PURE and oracle-tested (tree == brute force at every
 //! level). No encoder wiring lives here — that is Brick 2.
-#![allow(dead_code)] // wired in Brick 2 (var_pick_partition)
 
 use crate::tiling::PlaneRegion;
 use crate::util::{CastFromPrimitive, Pixel};
@@ -134,6 +133,21 @@ pub fn build_var_tree<T: Pixel>(
   v32.copy_from_slice(&l32);
 
   VarTree { v8, v16, v32, v64: l64[0] }
+}
+
+impl VarTree {
+  /// `256 · per-sample variance` of the square node of side `dim` pixels at
+  /// pixel offset `(ox, oy)` within the SB. Only square 8/16/32/64 nodes are
+  /// valid decision points in the NONE/SPLIT fast path.
+  #[inline]
+  pub fn node_variance(&self, dim: usize, ox: usize, oy: usize) -> i64 {
+    match dim {
+      64 => self.v64.variance(),
+      32 => self.v32[(oy / 32) * 2 + ox / 32].variance(),
+      16 => self.v16[(oy / 16) * 4 + ox / 16].variance(),
+      _ => self.v8[(oy / 8) * 8 + ox / 8].variance(),
+    }
+  }
 }
 
 #[cfg(test)]

@@ -304,6 +304,25 @@ pub fn luma_reuse() -> bool {
   })
 }
 
+// --- prom_av1e031/032: content-adaptive dispatch (variance partition) --------
+//
+// `RAV1E_VARPART=T` forces the variance-partition alternative ON for every SB
+// (Brick 2 force-on): at each square NONE/SPLIT node, SPLIT iff the node's
+// 256·per-sample residual variance exceeds T, else NONE — no RD search. The
+// leaf (rdo_mode_decision + encode) is reused verbatim, so the stream is
+// decodable by construction. Decision-space swap ⇒ BD-gated. Brick 3 replaces
+// the fixed T with a per-frame percentile.
+
+static VARPART: OnceLock<Option<i64>> = OnceLock::new();
+
+/// Some(T) forces the variance partition with split-threshold T.
+#[inline]
+pub fn varpart() -> Option<i64> {
+  *VARPART.get_or_init(|| {
+    std::env::var("RAV1E_VARPART").ok().and_then(|v| v.trim().parse().ok())
+  })
+}
+
 // --- prom_av1e029: intra full-trial cap --------------------------------------
 //
 // The aggressive MODE_TOPK knob caps INTER mode trials but the intra path
