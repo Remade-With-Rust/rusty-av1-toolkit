@@ -3783,6 +3783,7 @@ fn encode_tile<'a, T: Pixel>(
             100.0 * sc as f64 / (sc + rc).max(1) as f64
           );
           trial_audit::dump();
+          crate::rdo::fulltrial_audit::dump();
         }
       }
 

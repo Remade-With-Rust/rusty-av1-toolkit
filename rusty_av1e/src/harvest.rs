@@ -304,6 +304,24 @@ pub fn luma_reuse() -> bool {
   })
 }
 
+// --- prom_av1e029: intra full-trial cap --------------------------------------
+//
+// The aggressive MODE_TOPK knob caps INTER mode trials but the intra path
+// full-trials num_modes_rdo (3-7) uncapped — measured 14% of full-price work
+// on motion content where intra rarely wins. `RAV1E_INTRA_TOPK=K` caps the
+// intra full-trial loop to the top-K CDF-prob/SATD-ranked modes. Decision-
+// space reduction ⇒ BD-gated.
+
+static INTRA_TOPK: OnceLock<Option<usize>> = OnceLock::new();
+
+/// Some(K) caps intra mode full-trials to the top-K ranked candidates.
+#[inline]
+pub fn intra_topk() -> Option<usize> {
+  *INTRA_TOPK.get_or_init(|| {
+    std::env::var("RAV1E_INTRA_TOPK").ok().and_then(|v| v.trim().parse().ok())
+  })
+}
+
 // --- prom_av1e028: rate-aware mode screen ------------------------------------
 //
 // THE FRONTIER FIX. Our inter-mode screen ranked candidates by SATD alone —

@@ -1335,6 +1335,20 @@ fn pd0_proxy_cost<T: Pixel>(
   256 * satd as u64
 }
 
+#[cfg(feature = "profile")]
+pub(crate) mod fulltrial_audit {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  // [inter, intra, angle, txtype] full-price mode/tx evaluations
+  pub static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+  pub fn add(kind: usize, n: u64) { N[kind].fetch_add(n, Ordering::Relaxed); }
+  pub fn dump() {
+    eprintln!(
+      "FULLTRIAL inter={} intra={} angle={} txtype={}",
+      N[0].load(Ordering::Relaxed), N[1].load(Ordering::Relaxed),
+      N[2].load(Ordering::Relaxed), N[3].load(Ordering::Relaxed));
+  }
+}
+
 #[profiling::function]
 fn inter_frame_rdo_mode_decision<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
@@ -1643,6 +1657,8 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   let mut harvest_idx = 0usize;
   let mut harvest_imps = String::new();
 
+  #[cfg(feature = "profile")]
+  fulltrial_audit::add(0, num_full_006.min(sorted.len()) as u64);
   sorted.iter().take(num_full_006).for_each(
     |&((luma_mode, i), mvs, _satd)| {
       let mode_set_chroma = ArrayVec::from([luma_mode]);
@@ -1812,7 +1828,15 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
 
   debug_assert!(num_modes_rdo >= 1);
 
-  modes.iter().take(num_modes_rdo).for_each(|&luma_mode| {
+  // prom_av1e029: cap intra full-trials (the aggressive knob's uncapped 14%).
+  // modes are ranked (CDF-prob first half, SATD-screened second half), so
+  // taking fewer keeps the best-ranked candidates.
+  let num_intra_full = crate::harvest::intra_topk()
+    .map_or(num_modes_rdo, |k| num_modes_rdo.min(k.max(1)));
+
+  #[cfg(feature = "profile")]
+  fulltrial_audit::add(1, num_intra_full.min(modes.len()) as u64);
+  modes.iter().take(num_intra_full).for_each(|&luma_mode| {
     let mvs = [MotionVector::default(); 2];
     let ref_frames = [INTRA_FRAME, NONE_FRAME];
     let mut mode_set_chroma = ArrayVec::<_, 2>::new();
@@ -1855,6 +1879,8 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
     let mut best_angle_delta = best.angle_delta;
     let mut angle_delta_rdo = |y, uv| -> AngleDelta {
       if best.angle_delta.y != y || best.angle_delta.uv != uv {
+        #[cfg(feature = "profile")]
+        fulltrial_audit::add(2, 1);
         luma_chroma_mode_rdo(
           best.pred_mode_luma,
           fi,
@@ -2041,6 +2067,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
     if av1_tx_used[tx_set as usize][tx_type as usize] == 0 {
       continue;
     }
+    #[cfg(feature = "profile")]
+    fulltrial_audit::add(3, 1);
 
     if is_inter {
       motion_compensate(
