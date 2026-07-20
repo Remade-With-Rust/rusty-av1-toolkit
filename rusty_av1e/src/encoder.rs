@@ -4176,6 +4176,39 @@ fn encode_tile<'a, T: Pixel>(
         );
       }
 
+      // prom_av1e040: per-SB content segmentation — residual variance (dispatch
+      // signal) × partition-depth outcome (area at each block size). Bin
+      // offline by variance tier to map compute vs content.
+      if crate::harvest::sbseg() {
+        let rv = sb_root_var(fi, ts, tile_bo);
+        // area[i] = MI count at width 64/32/16/8/<=4
+        let mut area = [0u32; 5];
+        for my in 0..16u32 {
+          for mx in 0..16u32 {
+            let bo = TileBlockOffset(BlockOffset {
+              x: tile_bo.0.x + mx as usize,
+              y: tile_bo.0.y + my as usize,
+            });
+            if bo.0.x >= ts.mi_width || bo.0.y >= ts.mi_height {
+              continue;
+            }
+            let w = cw.bc.blocks[bo].bsize.width_mi();
+            let idx = match w {
+              16.. => 0,
+              8 => 1,
+              4 => 2,
+              2 => 3,
+              _ => 4,
+            };
+            area[idx] += 1;
+          }
+        }
+        crate::harvest::emit(&format!(
+          "SBSEG,{},{},{},{},{},{},{}",
+          fi.input_frameno, rv, area[0], area[1], area[2], area[3], area[4]
+        ));
+      }
+
       #[cfg(feature = "profile")]
       {
         use std::sync::atomic::{AtomicU64, Ordering};

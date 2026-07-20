@@ -602,6 +602,21 @@ pub fn pd0_real() -> Option<(f64, f64)> {
   })
 }
 
+// --- prom_av1e040: per-SB content segmentation instrument ------------------
+//
+// Break open the RD partition+mode search BY CONTENT. `RAV1E_SBSEG=1` emits one
+// row per SB: residual variance (the dispatch signal) + the partition-depth
+// outcome (area at each block size = the search-cost/content map). Offline
+// binning by variance tier reveals which segment is over-served (cheapen) vs
+// under-served (deepen) — the input to the per-segment algorithm choice.
+static SBSEG: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn sbseg() -> bool {
+  *SBSEG.get_or_init(|| {
+    matches!(std::env::var("RAV1E_SBSEG").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
 // --- prom_av1e004: calibrated MV-cost model for the motion search ----------
 //
 // me.rs::get_mv_rate prices an MV diff at 2·ilog(|d|) bits/axis; the harvested
