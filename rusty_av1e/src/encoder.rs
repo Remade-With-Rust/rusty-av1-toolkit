@@ -3569,6 +3569,11 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
         // partition gate and gives rdo_partition_simple a real early-exit
         // bound. Order affects output only on exact RD ties (verified
         // byte-identical on the corpus + FNV clip).
+        // prom_av1e042: rect partitions (HORZ/VERT) added to the deep set here
+        // were REFUTED — greedy topdown rect can't refine (rect leaf ≠ square ⇒
+        // no further split) so it locks worse structures: force-on −0.514% (vs
+        // −2.47% tx-type alone), foreman +2.18%, +156% wall. Rect needs the
+        // bottomup full-tree search, not a topdown add. Reverted.
         &[PartitionType::PARTITION_NONE, PartitionType::PARTITION_SPLIT],
         rdo_type,
         inter_cfg,
