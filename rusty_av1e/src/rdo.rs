@@ -763,6 +763,11 @@ pub fn rdo_tx_size_type<T: Pixel>(
   let mut cw_checkpoint: Option<ContextWriterCheckpoint> = None;
 
   for _ in 0..=rdo_tx_depth {
+    // prom_av1e043: unlocking the FULL tx set per-SB was REFUTED — use_reduced_
+    // tx_set is a FRAME-LEVEL bitstream flag the decoder reads from the header,
+    // NOT a per-block coded choice. Full-set on some SBs while the header says
+    // reduced => dav1d "Invalid data". A deep-dispatch tool must be per-SB IN
+    // THE BITSTREAM (a per-block coded choice like tx-TYPE), not a frame flag.
     let tx_set = get_tx_set(tx_size, is_inter, fi.use_reduced_tx_set);
 
     let do_rdo_tx_type = tx_set > TxSet::TX_SET_DCTONLY
