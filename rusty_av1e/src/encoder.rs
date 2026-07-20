@@ -3416,6 +3416,134 @@ pub(crate) mod deep {
   }
 }
 
+// prom_av1e045: the adaptively-chosen per-frame interp filter (Some ⇒ overrides
+// fi.default_filter for BOTH prediction and the header signal, so they stay
+// consistent). Set once per frame before the SB loop; None ⇒ use fi's default.
+pub(crate) mod frame_filter {
+  use crate::mc::FilterMode;
+  use std::cell::Cell;
+  thread_local! { pub static F: Cell<Option<FilterMode>> = const { Cell::new(None) }; }
+  #[inline]
+  pub fn get() -> Option<FilterMode> {
+    F.with(|c| c.get())
+  }
+  #[inline]
+  pub fn set(v: Option<FilterMode>) {
+    F.with(|c| c.set(v));
+  }
+}
+
+/// prom_av1e045: pick this inter frame's fixed interp filter by a cheap SATD
+/// trial (the sign-flip → dispatch rule). Sample a coarse grid of SBs, ME to
+/// LAST, predict with REGULAR vs SHARP, and take the lower-total-SATD filter.
+/// Predicts into ts.rec (overwritten by the real encode, like pd0_proxy_cost);
+/// reads only the LAST reference — no CDF/block-info touched.
+fn pick_frame_filter<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>, cw: &mut ContextWriter,
+) -> crate::mc::FilterMode {
+  use crate::mc::FilterMode;
+  let ref_frame = LAST_FRAME;
+  if fi.rec_buffer.frames[fi.ref_frames[ref_frame.to_index()] as usize].is_none()
+  {
+    return fi.default_filter;
+  }
+  let bsize = BlockSize::BLOCK_64X64;
+  let (w, h) = (bsize.width(), bsize.height());
+  let tile_rect = ts.tile_rect();
+  let (mut satd_reg, mut satd_sharp) = (0u64, 0u64);
+
+  let mut sby = 0;
+  while sby < ts.sb_height {
+    let mut sbx = 0;
+    while sbx < ts.sb_width {
+      let tile_bo =
+        TileSuperBlockOffset(SuperBlockOffset { x: sbx, y: sby })
+          .block_offset(0, 0);
+      sbx += 2; // coarse grid — a frame-level estimate, not per-block
+      if tile_bo.0.x + 16 > ts.mi_width || tile_bo.0.y + 16 > ts.mi_height {
+        continue;
+      }
+      let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+      let _ = cw.find_mvrefs(
+        tile_bo,
+        [ref_frame, NONE_FRAME],
+        &mut mv_stack,
+        bsize,
+        fi,
+        false,
+      );
+      let pmv = [
+        mv_stack.first().map_or(MotionVector::default(), |c| c.this_mv),
+        MotionVector::default(),
+      ];
+      let mv = estimate_motion(
+        fi,
+        ts,
+        w,
+        h,
+        tile_bo,
+        ref_frame,
+        Some(pmv),
+        MVSamplingMode::CORNER { right: true, bottom: true },
+        false,
+        0,
+        None,
+      )
+      .map_or(pmv[0], |r| r.mv);
+
+      let ref_frames = [ref_frame, NONE_FRAME];
+      let mvs = [mv, MotionVector::default()];
+      let po = tile_bo.plane_offset(ts.rec.planes[0].plane_cfg);
+      // Predict with each filter into rec (overwritten by the real encode, like
+      // pd0_proxy_cost); reuse predict_inter, which reads frame_filter, so the
+      // trial's prediction is exactly what the real encode would produce.
+      for (fm, acc) in [
+        (FilterMode::REGULAR, &mut satd_reg),
+        (FilterMode::SHARP, &mut satd_sharp),
+      ] {
+        frame_filter::set(Some(fm));
+        {
+          let mut dst = ts.rec.planes[0]
+            .subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+          PredictionMode::NEWMV.predict_inter(
+            fi,
+            tile_rect,
+            0,
+            po,
+            &mut dst,
+            w,
+            h,
+            ref_frames,
+            mvs,
+            &mut ts.inter_compound_buffers,
+          );
+        }
+        let input = ts.input_tile.planes[0]
+          .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        let recr =
+          ts.rec.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        *acc += crate::dist::get_satd(
+          &input,
+          &recr,
+          w,
+          h,
+          fi.sequence.bit_depth,
+          fi.cpu_feature_level,
+        ) as u64;
+      }
+    }
+    sby += 2;
+  }
+  // reset so the winner (set by the caller) isn't polluted by the last probe
+  frame_filter::set(None);
+
+  if satd_sharp < satd_reg {
+    FilterMode::SHARP
+  } else {
+    FilterMode::REGULAR
+  }
+}
+
 /// prom_av1e031/032: build the 64×64 residual variance tree for the SB at
 /// `tile_bo` — source vs the co-located LAST reference (zero-MV residual =
 /// coding difficulty). Falls back to source variance when LAST is absent
@@ -4178,6 +4306,22 @@ fn encode_tile<'a, T: Pixel>(
     DEEP_CUTOFF.with(|c| c.set(Some((cutoff, route_lo))));
   } else {
     DEEP_CUTOFF.with(|c| c.set(None));
+  }
+
+  // prom_av1e045: adaptive interp filter — pick this frame's fixed filter by a
+  // cheap SATD trial (sign-flip → dispatch). Runs before the SB loop so both
+  // prediction (below) and the header (written after the tile) read the same
+  // frame_filter. Inter frames only; off ⇒ None ⇒ fi.default_filter.
+  // Single-tile only: the filter is signaled once per frame but chosen inside
+  // the tile pass, so multi-tile frames could desync. (Guarded, not yet solved.)
+  if crate::harvest::afilter()
+    && fi.frame_type.has_inter()
+    && fi.sequence.tiling.cols * fi.sequence.tiling.rows == 1
+  {
+    let f = pick_frame_filter(fi, ts, &mut cw);
+    frame_filter::set(Some(f));
+  } else {
+    frame_filter::set(None);
   }
 
   // main loop

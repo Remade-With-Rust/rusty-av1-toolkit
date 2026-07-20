@@ -654,6 +654,27 @@ pub fn deep_lo() -> bool {
   })
 }
 
+// --- prom_av1e045: ADAPTIVE interp filter (the sign-flip → dispatch rule) ---
+//
+// SHARP vs REGULAR flips sign by content (mobile −1.8%, bus +2.7%), so the
+// filter is not one choice — it's a dispatch. `RAV1E_AFILTER=1` picks each
+// inter frame's fixed filter by a cheap SATD trial (predict a sample grid with
+// REGULAR vs SHARP at their ME MVs, take the lower-SATD filter). Off = REGULAR
+// (byte-identical). The chosen filter is BOTH predicted and header-signaled, so
+// encoder/decoder stay consistent (single fixed filter per frame, no switchable
+// syntax needed).
+static AFILTER: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn afilter() -> bool {
+  *AFILTER.get_or_init(|| match std::env::var("RAV1E_AFILTER") {
+    Ok(v) => v.trim() == "1",
+    // tier fallback: a FREE quality win (−0.859% mean BD, mobile −3.4%, ~0%
+    // wall — the per-frame SATD trial is a coarse grid) ⇒ folded into the fast
+    // tier. RAV1E_AFILTER=0 opts out; multi-tile frames fall back to REGULAR.
+    Err(_) => fast_tier() == FastTier::Fast,
+  })
+}
+
 // --- prom_av1e044: interp-filter ceiling probe -----------------------------
 //
 // Before building a per-block filter SEARCH, prove the filters differ on our

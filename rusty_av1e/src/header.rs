@@ -644,7 +644,11 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
 
       self.write_bit(fi.is_filter_switchable)?;
       if !fi.is_filter_switchable {
-        self.write::<2, u8>(fi.default_filter as u8)?;
+        // prom_av1e045: signal the adaptively-chosen frame filter (matches what
+        // prediction used); falls back to fi.default_filter when off.
+        let filt = crate::encoder::frame_filter::get()
+          .unwrap_or(fi.default_filter);
+        self.write::<2, u8>(filt as u8)?;
       }
       self.write_bit(fi.is_motion_mode_switchable)?;
 
