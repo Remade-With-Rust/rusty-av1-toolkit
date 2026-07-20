@@ -3304,6 +3304,12 @@ thread_local! {
   // (routing_thresh, route_hi, internal_split_t) when in dispatch mode.
   static VARPART_DISPATCH: std::cell::Cell<Option<(i64, bool, i64)>> =
     const { std::cell::Cell::new(None) };
+  // prom_av1e041: variance cutoff below which an SB is DEEPENED (low-variance
+  // fraction q). `Some(t)` in deep-dispatch mode; `None` off.
+  // prom_av1e041: (cutoff, route_lo). route_lo=false ⇒ deepen var>=cutoff
+  // (high-variance/busy fraction, the default). route_lo=true ⇒ var<=cutoff.
+  static DEEP_CUTOFF: std::cell::Cell<Option<(i64, bool)>> =
+    const { std::cell::Cell::new(None) };
 }
 
 /// The threshold for the routed SB's INTERNAL NONE/SPLIT decision — the
@@ -3377,6 +3383,30 @@ pub(crate) mod fwd_phase {
       eprintln!("FWDPHASE {} trial={} final={}", names[p], t, f);
     }
     eprintln!("FWDPHASE TOTAL {}", tot);
+  }
+}
+
+// prom_av1e041: per-SB DEEP-search dispatch (content-adaptive quality ladder).
+// A thread-local flag set around a chosen SB's encode; the deep levers (tx-type/
+// size RDO, unlocked for inter too) consult it. The dispatcher deepens a
+// content-adaptive fraction of SBs — low-variance first (2.5× more BD/sec, the
+// av1e040 cost-effectiveness finding). Off ⇒ the fast tier, byte-identical.
+pub(crate) mod deep {
+  use std::cell::Cell;
+  thread_local! { pub static ACTIVE: Cell<bool> = const { Cell::new(false) }; }
+  #[inline]
+  pub fn active() -> bool {
+    ACTIVE.with(|c| c.get())
+  }
+  pub struct Guard(bool);
+  #[inline]
+  pub fn enter(v: bool) -> Guard {
+    Guard(ACTIVE.with(|c| c.replace(v)))
+  }
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      ACTIVE.with(|c| c.set(self.0));
+    }
   }
 }
 
@@ -4111,6 +4141,34 @@ fn encode_tile<'a, T: Pixel>(
     VARPART_DISPATCH.with(|c| c.set(None));
   }
 
+  // prom_av1e041: per-frame percentile for the DEEP dispatch — deepen the
+  // low-variance fraction q (av1e040: deep search buys 2.5× more BD/sec on
+  // low-variance SBs). Cutoff at the q-th percentile of this frame's SB
+  // variances ⇒ content-invariant deepened fraction.
+  if let Some(q) = crate::harvest::deep_q() {
+    let mut vars = Vec::with_capacity(ts.sb_width * ts.sb_height);
+    for sby in 0..ts.sb_height {
+      for sbx in 0..ts.sb_width {
+        let sbo = TileSuperBlockOffset(SuperBlockOffset { x: sbx, y: sby });
+        vars.push(sb_root_var(fi, ts, sbo.block_offset(0, 0)));
+      }
+    }
+    vars.sort_unstable();
+    let n = vars.len();
+    let route_lo = crate::harvest::deep_lo();
+    // route-high (default): cutoff at the (1-q) percentile ⇒ deepen the top-q
+    // busiest SBs. route-low: cutoff at q ⇒ deepen the bottom-q flattest.
+    let idx = if route_lo {
+      ((q * n as f64) as usize).min(n.saturating_sub(1))
+    } else {
+      (((1.0 - q) * n as f64) as usize).min(n.saturating_sub(1))
+    };
+    let cutoff = vars.get(idx).copied().unwrap_or(i64::MAX);
+    DEEP_CUTOFF.with(|c| c.set(Some((cutoff, route_lo))));
+  } else {
+    DEEP_CUTOFF.with(|c| c.set(None));
+  }
+
   // main loop
   for sby in 0..ts.sb_height {
     cw.bc.reset_left_contexts(planes);
@@ -4142,6 +4200,20 @@ fn encode_tile<'a, T: Pixel>(
       // the gate (av1e007 law).
       #[cfg(feature = "profile")]
       let sb_t0 = unsafe { core::arch::x86_64::_rdtsc() };
+
+      // prom_av1e041: deepen this SB's search? Force-on (the A/B) or the
+      // low-variance-first content fraction (deep dispatch). Covers the whole
+      // SB encode (mode-decision trials + winner recode).
+      let deepen = crate::harvest::deep_force()
+        || DEEP_CUTOFF.with(|c| c.get()).is_some_and(|(t, route_lo)| {
+          let rv = sb_root_var(fi, ts, tile_bo);
+          if route_lo {
+            rv <= t
+          } else {
+            rv >= t
+          }
+        });
+      let _deep_guard = deep::enter(deepen);
 
       // Encode SuperBlock
       if fi.config.speed_settings.partition.encode_bottomup

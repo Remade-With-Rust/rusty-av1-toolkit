@@ -752,8 +752,12 @@ pub fn rdo_tx_size_type<T: Pixel>(
   let mut best_tx_size = tx_size;
   let mut best_rd = f64::MAX;
 
+  // prom_av1e041: the DEEP dispatch unlocks transform RDO. tx-SIZE RDO stays
+  // intra (inter uses the sub_tx_size default); tx-TYPE RDO (ADST/DCT selection)
+  // is unlocked for INTER too — the SVT busy-content lever we lacked.
+  let deep = crate::encoder::deep::active();
   let do_rdo_tx_size = fi.tx_mode_select
-    && fi.config.speed_settings.transform.rdo_tx_decision
+    && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
     && !is_inter;
   let rdo_tx_depth = if do_rdo_tx_size { 2 } else { 0 };
   let mut cw_checkpoint: Option<ContextWriterCheckpoint> = None;
@@ -762,8 +766,8 @@ pub fn rdo_tx_size_type<T: Pixel>(
     let tx_set = get_tx_set(tx_size, is_inter, fi.use_reduced_tx_set);
 
     let do_rdo_tx_type = tx_set > TxSet::TX_SET_DCTONLY
-      && fi.config.speed_settings.transform.rdo_tx_decision
-      && !is_inter
+      && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
+      && (!is_inter || deep)
       && !skip;
 
     if !do_rdo_tx_size && !do_rdo_tx_type {

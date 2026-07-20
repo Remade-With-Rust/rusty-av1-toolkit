@@ -617,6 +617,43 @@ pub fn sbseg() -> bool {
   })
 }
 
+// --- prom_av1e041: per-SB DEEP-search dispatch (content-adaptive quality ladder)
+//
+// `RAV1E_DEEP=1` forces the deep alternative ON for every SB (the force-on A/B —
+// measure the ceiling before wiring the dispatcher). `RAV1E_DEEP_Q=q` deepens
+// the fraction q of SBs by residual variance, LOW-variance first (av1e040: deep
+// search is 2.5× more BD/sec on low-variance SBs). Unset = fast tier.
+static DEEP_FORCE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn deep_force() -> bool {
+  *DEEP_FORCE.get_or_init(|| {
+    matches!(std::env::var("RAV1E_DEEP").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
+static DEEP_Q: OnceLock<Option<f64>> = OnceLock::new();
+#[inline]
+pub fn deep_q() -> Option<f64> {
+  *DEEP_Q.get_or_init(|| {
+    std::env::var("RAV1E_DEEP_Q")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .filter(|q: &f64| *q > 0.0 && *q <= 1.0)
+  })
+}
+
+// Direction: default routes the HIGH-variance (busy) fraction to deep search —
+// inter tx-type RDO pays where there is RESIDUAL to re-transform (av1e041
+// ladder: deepening low-variance/flat SBs found nothing and lost bits).
+// `RAV1E_DEEP_LO=1` routes the low-variance fraction instead (probe).
+static DEEP_LO: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn deep_lo() -> bool {
+  *DEEP_LO.get_or_init(|| {
+    matches!(std::env::var("RAV1E_DEEP_LO").as_deref().map(str::trim), Ok("1"))
+  })
+}
+
 // --- prom_av1e004: calibrated MV-cost model for the motion search ----------
 //
 // me.rs::get_mv_rate prices an MV diff at 2·ilog(|d|) bits/axis; the harvested
