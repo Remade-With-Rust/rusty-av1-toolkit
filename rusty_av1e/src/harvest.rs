@@ -654,6 +654,25 @@ pub fn deep_lo() -> bool {
   })
 }
 
+// --- prom_av1e044: interp-filter ceiling probe -----------------------------
+//
+// Before building a per-block filter SEARCH, prove the filters differ on our
+// content (codec-experimental: prove the ceiling first). `RAV1E_FILTER=0|1|2`
+// forces the whole-frame fixed filter to REGULAR/SMOOTH/SHARP (default_filter,
+// which is both predicted AND signaled, so encoder/decoder stay consistent).
+// If a fixed non-REGULAR filter beats REGULAR on some content, a per-block
+// search has headroom; if all three tie, it does not.
+static FILTER_PROBE: OnceLock<Option<u8>> = OnceLock::new();
+#[inline]
+pub fn filter_probe() -> Option<u8> {
+  *FILTER_PROBE.get_or_init(|| {
+    std::env::var("RAV1E_FILTER")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .filter(|f: &u8| *f <= 2)
+  })
+}
+
 // --- prom_av1e004: calibrated MV-cost model for the motion search ----------
 //
 // me.rs::get_mv_rate prices an MV diff at 2·ilog(|d|) bits/axis; the harvested

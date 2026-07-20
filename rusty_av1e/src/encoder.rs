@@ -1200,7 +1200,13 @@ impl<T: Pixel> FrameInvariants<T> {
       enable_early_exit: self.enable_early_exit,
       tx_mode_select: self.tx_mode_select,
       enable_inter_txfm_split: self.enable_inter_txfm_split,
-      default_filter: self.default_filter,
+      // prom_av1e044: interp-filter ceiling probe (whole-frame fixed filter).
+      default_filter: match crate::harvest::filter_probe() {
+        Some(1) => crate::mc::FilterMode::SMOOTH,
+        Some(2) => crate::mc::FilterMode::SHARP,
+        Some(_) => crate::mc::FilterMode::REGULAR,
+        None => self.default_filter,
+      },
       enable_segmentation: self.enable_segmentation,
       t35_metadata: self.t35_metadata.clone(),
       cpu_feature_level: self.cpu_feature_level,
