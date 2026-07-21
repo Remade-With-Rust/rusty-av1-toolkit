@@ -1951,7 +1951,10 @@ impl ContextWriter<'_> {
 
     // interior positions: 1..eob-1 (skip DC at 0 and the eob coefficient).
     // DC lowering was measured (av1e047c): +0.06% mean but a foreman sign-flip
-    // (-0.846%->-0.374%) with no cheap dispatch signal — reverted.
+    // (-0.846%->-0.374%) with no cheap dispatch signal — reverted. Multi-step
+    // lowering (av1e047d) was a NO-OP (byte-identical): single-step level->
+    // level-1 is already the per-coeff optimum (distortion ~quadratic per step,
+    // rate-saving ~linear ⇒ step 2 unbeneficial once step 1 is marginal).
     for c in (1..(eob as usize - 1)).rev() {
       let pos = scan[c] as usize;
       let q = i32::cast_from(qcoeffs[pos]);
