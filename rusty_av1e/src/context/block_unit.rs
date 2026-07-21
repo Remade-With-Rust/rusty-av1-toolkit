@@ -1900,9 +1900,9 @@ impl ContextWriter<'_> {
     &self, w: &W, coeffs_orig: &[T], qcoeffs: &mut [T], eob: u16,
     tx_size: TxSize, tx_type: TxType, plane_type: usize, ac_quant: i32,
     log_tx_scale: i32, lambda: f64, rd_scale: f64,
-  ) {
+  ) -> u16 {
     if eob < 3 {
-      return;
+      return eob;
     }
     let scan = &av1_scan_orders[tx_size as usize][tx_type as usize].scan
       [..eob as usize];
@@ -1983,6 +1983,119 @@ impl ContextWriter<'_> {
         levels[lvl_idx] = q_new.unsigned_abs().min(127) as u8;
       }
     }
+
+    // prom_av1e047b: EOB reduction — collapse the eob past trailing coefficients
+    // when the rate saved (the dropped coeff's base_eob + br + sign, the removed
+    // interior zeros' base-0 costs, and the shorter eob code, minus the new eob
+    // position's base→base_eob increase) beats the distortion added. Static
+    // contexts; conformance-safe (the real coder re-derives everything).
+    let eob_area_log = (tx_size.area_log2() as i32 - 4).max(0) as usize;
+    let eob_ctx = usize::from(tx_class != TX_CLASS_2D);
+    let eob_cost = |e: u16| -> i64 {
+      let (pt, extra) = Self::get_eob_pos_token(e);
+      let flag = match eob_area_log {
+        0 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf16[plane_type][eob_ctx]),
+        1 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf32[plane_type][eob_ctx]),
+        2 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf64[plane_type][eob_ctx]),
+        3 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf128[plane_type][eob_ctx]),
+        4 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf256[plane_type][eob_ctx]),
+        5 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf512[plane_type][eob_ctx]),
+        _ => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf1024[plane_type][eob_ctx]),
+      };
+      let mut bits = i64::from(flag);
+      let ob = k_eob_offset_bits[pt as usize];
+      if ob > 0 {
+        let first = ((extra >> (ob - 1)) & 1) as u32;
+        bits += i64::from(w.symbol_bits(
+          first,
+          &self.fc.eob_extra_cdf[txs_ctx][plane_type][(pt - 3) as usize],
+        ));
+        bits += (i64::from(ob) - 1) * (1i64 << OD_BITRES);
+      }
+      bits
+    };
+    let base_c = |level: u32, cctx: usize, brctx: usize, is_eob: bool| -> i64 {
+      let sym = if is_eob { level.min(3) - 1 } else { level.min(3) };
+      let cdf: &[u16] = if is_eob {
+        &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][cctx]
+      } else {
+        &self.fc.coeff_base_cdf[txs_ctx][plane_type][cctx]
+      };
+      let mut bits = i64::from(w.symbol_bits(sym, cdf));
+      if level as usize > NUM_BASE_LEVELS {
+        let base_range = level - (1 + NUM_BASE_LEVELS as u32);
+        let brc = &self.fc.coeff_br_cdf
+          [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][brctx];
+        let mut idx = 0u32;
+        loop {
+          if idx as usize >= COEFF_BASE_RANGE {
+            break;
+          }
+          let k = (base_range - idx).min(BR_CDF_SIZE as u32 - 1);
+          bits += i64::from(w.symbol_bits(k, brc));
+          if (k as usize) < BR_CDF_SIZE - 1 {
+            break;
+          }
+          idx += BR_CDF_SIZE as u32 - 1;
+        }
+      }
+      bits
+    };
+
+    let mut cur_eob = eob;
+    while cur_eob >= 2 {
+      let c = cur_eob as usize - 1;
+      let pos = scan[c] as usize;
+      let level = i32::cast_from(qcoeffs[pos]).unsigned_abs();
+      if level == 0 || level > COEFF_BASE_RANGE as u32 + NUM_BASE_LEVELS as u32 {
+        break;
+      }
+      // next nonzero below c
+      let mut nz = c;
+      while nz > 0 {
+        nz -= 1;
+        if i32::cast_from(qcoeffs[scan[nz] as usize]) != 0 {
+          break;
+        }
+      }
+      let has_lower = i32::cast_from(qcoeffs[scan[nz] as usize]) != 0;
+      if !has_lower {
+        break; // don't collapse the block to all-zero (keep ≥1 nonzero)
+      }
+      let new_eob = (nz + 1) as u16;
+      if new_eob >= cur_eob {
+        break;
+      }
+      let br_c = Self::get_br_ctx(levels, pos, bhl, tx_class);
+      // rate saved (frac bits) — the dropped eob coeff's base cost approximated
+      // by the interior CDF (its 0..3 eob context is a valid index; avoids the
+      // 4-context base_eob CDF OOB as the eob position walks down).
+      let mut saved =
+        base_c(level, coeff_contexts[c] as usize, br_c, false) + (1i64 << OD_BITRES);
+      for i in (new_eob as usize)..c {
+        saved += base_c(0, coeff_contexts[i] as usize, 0, false);
+      }
+      saved += eob_cost(cur_eob) - eob_cost(new_eob);
+      // NOTE: the new eob position's base→base_eob change is dropped (its eob
+      // context 0..3 differs from its stored interior context 0..42); it is a
+      // small second-order term. Its omission slightly over-counts the saving,
+      // partly offset by omitting the removed zeros above the DC — net near-zero
+      // and BD-gated.
+      // distortion added (drop the eob coeff to 0):
+      let orig = i32::cast_from(coeffs_orig[pos]) as i64;
+      let d_old = orig - dequant(i32::cast_from(qcoeffs[pos])) as i64;
+      let dd = orig * orig - d_old * d_old; // > 0
+      let rd_delta = dd as f64 * rd_scale - lambda * saved as f64 / rbits;
+      if rd_delta < 0.0 {
+        qcoeffs[pos] = T::cast_from(0);
+        let lvl_idx = pos + (pos >> bhl) * TX_PAD_HOR;
+        levels[lvl_idx] = 0;
+        cur_eob = new_eob;
+      } else {
+        break;
+      }
+    }
+    cur_eob
   }
 
   fn encode_eob<W: Writer>(
