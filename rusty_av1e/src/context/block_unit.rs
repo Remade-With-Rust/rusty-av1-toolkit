@@ -1888,6 +1888,103 @@ impl ContextWriter<'_> {
     true
   }
 
+  /// prom_av1e047: coefficient-level TRELLIS (RDOQ). Backward pass over the
+  /// interior coefficients (skip DC and the eob coefficient); lower a level by
+  /// 1 when the RD improves — EXACT rate via `symbol_bits` at the coefficient's
+  /// context, tx-domain distortion via the decoder's dequant `(q·quant + (q<0?
+  /// off:0))>>log_tx_scale`. Contexts are static (v1): conformance is safe
+  /// because the real coder re-codes with real contexts, so only BD is at
+  /// stake. `rd_scale` = raw-SSE→ScaledDistortion factor (matches compute_rd_
+  /// cost). Modifies qcoeffs in place; eob unchanged (interior only).
+  pub fn trellis_optimize<T: Coefficient, W: Writer>(
+    &self, w: &W, coeffs_orig: &[T], qcoeffs: &mut [T], eob: u16,
+    tx_size: TxSize, tx_type: TxType, plane_type: usize, ac_quant: i32,
+    log_tx_scale: i32, lambda: f64, rd_scale: f64,
+  ) {
+    if eob < 3 {
+      return;
+    }
+    let scan = &av1_scan_orders[tx_size as usize][tx_type as usize].scan
+      [..eob as usize];
+    let height = av1_get_coded_tx_size(tx_size).height();
+    let txs_ctx = Self::get_txsize_entropy_ctx(tx_size);
+    let tx_class = tx_type_to_class[tx_type as usize];
+    let bhl = Self::get_txb_bhl(tx_size);
+    let off = (1i32 << log_tx_scale) - 1;
+    let dequant = |q: i32| -> i32 { (q * ac_quant + ((q >> 31) & off)) >> log_tx_scale };
+    let rbits = (1i64 << OD_BITRES) as f64;
+
+    let mut levels_buf = [0u8; TX_PAD_2D];
+    let levels: &mut [u8] =
+      &mut levels_buf[TX_PAD_TOP * (height + TX_PAD_HOR)..];
+    self.txb_init_levels(qcoeffs, height, levels, height + TX_PAD_HOR);
+    let mut cc = Aligned::<[MaybeUninit<i8>; MAX_CODED_TX_SQUARE]>::uninit_array();
+    let coeff_contexts = self.get_nz_map_contexts(
+      levels, scan, eob, tx_size, tx_class, &mut cc.data,
+    );
+
+    // base+br rate (frac bits) of an interior coefficient at `level`.
+    let base_rate = |level: u32, coeff_ctx: usize, br_ctx: usize| -> i64 {
+      let mut bits = i64::from(w.symbol_bits(
+        level.min(3),
+        &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx],
+      ));
+      if level as usize > NUM_BASE_LEVELS {
+        let base_range = level - (1 + NUM_BASE_LEVELS as u32);
+        let brc = &self.fc.coeff_br_cdf
+          [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
+        let mut idx = 0u32;
+        loop {
+          if idx as usize >= COEFF_BASE_RANGE {
+            break;
+          }
+          let k = (base_range - idx).min(BR_CDF_SIZE as u32 - 1);
+          bits += i64::from(w.symbol_bits(k, brc));
+          if (k as usize) < BR_CDF_SIZE - 1 {
+            break;
+          }
+          idx += BR_CDF_SIZE as u32 - 1;
+        }
+      }
+      bits
+    };
+
+    // interior positions: 1..eob-1 (skip DC at 0 and the eob coefficient).
+    for c in (1..(eob as usize - 1)).rev() {
+      let pos = scan[c] as usize;
+      let q = i32::cast_from(qcoeffs[pos]);
+      let level = q.unsigned_abs();
+      if level == 0 || level > COEFF_BASE_RANGE as u32 + NUM_BASE_LEVELS as u32 {
+        continue; // skip zero + golomb-tail coeffs (rare; keep v1 simple)
+      }
+      let coeff_ctx = coeff_contexts[c] as usize;
+      let br_ctx = Self::get_br_ctx(levels, pos, bhl, tx_class);
+      let sgn = if q < 0 { -1 } else { 1 };
+      let q_new = sgn * (level as i32 - 1);
+      let orig = i32::cast_from(coeffs_orig[pos]);
+      let d_old = (orig - dequant(q)) as i64;
+      let d_new = (orig - dequant(q_new)) as i64;
+      let dd = d_new * d_new - d_old * d_old; // tx-SSE delta (can be < 0)
+      let r_old = base_rate(level, coeff_ctx, br_ctx) + (1i64 << OD_BITRES);
+      let r_new = if q_new == 0 {
+        i64::from(w.symbol_bits(
+          0,
+          &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx],
+        ))
+      } else {
+        base_rate(level - 1, coeff_ctx, br_ctx) + (1i64 << OD_BITRES)
+      };
+      let rd_delta =
+        dd as f64 * rd_scale + lambda * (r_new - r_old) as f64 / rbits;
+      if rd_delta < 0.0 {
+        qcoeffs[pos] = T::cast_from(q_new);
+        // keep levels/coeff_ctx static (v1): the real coder re-derives them.
+        let lvl_idx = pos + (pos >> bhl) * TX_PAD_HOR;
+        levels[lvl_idx] = q_new.unsigned_abs().min(127) as u8;
+      }
+    }
+  }
+
   fn encode_eob<W: Writer>(
     &mut self, eob: u16, tx_size: TxSize, tx_class: TxClass, txs_ctx: usize,
     plane_type: usize, w: &mut W,

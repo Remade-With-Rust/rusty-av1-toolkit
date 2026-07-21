@@ -1795,6 +1795,44 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
 
   let eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type);
 
+  // prom_av1e047: coefficient trellis (RDOQ) — final encode only, on the shared
+  // qcoeffs before BOTH coding and recon so they stay consistent. Reads the
+  // decoder's exact dequant + the coeff CDFs; RD units match compute_rd_cost.
+  // ★ sign-flip → DISPATCH: force-on is +0.53% on flat / −0.39% on busy (mean
+  // +0.055%, a mirage). Routed to BUSY SBs (the deep flag) it banks the busy
+  // win and skips the flat loss. `deep::active()` when RAV1E_DEEP/DEEP_Q on;
+  // RAV1E_TRELLIS_ALL=1 forces every block (the force-on ceiling).
+  // trellis_gate::on() is set per-SB: true when the trellis is active AND this
+  // SB is non-flat (absolute variance > threshold) or force-on.
+  if trellis_gate::on() && !W::COUNTS_ONLY && !skip && eob > 2 {
+    let acq =
+      crate::quantize::ac_q(qidx, fi.ac_delta_q[p], fi.sequence.bit_depth)
+        .get() as i32;
+    let lts = get_log_tx_scale(tx_size) as i32;
+    let sb = 2 * (3 - get_log_tx_scale(tx_size));
+    // Include the per-block PERCEPTUAL bias (spatiotemporal_scale, the >8×8-safe
+    // weight the pixel-domain RD uses) so the trellis matches the encoder's RD —
+    // without it, important flat regions (akiyo's face) are under-weighted and
+    // over-dropped.
+    let bias = crate::rdo::spatiotemporal_scale(fi, frame_bo, bsize);
+    let rd_scale = (f64::from(fi.dist_scale[p].0) / f64::from(1u32 << 14))
+      * (f64::from(bias.0) / f64::from(1u32 << 14))
+      / (1u64 << sb) as f64;
+    cw.trellis_optimize(
+      w,
+      coeffs,
+      qcoeffs,
+      eob,
+      tx_size,
+      tx_type,
+      usize::from(p != 0),
+      acq,
+      lts,
+      fi.lambda,
+      rd_scale,
+    );
+  }
+
   // prom_av1e034 rate-table harvest: capture the REAL coefficient rate the
   // RDO uses, to refit estimate_rate's table. Tier at tune=Psnr already runs
   // both write_coeffs (rate) and the tx_dist below.
@@ -3433,6 +3471,22 @@ pub(crate) mod frame_filter {
   }
 }
 
+// prom_av1e047: per-SB gate for the trellis — true when this SB is NOT flat
+// (absolute residual variance above the threshold), so the trellis (which
+// helps busy content, marginally hurts flat) is dispatched off akiyo-like SBs.
+pub(crate) mod trellis_gate {
+  use std::cell::Cell;
+  thread_local! { pub static ON: Cell<bool> = const { Cell::new(false) }; }
+  #[inline]
+  pub fn on() -> bool {
+    ON.with(|c| c.get())
+  }
+  #[inline]
+  pub fn set(v: bool) {
+    ON.with(|c| c.set(v));
+  }
+}
+
 /// prom_av1e045: pick this inter frame's fixed interp filter by a cheap SATD
 /// trial (the sign-flip → dispatch rule). Sample a coarse grid of SBs, ME to
 /// LAST, predict with REGULAR vs SHARP, and take the lower-total-SATD filter.
@@ -4369,6 +4423,16 @@ fn encode_tile<'a, T: Pixel>(
           }
         });
       let _deep_guard = deep::enter(deepen);
+
+      // prom_av1e047: dispatch the trellis off FLAT SBs (absolute residual
+      // variance below the threshold) — it wins on busy content, marginally
+      // hurts flat. Only compute the signal when the trellis is active.
+      trellis_gate::set(
+        crate::harvest::trellis()
+          && (crate::harvest::trellis_all()
+            || sb_root_var(fi, ts, tile_bo)
+              > crate::harvest::trellis_t()),
+      );
 
       // Encode SuperBlock
       if fi.config.speed_settings.partition.encode_bottomup

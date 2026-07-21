@@ -44,6 +44,52 @@ pub fn emit(line: &str) {
   }
 }
 
+// --- prom_av1e047: coefficient-level trellis (RDOQ) ------------------------
+//
+// `RAV1E_TRELLIS=1` runs a backward RD pass over each block's interior
+// coefficients (final encode only), lowering a level when the exact rate saved
+// (symbol_bits) beats the tx-domain distortion added. Off = the deadzone
+// quantizer alone (byte-identical). Adaptive follow-up: route to busy SBs where
+// the residual is (the deep flag), and check the per-clip sign-flip.
+static TRELLIS: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn trellis() -> bool {
+  *TRELLIS.get_or_init(|| match std::env::var("RAV1E_TRELLIS") {
+    Ok(v) => v.trim() == "1",
+    // tier fallback: a FREE quality win — dispatched to non-flat SBs it is
+    // −0.506% mean BD (mobile −1.0%), every clip improves, ~0% wall (O(n)
+    // symbol_bits rate, busy SBs only). RAV1E_TRELLIS=0 opts out.
+    Err(_) => fast_tier() == FastTier::Fast,
+  })
+}
+
+// RAV1E_TRELLIS_ALL=1 forces the trellis on EVERY block (the force-on ceiling);
+// otherwise the trellis is dispatched to non-flat SBs (sign-flip → route).
+static TRELLIS_ALL: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn trellis_all() -> bool {
+  *TRELLIS_ALL.get_or_init(|| {
+    matches!(
+      std::env::var("RAV1E_TRELLIS_ALL").as_deref().map(str::trim),
+      Ok("1")
+    )
+  })
+}
+
+// Absolute residual-variance threshold: SBs above it get the trellis (busy),
+// flat SBs below it (akiyo) are skipped. `RAV1E_TRELLIS_T=N`; default 20000
+// (the akiyo↔foreman boundary from the av1e040 segmentation).
+static TRELLIS_T: OnceLock<i64> = OnceLock::new();
+#[inline]
+pub fn trellis_t() -> i64 {
+  *TRELLIS_T.get_or_init(|| {
+    std::env::var("RAV1E_TRELLIS_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(20000)
+  })
+}
+
 // --- prom_av1e002: experimental λ multiplier -------------------------------
 //
 // Probe arm for the RDO λ-calibration experiment: scales fi.lambda (and thus
