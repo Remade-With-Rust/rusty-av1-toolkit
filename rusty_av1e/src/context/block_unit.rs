@@ -1950,6 +1950,8 @@ impl ContextWriter<'_> {
     };
 
     // interior positions: 1..eob-1 (skip DC at 0 and the eob coefficient).
+    // DC lowering was measured (av1e047c): +0.06% mean but a foreman sign-flip
+    // (-0.846%->-0.374%) with no cheap dispatch signal — reverted.
     for c in (1..(eob as usize - 1)).rev() {
       let pos = scan[c] as usize;
       let q = i32::cast_from(qcoeffs[pos]);
