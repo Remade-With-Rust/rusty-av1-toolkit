@@ -25,6 +25,52 @@ use crate::util::*;
 use simd_helpers::cold_for_target_arch;
 use std::ops;
 
+// prom_av1e050: OBMC blend (mirrors dav1d dav1d_obmc_masks + mc.rs blend_h/v
+// exactly). blend_px(a,b,m) = (a*(64-m) + b*m + 32) >> 6.
+pub static OBMC_MASKS: [u8; 64] = [
+  0, 0, 19, 0, 25, 14, 5, 0, 28, 22, 16, 11, 7, 3, 0, 0, 30, 27, 24, 21, 18, 15,
+  12, 10, 8, 6, 4, 3, 0, 0, 0, 0, 31, 29, 28, 26, 24, 23, 21, 20, 19, 17, 16, 14,
+  13, 12, 11, 9, 8, 7, 6, 5, 4, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Blend an above-neighbour OBMC prediction (`lap`) into `dst`; mask by ROW.
+/// `w`/`h` = pixel overlap width/height (h_mul*ow4 / v_mul*oh4).
+pub fn obmc_blend_h<T: Pixel>(
+  dst: &mut PlaneRegionMut<'_, T>, lap: &PlaneRegion<'_, T>, w: usize, h: usize,
+) {
+  let mask = &OBMC_MASKS[h..];
+  let rows = h * 3 >> 2;
+  for y in 0..rows {
+    let m = i32::from(mask[y]);
+    let inv = 64 - m;
+    let drow = &mut dst[y];
+    let lrow = &lap[y];
+    for x in 0..w {
+      let a: i32 = drow[x].as_();
+      let b: i32 = lrow[x].as_();
+      drow[x] = T::cast_from(((a * inv + b * m + 32) >> 6) as u32);
+    }
+  }
+}
+
+/// Blend a left-neighbour OBMC prediction (`lap`) into `dst`; mask by COLUMN.
+pub fn obmc_blend_v<T: Pixel>(
+  dst: &mut PlaneRegionMut<'_, T>, lap: &PlaneRegion<'_, T>, w: usize, h: usize,
+) {
+  let mask = &OBMC_MASKS[w..];
+  let cols = w * 3 >> 2;
+  for y in 0..h {
+    let drow = &mut dst[y];
+    let lrow = &lap[y];
+    for x in 0..cols {
+      let m = i32::from(mask[x]);
+      let a: i32 = drow[x].as_();
+      let b: i32 = lrow[x].as_();
+      drow[x] = T::cast_from(((a * (64 - m) + b * m + 32) >> 6) as u32);
+    }
+  }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MotionVector {
   pub row: i16,

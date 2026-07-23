@@ -180,6 +180,11 @@ pub struct Block {
   // deltas
   pub deblock_deltas: [i8; FRAME_LF_COUNT],
   pub segmentation_idx: u8,
+  // prom_av1e048c: per-block switchable interpolation filter.
+  pub interp_filter: crate::mc::FilterMode,
+  // prom_av1e050: per-block motion mode (OBMC). SIMPLE_TRANSLATION unless the
+  // block signals OBMC_CAUSAL; neighbours read this + mv/ref for their blend.
+  pub motion_mode: crate::predict::MotionMode,
 }
 
 impl Block {
@@ -207,8 +212,22 @@ impl Default for Block {
       txsize: TX_64X64,
       deblock_deltas: [0, 0, 0, 0],
       segmentation_idx: 0,
+      interp_filter: crate::mc::FilterMode::REGULAR,
+      motion_mode: crate::predict::MotionMode::SIMPLE_TRANSLATION,
     }
   }
+}
+
+// prom_av1e048c: AV1 needs_interp_filter() reduced to this fork's feature set
+// (no skip_mode, no warp, GM always IDENTITY): a LARGE GLOBALMV/GLOBAL_GLOBALMV
+// block infers REGULAR (codes no filter symbol); every other inter block codes
+// one. Encoder and decoder compute this identically.
+#[inline]
+pub fn needs_interp_filter(bsize: BlockSize, mode: PredictionMode) -> bool {
+  let large = bsize.width().min(bsize.height()) >= 8;
+  let is_global = mode == PredictionMode::GLOBALMV
+    || mode == PredictionMode::GLOBAL_GLOBALMV;
+  !(large && is_global)
 }
 
 #[derive(Clone)]
@@ -1718,6 +1737,92 @@ impl ContextWriter<'_> {
   ) {
     let cdf = &self.fc.drl_cdfs[ctx];
     symbol_with_update!(self, w, drl_mode as u32, cdf);
+  }
+
+  // prom_av1e048c: AV1 switchable-interp coding context (dav1d get_filter_ctx,
+  // single filter ⇒ dir=0). ctx = comp*4 + combo, combo∈0..3 from above/left
+  // neighbor filters, each counted only when that neighbor references ref0.
+  pub(crate) fn get_switchable_interp_ctx(
+    &self, bo: TileBlockOffset, ref0: RefType, comp: bool,
+  ) -> usize {
+    let n_switch = crate::entropymode::SWITCHABLE_FILTERS as u8;
+    let neigh = |b: &Block| -> u8 {
+      if b.ref_frames[0] == ref0 || b.ref_frames[1] == ref0 {
+        b.interp_filter as u8
+      } else {
+        n_switch
+      }
+    };
+    let above =
+      if bo.0.y > 0 { neigh(self.bc.blocks.above_of(bo)) } else { n_switch };
+    let left =
+      if bo.0.x > 0 { neigh(self.bc.blocks.left_of(bo)) } else { n_switch };
+    let combo = if above == left {
+      above
+    } else if above == n_switch {
+      left
+    } else if left == n_switch {
+      above
+    } else {
+      n_switch
+    };
+    (comp as usize) * 4 + combo as usize
+  }
+
+  // prom_av1e048c: code this inter block's interpolation filter (single filter;
+  // dual_filter off). Caller guards on needs_interp_filter.
+  pub fn write_interp_filter<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset,
+    filter: crate::mc::FilterMode, ref0: RefType, comp: bool,
+  ) {
+    let ctx = self.get_switchable_interp_ctx(bo, ref0, comp);
+    symbol_with_update!(
+      self,
+      w,
+      filter as u32,
+      &self.fc.switchable_interp_cdf[ctx]
+    );
+  }
+
+  // prom_av1e050: OBMC eligibility — mirrors the decoder's motion_mode gate with
+  // interintra absent and warp off (decode.rs ~2768): the block is >= 8px in both
+  // dims AND has an overlappable (inter, odd-4x4-position) neighbour on the top
+  // row or left column (dav1d `findoddzero`). Read from the block grid, which
+  // matches the decoder's above/left intra caches by construction.
+  pub(crate) fn obmc_allowed(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> bool {
+    let bw4 = bsize.width_mi();
+    let bh4 = bsize.height_mi();
+    if bw4.min(bh4) < 2 {
+      return false;
+    }
+    // Clip the neighbour scan to the frame edge, matching the decoder's
+    // w4 = min(bw4, bw - bx) / h4 = min(bh4, bh - by) — an unclipped scan reads
+    // blocks past the right/bottom edge and mis-computes eligibility (desync).
+    let (cols, rows) = (self.bc.blocks.cols(), self.bc.blocks.rows());
+    let w4 = bw4.min(cols - bo.0.x);
+    let h4 = bh4.min(rows - bo.0.y);
+    let top = bo.0.y > 0
+      && (1..w4).step_by(2).any(|x| {
+        self.bc.blocks[bo.with_offset(x as isize, -1)].is_inter()
+      });
+    let left = bo.0.x > 0
+      && (1..h4).step_by(2).any(|y| {
+        self.bc.blocks[bo.with_offset(-1, y as isize)].is_inter()
+      });
+    top || left
+  }
+
+  // prom_av1e050: code the OBMC on/off symbol (warp off ⇒ the decoder takes the
+  // 2-way obmc_cdf path). Caller guards on obmc_allowed + the frame flag.
+  pub fn write_motion_mode<W: Writer>(
+    &mut self, w: &mut W, _bo: TileBlockOffset, bsize: BlockSize,
+    motion_mode: crate::predict::MotionMode,
+  ) {
+    let is_obmc =
+      (motion_mode == crate::predict::MotionMode::OBMC_CAUSAL) as u32;
+    symbol_with_update!(self, w, is_obmc, &self.fc.obmc_cdf[bsize as usize]);
   }
 
   /// # Panics

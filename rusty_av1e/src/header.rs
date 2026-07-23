@@ -642,15 +642,20 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         self.write_bit(fi.allow_high_precision_mv);
       }
 
-      self.write_bit(fi.is_filter_switchable)?;
-      if !fi.is_filter_switchable {
+      // prom_av1e048c: per-FRAME dispatch decides SWITCHABLE (each inter block
+      // codes its own filter) vs a fixed frame filter. frame_dispatch is set by
+      // pick_frame_dispatch before the tile pass, so header + blocks agree.
+      let switchable = crate::encoder::frame_dispatch::switchable();
+      self.write_bit(switchable)?;
+      if !switchable {
         // prom_av1e045: signal the adaptively-chosen frame filter (matches what
         // prediction used); falls back to fi.default_filter when off.
         let filt = crate::encoder::frame_filter::get()
           .unwrap_or(fi.default_filter);
         self.write::<2, u8>(filt as u8)?;
       }
-      self.write_bit(fi.is_motion_mode_switchable)?;
+      // prom_av1e050: OBMC — frame-level motion_mode switchable flag.
+      self.write_bit(crate::encoder::obmc_frame::on())?;
 
       if (!fi.error_resilient && fi.sequence.enable_ref_frame_mvs) {
         self.write_bit(fi.use_ref_frame_mvs)?;

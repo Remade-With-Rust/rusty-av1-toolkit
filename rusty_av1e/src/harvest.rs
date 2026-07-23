@@ -721,6 +721,132 @@ pub fn afilter() -> bool {
   })
 }
 
+// prom_av1e048c: PER-BLOCK switchable interpolation filter. Default OFF
+// (bitstream change; default path stays byte-identical). RAV1E_PBINTERP=1 on.
+static PBINTERP: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn pbinterp() -> bool {
+  *PBINTERP.get_or_init(|| match std::env::var("RAV1E_PBINTERP") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+
+// prom_av1e050/051: OBMC (overlapped block motion compensation) motion_mode.
+// FOLDED INTO THE FAST TIER (prom_av1e051): with the per-clip motion gate
+// (obmc_mgate) it is −0.998% mean BD on Derf-CIF with WORST clip 0.00% (a clean
+// monotone non-regression). RAV1E_OBMC=1 forces it on (per-block RD unless
+// obmc_mgate also set); RAV1E_OBMC=0 opts out. Unset = fast tier only, so the
+// plain default (RAV1E_FAST unset) stays byte-identical.
+static OBMC: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn obmc() -> bool {
+  *OBMC.get_or_init(|| match std::env::var("RAV1E_OBMC") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => fast_tier() == FastTier::Fast,
+  })
+}
+
+// prom_av1e050: per-frame OBMC switchable-dispatch threshold on the PREVIOUS
+// frame's OBMC-adoption fraction. A frame signals switchable (pays the per-block
+// motion_mode tax) only when the prior frame's adoption cleared this — high on
+// coherent-motion content where OBMC broadly helps, low where the RD only
+// over-picks noisy blocks (the sign-flip → dispatch).
+static OBMC_T: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn obmc_t() -> f64 {
+  *OBMC_T.get_or_init(|| {
+    std::env::var("RAV1E_OBMC_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0.88)
+  })
+}
+
+// prom_av1e050: force OBMC on for every eligible block (bring-up A/B, before the
+// RD search) — validates the prediction + signaling bit-exact vs the decoder.
+static OBMC_FORCE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn obmc_force() -> bool {
+  *OBMC_FORCE.get_or_init(|| match std::env::var("RAV1E_OBMC_FORCE") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+
+// prom_av1e051: per-CLIP MOTION-GATED force-on OBMC. Derf-CIF deployment showed
+// the per-block-RD dispatch is CONTAMINATED — it can't see OBMC's temporal-
+// reference-chain benefit, so it under-adopts (halves the win vs force-on) and
+// even mis-picks. Force-on beats it 2× but LOSES on 2/8 low-motion clips
+// (container +1.13, news +0.91). The true dispatch is per-CLIP: force-on where
+// motion clears a floor, byte-identical-off below it (the loss band = slight
+// incoherent motion over flat regions). Latched once on the first inter frame.
+static OBMC_MGATE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn obmc_mgate() -> bool {
+  *OBMC_MGATE.get_or_init(|| match std::env::var("RAV1E_OBMC_MGATE") {
+    Ok(v) => v.trim() == "1",
+    // tier fallback: the motion gate is the SHIPPING OBMC dispatch (force-on
+    // where clip motion clears the floor, byte-identical-off below) — the
+    // per-block RD is contaminated (blind to OBMC's temporal-reference gain).
+    Err(_) => fast_tier() == FastTier::Fast,
+  })
+}
+
+// Motion floor (mean per-pixel zero-MV SAD over a coarse first-inter-frame grid)
+// above which the clip force-ons OBMC. Wide margin on the corpus: losers ~1.3-1.6,
+// winners ~5.8-21 in source-SAD terms; tuned on the in-encoder (recon-ref) value.
+static OBMC_MT: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn obmc_mt() -> f64 {
+  *OBMC_MT.get_or_init(|| {
+    std::env::var("RAV1E_OBMC_MT")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(6.0)
+  })
+}
+
+// prom_av1e048c: extend the av1e045 per-frame filter trial from best-of-2
+// (REGULAR/SHARP) to best-of-3 (add SMOOTH). Clean win on SMOOTH-dominant
+// content, neutral elsewhere, zero syntax cost. Default ON (folds into fast).
+static AFILTER3: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn afilter3() -> bool {
+  *AFILTER3.get_or_init(|| match std::env::var("RAV1E_AFILTER3") {
+    Ok(v) => v.trim() != "0",
+    Err(_) => true,
+  })
+}
+
+// prom_av1e048c: run the per-block filter search inside RDO trials too (mode/tx
+// co-optimise with the filter) instead of final-encode only. Costlier.
+static PBINTERP_RDO: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn pbinterp_rdo() -> bool {
+  *PBINTERP_RDO.get_or_init(|| match std::env::var("RAV1E_PBINTERP_RDO") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+
+// prom_av1e048c: per-frame switchable-vs-fixed dispatch threshold on filter-
+// choice DIVERSITY (fraction of sampled blocks not choosing the plurality
+// filter). A frame uses SWITCHABLE (per-block filter) only when diversity
+// exceeds this — i.e. blocks genuinely want different filters. Tuned on the
+// sign-flip: corr627 (WIN, div 0.42) → switchable, al12 (LOSS, div 0.17) and
+// perf (wash, div 0.25) → fixed.
+static PBINTERP_T: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn pbinterp_t() -> f64 {
+  *PBINTERP_T.get_or_init(|| {
+    std::env::var("RAV1E_PBINTERP_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0.33)
+  })
+}
+
 // --- prom_av1e044: interp-filter ceiling probe -----------------------------
 //
 // Before building a per-block filter SEARCH, prove the filters differ on our

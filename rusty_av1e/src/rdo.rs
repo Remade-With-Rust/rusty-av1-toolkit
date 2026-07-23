@@ -1240,6 +1240,87 @@ pub fn rdo_mode_decision<T: Pixel>(
   cw.bc.blocks.set_ref_frames(tile_bo, bsize, best.ref_frames);
   cw.bc.blocks.set_motion_vectors(tile_bo, bsize, best.mvs);
 
+  // prom_av1e050: per-block motion_mode decision — SIMPLE vs OBMC by real
+  // recon-SSE + λ·rate (incl. the motion_mode symbol), NOT a SATD proxy (the
+  // interp lesson). Single-ref eligible inter only; the winner is stored in the
+  // block grid and read by both motion_compensate and the symbol write.
+  // Runs on switchable frames only (the per-clip verdict is latched from the
+  // first inter frame); the committed encode applies OBMC per this decision.
+  if crate::encoder::obmc_frame::on()
+    && !crate::harvest::obmc_force()
+    && !crate::encoder::obmc_frame::force_clip()
+    && !best.pred_mode_luma.is_intra()
+    && !best.pred_mode_luma.is_compound()
+    && cw.obmc_allowed(tile_bo, bsize)
+  {
+    use crate::predict::MotionMode::{OBMC_CAUSAL, SIMPLE_TRANSLATION};
+    // Recompute the mv stack for the consistency asserts inside the inter
+    // encode (NEARESTMV/NEWMV expect mvs relative to it).
+    let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+    let mode_context = cw.find_mvrefs(
+      tile_bo,
+      best.ref_frames,
+      &mut mv_stack,
+      bsize,
+      fi,
+      false,
+    );
+    let (mut best_mm, mut best_mm_rd) = (SIMPLE_TRANSLATION, f64::MAX);
+    for mm in [SIMPLE_TRANSLATION, OBMC_CAUSAL] {
+      cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);
+      let mut wr = WriterCounter::new();
+      let tell = wr.tell_frac();
+      encode_block_pre_cdef(
+        &fi.sequence,
+        ts,
+        cw,
+        &mut wr,
+        bsize,
+        tile_bo,
+        best.skip,
+      );
+      let _ = encode_block_post_cdef(
+        fi,
+        ts,
+        cw,
+        &mut wr,
+        best.pred_mode_luma,
+        best.pred_mode_chroma,
+        best.angle_delta,
+        best.ref_frames,
+        best.mvs,
+        bsize,
+        tile_bo,
+        best.skip,
+        best.pred_cfl_params,
+        best.tx_size,
+        best.tx_type,
+        mode_context,
+        &mv_stack,
+        rdo_type,
+        true,
+        None,
+        None,
+      );
+      let rate = wr.tell_frac() - tell;
+      let distortion =
+        compute_distortion(fi, ts, bsize, is_chroma_block, tile_bo, false);
+      let rd = compute_rd_cost(fi, rate, distortion);
+      cw.rollback(&cw_checkpoint);
+      if rd < best_mm_rd {
+        best_mm_rd = rd;
+        best_mm = mm;
+      }
+    }
+    cw.bc.blocks.set_motion_mode(tile_bo, bsize, best_mm);
+    // adoption signal for the per-frame temporal dispatch.
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::encoder::obmc_frame::ELIG.fetch_add(1, Relaxed);
+    if best_mm == OBMC_CAUSAL {
+      crate::encoder::obmc_frame::CHOSEN.fetch_add(1, Relaxed);
+    }
+  }
+
   assert!(best.rd_cost >= 0_f64);
 
   PartitionParameters {

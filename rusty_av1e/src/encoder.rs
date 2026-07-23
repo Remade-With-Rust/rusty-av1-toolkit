@@ -1956,6 +1956,103 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
 ///
 /// - If the block size is invalid for subsampling
 #[profiling::function]
+// prom_av1e050: OBMC — blend the above-row and left-column neighbours'
+// motion-compensated predictions into this block's prediction (`rec`), for one
+// plane. Mirrors dav1d recon.rs obmc() exactly: neighbours at ODD 4x4 positions,
+// stepped by the neighbour's clamped dimension, capped at 4 and log2(dim), only
+// inter neighbours (ref[0]) blended. The neighbour MC uses the frame filter
+// (predict_inter_single reads frame_filter) — matching the decoder since
+// interp is non-switchable when OBMC is on.
+fn predict_obmc_plane<T: Pixel>(
+  fi: &FrameInvariants<T>, blocks: &TileBlocks,
+  rec: &mut PlaneRegionMut<'_, T>, tile_rect: TileRect, p: usize,
+  tile_bo: TileBlockOffset, bsize: BlockSize,
+) {
+  let PlaneConfig { xdec, ydec, .. } = *rec.plane_cfg;
+  let h_mul = 4 >> xdec;
+  let v_mul = 4 >> ydec;
+  let bw4 = bsize.width_mi();
+  let bh4 = bsize.height_mi();
+  let (cols, rows) = (blocks.cols(), blocks.rows());
+  let w4 = bw4.min(cols - tile_bo.0.x);
+  let h4 = bh4.min(rows - tile_bo.0.y);
+  let log2_bw4 = (usize::BITS - 1 - bw4.leading_zeros()) as usize;
+  let log2_bh4 = (usize::BITS - 1 - bh4.leading_zeros()) as usize;
+  let po = tile_bo.plane_offset(rec.plane_cfg);
+
+  // above row
+  if tile_bo.0.y > 0 && (p == 0 || bw4 * h_mul + bh4 * v_mul >= 16) {
+    let (mut i, mut x) = (0usize, 0usize);
+    while x < w4 && i < log2_bw4.min(4) {
+      let nbr = blocks[tile_bo.with_offset(x as isize + 1, -1)];
+      let step4 = (nbr.bsize.width_mi()).clamp(2, 16);
+      if nbr.is_inter() {
+        let ow4 = step4.min(bw4);
+        let oh4 = (bh4.min(16)) >> 1;
+        let (mc_w, mc_h) = (ow4 * h_mul, ((oh4 * 3 + 3) >> 2) * v_mul);
+        let nbr_po =
+          tile_bo.with_offset(x as isize, 0).plane_offset(rec.plane_cfg);
+        let mut lap =
+          Plane::from_slice(&vec![T::cast_from(0u32); mc_w * mc_h], mc_w);
+        PredictionMode::NEWMV.predict_inter_single(
+          fi, tile_rect, p, nbr_po, &mut lap.as_region_mut(), mc_w, mc_h,
+          nbr.ref_frames[0], nbr.mv[0],
+        );
+        let mut dst = rec.subregion_mut(Area::Rect {
+          x: po.x + (x * h_mul) as isize,
+          y: po.y,
+          width: h_mul * ow4,
+          height: v_mul * oh4,
+        });
+        crate::mc::obmc_blend_h(
+          &mut dst,
+          &lap.as_region(),
+          h_mul * ow4,
+          v_mul * oh4,
+        );
+        i += 1;
+      }
+      x += step4;
+    }
+  }
+
+  // left column
+  if tile_bo.0.x > 0 {
+    let (mut i, mut y) = (0usize, 0usize);
+    while y < h4 && i < log2_bh4.min(4) {
+      let nbr = blocks[tile_bo.with_offset(-1, y as isize + 1)];
+      let step4 = (nbr.bsize.height_mi()).clamp(2, 16);
+      if nbr.is_inter() {
+        let ow4 = (bw4.min(16)) >> 1;
+        let oh4 = step4.min(bh4);
+        let (mc_w, mc_h) = (ow4 * h_mul, oh4 * v_mul);
+        let nbr_po =
+          tile_bo.with_offset(0, y as isize).plane_offset(rec.plane_cfg);
+        let mut lap =
+          Plane::from_slice(&vec![T::cast_from(0u32); mc_w * mc_h], mc_w);
+        PredictionMode::NEWMV.predict_inter_single(
+          fi, tile_rect, p, nbr_po, &mut lap.as_region_mut(), mc_w, mc_h,
+          nbr.ref_frames[0], nbr.mv[0],
+        );
+        let mut dst = rec.subregion_mut(Area::Rect {
+          x: po.x,
+          y: po.y + (y * v_mul) as isize,
+          width: h_mul * ow4,
+          height: v_mul * oh4,
+        });
+        crate::mc::obmc_blend_v(
+          &mut dst,
+          &lap.as_region(),
+          h_mul * ow4,
+          v_mul * oh4,
+        );
+        i += 1;
+      }
+      y += step4;
+    }
+  }
+}
+
 pub fn motion_compensate<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, luma_mode: PredictionMode, ref_frames: [RefType; 2],
@@ -1983,6 +2080,17 @@ pub fn motion_compensate<T: Pixel>(
     } else {
       0
     };
+
+  // prom_av1e050: OBMC applies to single-ref eligible blocks the RD chose
+  // (Block.motion_mode == OBMC) on a switchable frame, or all eligible under
+  // obmc_force (the A/B).
+  let do_obmc = crate::encoder::obmc_frame::on()
+    && !luma_mode.is_compound()
+    && cw.obmc_allowed(tile_bo, bsize)
+    && (crate::harvest::obmc_force()
+      || crate::encoder::obmc_frame::force_clip()
+      || cw.bc.blocks[tile_bo].motion_mode
+        == crate::predict::MotionMode::OBMC_CAUSAL);
 
   let luma_tile_rect = ts.tile_rect();
   let compound_buffer = &mut ts.inter_compound_buffers;
@@ -2167,6 +2275,18 @@ pub fn motion_compensate<T: Pixel>(
         ref_frames,
         mvs,
         compound_buffer,
+      );
+    }
+
+    if do_obmc {
+      predict_obmc_plane(
+        fi,
+        &cw.bc.blocks.as_const(),
+        rec,
+        tile_rect,
+        p,
+        tile_bo,
+        bsize,
       );
     }
   }
@@ -2455,6 +2575,73 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         } else {
           assert_eq!(mvs[0].row, mv_stack[0].this_mv.row);
           assert_eq!(mvs[0].col, mv_stack[0].this_mv.col);
+        }
+      }
+
+      // prom_av1e050: motion_mode (OBMC), coded after mv/drl and BEFORE the
+      // interp filter (AV1 order: ...mv, drl, interintra, MOTION_MODE,
+      // compound_type, interp_filter; interintra/compound_type absent here).
+      // OBMC/motion_mode is SINGLE-REF only — the decoder's read_motion_mode
+      // returns SIMPLE (no symbol) for compound blocks (AV1 `if (isCompound)`).
+      let mm_elig = crate::encoder::obmc_frame::on()
+        && !luma_mode.is_compound()
+        && cw.obmc_allowed(tile_bo, bsize);
+      if mm_elig {
+        // The block's motion_mode is the RD winner (set by rdo_mode_decision);
+        // obmc_force overrides it to OBMC for the bring-up A/B. Both the symbol
+        // and the motion_compensate OBMC pass read this same value.
+        let mm = if crate::harvest::obmc_force()
+          || crate::encoder::obmc_frame::force_clip()
+        {
+          crate::predict::MotionMode::OBMC_CAUSAL
+        } else {
+          cw.bc.blocks[tile_bo].motion_mode
+        };
+        cw.write_motion_mode(w, tile_bo, bsize, mm);
+        if !W::COUNTS_ONLY {
+          cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);
+        }
+      }
+
+      // prom_av1e048c: per-block switchable interpolation filter, coded last in
+      // the inter block (matching where dav1d reads it — this fork emits no
+      // compound_type after mv). Value = frame_filter (REGULAR in
+      // the minimal version). Skipped when the block infers REGULAR.
+      if crate::encoder::frame_dispatch::switchable() {
+        let needs = crate::context::needs_interp_filter(bsize, luma_mode);
+        // Per-block RD filter search. When RAV1E_PBINTERP_RDO is set it runs in
+        // RDO trials too (co-optimises mode/tx with the filter); otherwise only
+        // at the final encode (cheaper, decoupled). The chosen filter drives
+        // BOTH the symbol written here and the motion_compensate prediction
+        // below, via the frame_filter thread-local.
+        let search_now =
+          needs && (!W::COUNTS_ONLY || crate::harvest::pbinterp_rdo());
+        let fm = if search_now {
+          pick_block_filter(
+            fi, ts, cw, w, bsize, tile_bo, luma_mode, ref_frames, mvs,
+          )
+        } else {
+          // RDO trials + no-filter blocks use the frame default (also resets
+          // any per-block filter left in the thread-local by a prior block).
+          fi.default_filter
+        };
+        crate::encoder::frame_filter::set(Some(fm));
+        if needs {
+          cw.write_interp_filter(
+            w,
+            tile_bo,
+            fm,
+            ref_frames[0],
+            luma_mode.is_compound(),
+          );
+        }
+        if !W::COUNTS_ONLY {
+          // The decoder stores REGULAR for blocks that infer their filter
+          // (has_subpel_filter == false); the neighbour filter context reads
+          // this. Mirror it exactly, else a no-filter neighbour poisons a
+          // later block's switchable-interp context and desyncs.
+          let stored = if needs { fm } else { crate::mc::FilterMode::REGULAR };
+          cw.bc.blocks.set_interp_filters(tile_bo, bsize, stored);
         }
       }
     } else {
@@ -3471,6 +3658,84 @@ pub(crate) mod frame_filter {
   }
 }
 
+// prom_av1e048c: per-FRAME dispatch — SWITCHABLE (per-block filter search) vs a
+// fixed frame filter. Set by pick_frame_dispatch; read by the header AND the
+// per-block encode so they agree. The per-block interp lever wins only where
+// intra-frame filter preference VARIES (moderate/mixed motion) and loses on
+// uniform content (pure syntax overhead) — the sign-flip → dispatch.
+pub(crate) mod frame_dispatch {
+  use std::cell::Cell;
+  thread_local! { pub static SWITCHABLE: Cell<bool> = const { Cell::new(false) }; }
+  #[inline]
+  pub fn switchable() -> bool {
+    SWITCHABLE.with(|c| c.get())
+  }
+  #[inline]
+  pub fn set(v: bool) {
+    SWITCHABLE.with(|c| c.set(v));
+  }
+}
+
+// prom_av1e050: this frame signals interpolation_filter's sibling — motion_mode
+// switchable (OBMC). Set per frame before the tile pass; read by the header AND
+// the per-block eligibility so they agree (single-tile only).
+pub(crate) mod obmc_frame {
+  use std::cell::Cell;
+  use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+  thread_local! { pub static ON: Cell<bool> = const { Cell::new(false) }; }
+  // Per-frame OBMC-adoption counters (reset each frame): eligible inter blocks
+  // vs those the RD chose OBMC for. The adoption FRACTION is the dispatch signal
+  // — high where OBMC broadly helps (coherent motion), low where the RD only
+  // over-picks a few noisy blocks. PREV holds the previous frame's fraction so
+  // this frame decides SWITCHABLE without a chicken-and-egg pre-pass.
+  pub static ELIG: AtomicU64 = AtomicU64::new(0);
+  pub static CHOSEN: AtomicU64 = AtomicU64::new(0);
+  // Per-CLIP LOCKED decision. OBMC's benefit compounds through the reference
+  // chain, so per-frame on/off is unstable (turning off makes references SIMPLE
+  // → adoption drops → stuck off, collapsing the win). Instead decide ONCE on
+  // the first inter frame (key-referenced, feedback-free) and stick.
+  use std::sync::atomic::AtomicBool;
+  pub static DECIDED: AtomicBool = AtomicBool::new(false);
+  pub static ENABLE: AtomicBool = AtomicBool::new(true);
+  // prom_av1e051: per-CLIP force-on latch (motion-gate mode). When the first
+  // inter frame's motion clears the floor, every eligible block force-ons OBMC
+  // (skipping the contaminated per-block RD) for the rest of the clip.
+  pub static FORCE_CLIP: AtomicBool = AtomicBool::new(false);
+  #[inline]
+  pub fn force_clip() -> bool {
+    FORCE_CLIP.load(Relaxed)
+  }
+  #[inline]
+  pub fn on() -> bool {
+    ON.with(|c| c.get())
+  }
+  #[inline]
+  pub fn set(v: bool) {
+    ON.with(|c| c.set(v));
+  }
+  // This frame's switchable decision: measure (on) the first inter frame; then
+  // follow the locked verdict for the rest of the clip.
+  #[inline]
+  pub fn decide(has_inter: bool, single_tile: bool) -> bool {
+    if !crate::harvest::obmc() || !has_inter || !single_tile {
+      return false;
+    }
+    ELIG.store(0, Relaxed);
+    CHOSEN.store(0, Relaxed);
+    !DECIDED.load(Relaxed) || ENABLE.load(Relaxed)
+  }
+  // After the first inter frame, latch the verdict from its adoption fraction.
+  #[inline]
+  pub fn commit_adoption() {
+    let e = ELIG.load(Relaxed);
+    if e > 0 && !DECIDED.load(Relaxed) {
+      let adoption = CHOSEN.load(Relaxed) as f64 / e as f64;
+      ENABLE.store(adoption > crate::harvest::obmc_t(), Relaxed);
+      DECIDED.store(true, Relaxed);
+    }
+  }
+}
+
 // prom_av1e047: per-SB gate for the trellis — true when this SB is NOT flat
 // (absolute residual variance above the threshold), so the trellis (which
 // helps busy content, marginally hurts flat) is dispatched off akiyo-like SBs.
@@ -3504,7 +3769,16 @@ fn pick_frame_filter<T: Pixel>(
   let bsize = BlockSize::BLOCK_64X64;
   let (w, h) = (bsize.width(), bsize.height());
   let tile_rect = ts.tile_rect();
-  let (mut satd_reg, mut satd_sharp) = (0u64, 0u64);
+  // prom_av1e048c: extend av1e045 from best-of-2 (REGULAR/SHARP) to best-of-3
+  // by adding SMOOTH — SMOOTH-dominant content (soft/low-detail motion) picks it
+  // frame-wide for a clean win at zero syntax cost, others fall back neutrally.
+  let three = crate::harvest::afilter3();
+  let cands: &[FilterMode] = if three {
+    &[FilterMode::REGULAR, FilterMode::SMOOTH, FilterMode::SHARP]
+  } else {
+    &[FilterMode::REGULAR, FilterMode::SHARP]
+  };
+  let mut satd = [0u64; 3];
 
   let mut sby = 0;
   while sby < ts.sb_height {
@@ -3551,10 +3825,7 @@ fn pick_frame_filter<T: Pixel>(
       // Predict with each filter into rec (overwritten by the real encode, like
       // pd0_proxy_cost); reuse predict_inter, which reads frame_filter, so the
       // trial's prediction is exactly what the real encode would produce.
-      for (fm, acc) in [
-        (FilterMode::REGULAR, &mut satd_reg),
-        (FilterMode::SHARP, &mut satd_sharp),
-      ] {
+      for (i, &fm) in cands.iter().enumerate() {
         frame_filter::set(Some(fm));
         {
           let mut dst = ts.rec.planes[0]
@@ -3576,7 +3847,7 @@ fn pick_frame_filter<T: Pixel>(
           .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
         let recr =
           ts.rec.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
-        *acc += crate::dist::get_satd(
+        satd[i] += crate::dist::get_satd(
           &input,
           &recr,
           w,
@@ -3591,11 +3862,279 @@ fn pick_frame_filter<T: Pixel>(
   // reset so the winner (set by the caller) isn't polluted by the last probe
   frame_filter::set(None);
 
-  if satd_sharp < satd_reg {
-    FilterMode::SHARP
-  } else {
-    FilterMode::REGULAR
+  let mut best = 0;
+  for i in 1..cands.len() {
+    if satd[i] < satd[best] {
+      best = i;
+    }
   }
+  cands[best]
+}
+
+/// prom_av1e051: per-CLIP OBMC gate signal — coarse-grid ZERO-MV SAD on the
+/// first inter frame (feedback-free, key-referenced). High = real scene motion
+/// (OBMC's boundary blend pays); low-but-nonzero = the loss band (slight
+/// incoherent motion over flat regions, where flat MVs are unreliable and the
+/// blend costs more than it saves). Predicts the co-located LAST reference (mv=0,
+/// no interp) into ts.rec (thrown away by the real encode, like pick_frame_filter)
+/// and returns the mean per-pixel SAD vs the source over the coarse grid.
+fn obmc_motion_measure<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+) -> f64 {
+  let ref_frame = LAST_FRAME;
+  if fi.rec_buffer.frames[fi.ref_frames[ref_frame.to_index()] as usize].is_none()
+  {
+    return 0.0;
+  }
+  let bsize = BlockSize::BLOCK_64X64;
+  let (w, h) = (bsize.width(), bsize.height());
+  let tile_rect = ts.tile_rect();
+  let ref_frames = [ref_frame, NONE_FRAME];
+  let mvs = [MotionVector::default(), MotionVector::default()];
+  let (mut sad, mut px): (u64, u64) = (0, 0);
+  let mut sby = 0;
+  while sby < ts.sb_height {
+    let mut sbx = 0;
+    while sbx < ts.sb_width {
+      let tile_bo = TileSuperBlockOffset(SuperBlockOffset { x: sbx, y: sby })
+        .block_offset(0, 0);
+      sbx += 2; // coarse grid — a frame-level estimate, not per-block
+      if tile_bo.0.x + 16 > ts.mi_width || tile_bo.0.y + 16 > ts.mi_height {
+        continue;
+      }
+      let po = tile_bo.plane_offset(ts.rec.planes[0].plane_cfg);
+      {
+        let mut dst = ts.rec.planes[0]
+          .subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+        PredictionMode::NEWMV.predict_inter(
+          fi,
+          tile_rect,
+          0,
+          po,
+          &mut dst,
+          w,
+          h,
+          ref_frames,
+          mvs,
+          &mut ts.inter_compound_buffers,
+        );
+      }
+      let input = ts.input_tile.planes[0]
+        .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+      let recr =
+        ts.rec.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+      sad += crate::dist::get_sad(
+        &input,
+        &recr,
+        w,
+        h,
+        fi.sequence.bit_depth,
+        fi.cpu_feature_level,
+      ) as u64;
+      px += (w * h) as u64;
+    }
+    sby += 2;
+  }
+  let m = if px == 0 { 0.0 } else { sad as f64 / px as f64 };
+  if std::env::var("RAV1E_OBMC_DBG").is_ok() {
+    eprintln!("OBMC_MOTION {:.4}", m);
+  }
+  m
+}
+
+/// prom_av1e048c: per-FRAME switchable-vs-fixed dispatch. Coarse-grid SATD trial
+/// over REGULAR/SMOOTH/SHARP; the best FIXED frame filter is argmin of the
+/// per-filter totals, and the per-block GAIN = (fixed total − Σ per-block minima)
+/// measures how much intra-frame filter DIVERSITY buys. SWITCHABLE pays only when
+/// that relative gain clears the threshold (switchable syntax overhead) — the
+/// sign-flip dispatch. Returns (use_switchable, best_fixed_filter).
+fn pick_frame_dispatch<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>, cw: &mut ContextWriter,
+) -> (bool, crate::mc::FilterMode) {
+  use crate::mc::FilterMode;
+  let ref_frame = LAST_FRAME;
+  if fi.rec_buffer.frames[fi.ref_frames[ref_frame.to_index()] as usize].is_none()
+  {
+    return (false, fi.default_filter);
+  }
+  let filters = [FilterMode::REGULAR, FilterMode::SMOOTH, FilterMode::SHARP];
+  let bsize = BlockSize::BLOCK_64X64;
+  let (w, h) = (bsize.width(), bsize.height());
+  let tile_rect = ts.tile_rect();
+  let mut tot = [0u64; 3]; // per-filter total SATD (frame-fixed candidates)
+  let mut per_block_min = 0u64; // Σ per-block best SATD (the switchable ceiling)
+  let mut argcnt = [0u32; 3]; // how many sampled blocks each filter wins
+  let mut sby = 0;
+  while sby < ts.sb_height {
+    let mut sbx = 0;
+    while sbx < ts.sb_width {
+      let tile_bo = TileSuperBlockOffset(SuperBlockOffset { x: sbx, y: sby })
+        .block_offset(0, 0);
+      sbx += 2;
+      if tile_bo.0.x + 16 > ts.mi_width || tile_bo.0.y + 16 > ts.mi_height {
+        continue;
+      }
+      let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+      let _ = cw.find_mvrefs(
+        tile_bo,
+        [ref_frame, NONE_FRAME],
+        &mut mv_stack,
+        bsize,
+        fi,
+        false,
+      );
+      let pmv = [
+        mv_stack.first().map_or(MotionVector::default(), |c| c.this_mv),
+        MotionVector::default(),
+      ];
+      let mv = estimate_motion(
+        fi,
+        ts,
+        w,
+        h,
+        tile_bo,
+        ref_frame,
+        Some(pmv),
+        MVSamplingMode::CORNER { right: true, bottom: true },
+        false,
+        0,
+        None,
+      )
+      .map_or(pmv[0], |r| r.mv);
+      let ref_frames = [ref_frame, NONE_FRAME];
+      let mvs = [mv, MotionVector::default()];
+      let po = tile_bo.plane_offset(ts.rec.planes[0].plane_cfg);
+      let mut blk = u64::MAX;
+      let mut blk_arg = 0usize;
+      for (i, fm) in filters.iter().enumerate() {
+        frame_filter::set(Some(*fm));
+        {
+          let mut dst = ts.rec.planes[0]
+            .subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+          PredictionMode::NEWMV.predict_inter(
+            fi,
+            tile_rect,
+            0,
+            po,
+            &mut dst,
+            w,
+            h,
+            ref_frames,
+            mvs,
+            &mut ts.inter_compound_buffers,
+          );
+        }
+        let input = ts.input_tile.planes[0]
+          .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        let recr = ts.rec.planes[0]
+          .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        let s = crate::dist::get_satd(
+          &input,
+          &recr,
+          w,
+          h,
+          fi.sequence.bit_depth,
+          fi.cpu_feature_level,
+        ) as u64;
+        tot[i] += s;
+        if s < blk {
+          blk = s;
+          blk_arg = i;
+        }
+      }
+      per_block_min += blk;
+      argcnt[blk_arg] += 1;
+    }
+    sby += 2;
+  }
+  frame_filter::set(None);
+  let mut best_i = 0;
+  for i in 1..3 {
+    if tot[i] < tot[best_i] {
+      best_i = i;
+    }
+  }
+  // The dispatch signal is filter-choice DIVERSITY, not the SATD gain magnitude:
+  // SATD over-values prediction gains that quantization erases (largest on the
+  // LOW-motion loser al12), so gain magnitude anti-correlates with the BD win.
+  // Diversity — the fraction of sampled blocks NOT choosing the plurality filter
+  // — measures whether blocks genuinely WANT different filters, i.e. whether the
+  // switchable syntax buys anything. High on the CIF winner (0.42), low on the
+  // uniform loser (0.17). This is the tool's real head-room.
+  let nb: u32 = argcnt.iter().sum::<u32>().max(1);
+  let plur = *argcnt.iter().max().unwrap();
+  let diversity = 1.0 - plur as f64 / nb as f64;
+  let switchable = diversity > crate::harvest::pbinterp_t();
+  if std::env::var("RAV1E_PBDISP_DUMP").is_ok() {
+    let fixed_tot = tot[best_i];
+    let gain = fixed_tot.saturating_sub(per_block_min);
+    let rel = if fixed_tot > 0 { gain as f64 / fixed_tot as f64 } else { 0.0 };
+    eprintln!(
+      "PBDISP oh={} rel_gain={:.4} argcnt={:?} diversity={:.3} switchable={}",
+      fi.order_hint, rel, argcnt, diversity, switchable
+    );
+  }
+  (switchable, filters[best_i])
+}
+
+/// prom_av1e048c: per-block interp-filter RD search. For this inter block's
+/// already-decided mode/mv/ref, trial each switchable filter and pick the one
+/// minimising SATD(source, prediction) + me_lambda-weighted filter-symbol rate
+/// (the symbol cost matters per-block: switchable syntax is paid every block,
+/// so a marginal SATD win must clear its bits). Predicts into ts.rec, which the
+/// real motion_compensate immediately overwrites with the winner's prediction
+/// (frame_filter is left set to the winner). Reads only refs + the block cdf.
+fn pick_block_filter<T: Pixel, W: Writer>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>, cw: &ContextWriter,
+  w: &W, bsize: BlockSize, tile_bo: TileBlockOffset,
+  luma_mode: PredictionMode, ref_frames: [RefType; 2],
+  mvs: [MotionVector; 2],
+) -> crate::mc::FilterMode {
+  use crate::mc::FilterMode;
+  let comp = luma_mode.is_compound();
+  let ctx = cw.get_switchable_interp_ctx(tile_bo, ref_frames[0], comp);
+  let cdf = &cw.fc.switchable_interp_cdf[ctx];
+  let (bw, bh) = (bsize.width(), bsize.height());
+  let tile_rect = ts.tile_rect();
+  let po = tile_bo.plane_offset(ts.rec.planes[0].plane_cfg);
+  let mut best = (u64::MAX, fi.default_filter);
+  for fm in [FilterMode::REGULAR, FilterMode::SMOOTH, FilterMode::SHARP] {
+    frame_filter::set(Some(fm));
+    {
+      let mut dst =
+        ts.rec.planes[0].subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+      luma_mode.predict_inter(
+        fi,
+        tile_rect,
+        0,
+        po,
+        &mut dst,
+        bw,
+        bh,
+        ref_frames,
+        mvs,
+        &mut ts.inter_compound_buffers,
+      );
+    }
+    let input =
+      ts.input_tile.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+    let recr =
+      ts.rec.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+    let satd = crate::dist::get_satd(
+      &input,
+      &recr,
+      bw,
+      bh,
+      fi.sequence.bit_depth,
+      fi.cpu_feature_level,
+    ) as u64;
+    let bits = w.symbol_bits(fm as u32, cdf) as f64;
+    let cost = satd + (bits * fi.me_lambda * 0.5) as u64;
+    if cost < best.0 {
+      best = (cost, fm);
+    }
+  }
+  best.1
 }
 
 /// prom_av1e031/032: build the 64×64 residual variance tree for the SB at
@@ -4064,6 +4603,9 @@ fn encode_tile_group<T: Pixel>(
     fs.enc_stats += &tile_stats;
   }
 
+  // prom_av1e050: latch the per-clip OBMC verdict from the first inter frame.
+  obmc_frame::commit_adoption();
+
   /* Frame deblocking operates over a single large tile wrapping the
    * frame rather than the frame itself so that deblocking is
    * available inside RDO when needed */
@@ -4368,14 +4910,50 @@ fn encode_tile<'a, T: Pixel>(
   // frame_filter. Inter frames only; off ⇒ None ⇒ fi.default_filter.
   // Single-tile only: the filter is signaled once per frame but chosen inside
   // the tile pass, so multi-tile frames could desync. (Guarded, not yet solved.)
-  if crate::harvest::afilter()
+  let single_tile =
+    fi.sequence.tiling.cols * fi.sequence.tiling.rows == 1;
+  if crate::harvest::pbinterp() && fi.frame_type.has_inter() && single_tile {
+    // prom_av1e048c: per-FRAME dispatch — SWITCHABLE per-block filter only where
+    // intra-frame filter preference varies enough to beat the syntax overhead;
+    // otherwise fall back to the best fixed frame filter (the av1e045 path).
+    let (switchable, fixed) = pick_frame_dispatch(fi, ts, &mut cw);
+    frame_dispatch::set(switchable);
+    frame_filter::set(if switchable { None } else { Some(fixed) });
+  } else if crate::harvest::afilter()
     && fi.frame_type.has_inter()
-    && fi.sequence.tiling.cols * fi.sequence.tiling.rows == 1
+    && single_tile
   {
+    frame_dispatch::set(false);
     let f = pick_frame_filter(fi, ts, &mut cw);
     frame_filter::set(Some(f));
   } else {
+    frame_dispatch::set(false);
     frame_filter::set(None);
+  }
+
+  // prom_av1e050: per-frame OBMC dispatch. Signal switchable only when the
+  // PREVIOUS frame's OBMC adoption cleared the threshold (temporal signal, no
+  // pre-pass) — keeps the win on coherent-motion content, drops the per-block
+  // motion_mode tax on content where OBMC only over-picks noisy blocks. The
+  // first inter frame defaults on (PREV=1.0) to seed the signal.
+  // prom_av1e051: MOTION-GATE mode replaces the (contaminated) per-block-RD
+  // dispatch with a per-CLIP force-on latched on the first inter frame's motion.
+  if crate::harvest::obmc()
+    && crate::harvest::obmc_mgate()
+    && fi.frame_type.has_inter()
+    && single_tile
+  {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !obmc_frame::DECIDED.load(Relaxed) {
+      let motion = obmc_motion_measure(fi, ts);
+      let en = motion > crate::harvest::obmc_mt();
+      obmc_frame::ENABLE.store(en, Relaxed);
+      obmc_frame::FORCE_CLIP.store(en, Relaxed);
+      obmc_frame::DECIDED.store(true, Relaxed);
+    }
+    obmc_frame::set(obmc_frame::ENABLE.load(Relaxed));
+  } else {
+    obmc_frame::set(obmc_frame::decide(fi.frame_type.has_inter(), single_tile));
   }
 
   // main loop
