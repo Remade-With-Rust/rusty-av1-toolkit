@@ -2085,10 +2085,30 @@ pub fn motion_compensate<T: Pixel>(
       0
     };
 
+  // prom_av1e052: WARP — a LOCALWARP block replaces the base translation MC with
+  // the affine warp when its derived model is non-degenerate (else regular MC,
+  // exactly as the decoder falls back). Mutually exclusive with OBMC.
+  let warp_elig = crate::harvest::warp()
+    && !luma_mode.is_compound()
+    && crate::encoder::obmc_frame::on()
+    && cw.obmc_allowed(tile_bo, bsize)
+    && fi.allow_warped_motion
+    && cw.warp_allowed(tile_bo, bsize)
+    && (crate::harvest::warp_force()
+      || cw.bc.blocks[tile_bo].motion_mode
+        == crate::predict::MotionMode::WARPED_CAUSAL);
+  let warpmv = if warp_elig {
+    cw.derive_warpmv(tile_bo, bsize, mvs[0])
+  } else {
+    crate::warp::WarpedMotionParams::default()
+  };
+  let do_warp = warp_elig && warpmv.valid;
+
   // prom_av1e050: OBMC applies to single-ref eligible blocks the RD chose
   // (Block.motion_mode == OBMC) on a switchable frame, or all eligible under
   // obmc_force (the A/B).
-  let do_obmc = crate::encoder::obmc_frame::on()
+  let do_obmc = !warp_elig
+    && crate::encoder::obmc_frame::on()
     && !luma_mode.is_compound()
     && cw.obmc_allowed(tile_bo, bsize)
     && (crate::harvest::obmc_force()
@@ -2266,6 +2286,29 @@ pub fn motion_compensate<T: Pixel>(
             compound_buffer,
           );
         }
+      }
+    } else if do_warp
+      && (p == 0
+        || plane_bsize.width_mi().min(plane_bsize.height_mi()) > 1)
+    {
+      // prom_av1e052 M2: affine warp prediction replaces regular MC. The decoder
+      // warps chroma only when the chroma block is >= 8x8 (min(cbw4,cbh4) > 1);
+      // for smaller chroma (8x8-luma blocks) chroma falls to regular MC below.
+      if let Some(ref refp) = fi.rec_buffer.frames
+        [fi.ref_frames[ref_frames[0].to_index()] as usize]
+      {
+        crate::warp::predict_warp(
+          &refp.frame.planes[p],
+          &mut rec.subregion_mut(area),
+          &warpmv,
+          tile_bo.0.x as i32 * 4,
+          tile_bo.0.y as i32 * 4,
+          plane_bsize.width(),
+          plane_bsize.height(),
+          xdec as i32,
+          ydec as i32,
+          fi.sequence.bit_depth,
+        );
       }
     } else {
       luma_mode.predict_inter(
@@ -2594,20 +2637,23 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         // The block's motion_mode is the RD winner (set by rdo_mode_decision);
         // obmc_force overrides it to OBMC for the bring-up A/B. Both the symbol
         // and the motion_compensate OBMC pass read this same value.
-        let mm = if crate::harvest::obmc_force()
+        // prom_av1e052: WARP — warp-eligible blocks (allow_warped_motion + a
+        // non-empty matching-ref mask) code motion_mode via the 3-way CDF.
+        let allow_warp = crate::harvest::warp()
+          && fi.allow_warped_motion
+          && cw.warp_allowed(tile_bo, bsize);
+        // M2: RAV1E_WARP_FORCE selects LOCALWARP on every warp-eligible block
+        // (the decoder derives the same warpmv + warp-predicts, or falls back to
+        // regular MC when the model is degenerate — motion_compensate mirrors it).
+        let mm = if crate::harvest::warp_force() && allow_warp {
+          crate::predict::MotionMode::WARPED_CAUSAL
+        } else if crate::harvest::obmc_force()
           || crate::encoder::obmc_frame::force_clip()
         {
           crate::predict::MotionMode::OBMC_CAUSAL
         } else {
           cw.bc.blocks[tile_bo].motion_mode
         };
-        // prom_av1e052: WARP M1 — warp-eligible blocks (allow_warped_motion +
-        // a non-empty matching-ref mask) code motion_mode via the 3-way CDF.
-        // M1 never selects LOCALWARP, so `mm` stays SIMPLE/OBMC; the 3-way path
-        // only changes which CDF costs/codes that value (conformance only).
-        let allow_warp = crate::harvest::warp()
-          && fi.allow_warped_motion
-          && cw.warp_allowed(tile_bo, bsize);
         cw.write_motion_mode(w, tile_bo, bsize, mm, allow_warp);
         if !W::COUNTS_ONLY {
           cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);

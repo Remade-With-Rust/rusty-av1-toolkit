@@ -113,6 +113,8 @@ mod me;
 mod rate;
 mod recon_intra;
 mod scan_order;
+mod warp;
+mod warp_tables;
 mod segmentation;
 mod stats;
 #[doc(hidden)]

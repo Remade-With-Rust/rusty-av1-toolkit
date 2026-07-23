@@ -1824,6 +1824,17 @@ impl ContextWriter<'_> {
   pub(crate) fn warp_allowed(
     &self, bo: TileBlockOffset, bsize: BlockSize,
   ) -> bool {
+    let m = self.warp_masks(bo, bsize);
+    m[0] != 0 || m[1] != 0
+  }
+
+  /// prom_av1e052: WARP — the decoder's `find_matching_ref`, filling the top
+  /// (masks[0]) and left (masks[1]) neighbour bitmasks EXACTLY as dav1d does
+  /// (block-size stepping; corner bits at position 32). `mask != 0` drives the
+  /// M1 CDF selection; the bit pattern drives M2's warp-sample collection.
+  pub(crate) fn warp_masks(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> [u64; 2] {
     let bw4 = bsize.width_mi() as isize;
     let bh4 = bsize.height_mi() as isize;
     let (cols, rows) =
@@ -1835,22 +1846,18 @@ impl ContextWriter<'_> {
       b.ref_frames[0] == our_ref
         && b.ref_frames[1] == crate::partition::RefType::NONE_FRAME
     };
-    // have_topleft / have_topright track whether the CORNER neighbours are valid
-    // candidates; the decoder clears them when the first above neighbour is
-    // wider than our block AND our position is offset within it. have_topright
-    // additionally needs the AV1 above-right availability (has_tr) — the same
-    // gate the encoder's MV prediction uses.
+    let mut masks = [0u64; 2];
+    let mut count = 0u32;
     let mut have_topleft = bo.0.y > 0 && bo.0.x > 0;
     let mut have_topright = bw4.max(bh4) < 32
       && bo.0.y > 0
       && (bo.0.x as isize + bw4) < cols
       && crate::partition::has_tr(bo, bsize);
-    // top row: check the first above-neighbour; only walk further if it is
-    // narrower than our block (the decoder's `aw4 < bw4` else-branch).
     if bo.0.y > 0 {
       let n0 = &self.bc.blocks[bo.with_offset(0, -1)];
       if matches(n0) {
-        return true;
+        masks[0] |= 1;
+        count = 1;
       }
       let aw4 = n0.n4_w as isize;
       if aw4 >= bw4 {
@@ -1862,21 +1869,31 @@ impl ContextWriter<'_> {
           have_topright = false;
         }
       } else {
+        let mut mask = 1u64 << aw4;
         let mut x = aw4;
         while x < w4 {
           let n = &self.bc.blocks[bo.with_offset(x, -1)];
           if matches(n) {
-            return true;
+            masks[0] |= mask;
+            count += 1;
+            if count >= 8 {
+              return masks;
+            }
           }
-          x += n.n4_w as isize;
+          let aw = n.n4_w as isize;
+          mask <<= aw;
+          x += aw;
         }
       }
     }
-    // left column, symmetric on height.
     if bo.0.x > 0 {
       let n0 = &self.bc.blocks[bo.with_offset(-1, 0)];
       if matches(n0) {
-        return true;
+        masks[1] |= 1;
+        count += 1;
+        if count >= 8 {
+          return masks;
+        }
       }
       let lh4 = n0.n4_h as isize;
       if lh4 >= bh4 {
@@ -1884,25 +1901,104 @@ impl ContextWriter<'_> {
           have_topleft = false;
         }
       } else {
+        let mut mask = 1u64 << lh4;
         let mut y = lh4;
         while y < h4 {
           let n = &self.bc.blocks[bo.with_offset(-1, y)];
           if matches(n) {
-            return true;
+            masks[1] |= mask;
+            count += 1;
+            if count >= 8 {
+              return masks;
+            }
           }
-          y += n.n4_h as isize;
+          let lh = n.n4_h as isize;
+          mask <<= lh;
+          y += lh;
         }
       }
     }
-    // top-left corner (decode.rs:428) — only when still a valid candidate.
     if have_topleft && matches(&self.bc.blocks[bo.with_offset(-1, -1)]) {
-      return true;
+      masks[1] |= 1 << 32;
+      count += 1;
+      if count >= 8 {
+        return masks;
+      }
     }
-    // top-right corner (decode.rs:435) — block just past our top row, one row up.
     if have_topright && matches(&self.bc.blocks[bo.with_offset(bw4, -1)]) {
-      return true;
+      masks[0] |= 1 << 32;
     }
-    false
+    masks
+  }
+
+  /// prom_av1e052: WARP M2 — derive the affine warp model for a block from its
+  /// neighbour MV correspondences (dav1d derive_warpmv). Reads the same mask as
+  /// warp_masks, collects samples (neighbour position → neighbour-MV-projected
+  /// point), filters + solves. `mv` is the block's own MV.
+  pub(crate) fn derive_warpmv(
+    &self, bo: TileBlockOffset, bsize: BlockSize, mv: MotionVector,
+  ) -> crate::warp::WarpedMotionParams {
+    let bw4 = bsize.width_mi() as i32;
+    let bh4 = bsize.height_mi() as i32;
+    let bx = bo.0.x as i32;
+    let by = bo.0.y as i32;
+    let masks = self.warp_masks(bo, bsize);
+    let nb = |dc: i32, dr: i32| -> &Block {
+      &self.bc.blocks[bo.with_offset(dc as isize, dr as isize)]
+    };
+    let mut pts: Vec<[[i32; 2]; 2]> = Vec::with_capacity(8);
+    let add = |pts: &mut Vec<[[i32; 2]; 2]>,
+               dx: i32,
+               dy: i32,
+               sx: i32,
+               sy: i32,
+               b: &Block| {
+      if pts.len() >= 8 {
+        return;
+      }
+      let ix = 16 * (2 * dx + sx * b.n4_w as i32) - 8;
+      let iy = 16 * (2 * dy + sy * b.n4_h as i32) - 8;
+      pts.push([[ix, iy], [ix + b.mv[0].col as i32, iy + b.mv[0].row as i32]]);
+    };
+    // top row
+    if masks[0] as u32 == 1 && masks[1] >> 32 == 0 {
+      let off = bx & (nb(0, -1).n4_w as i32 - 1);
+      add(&mut pts, -off, 0, 1, -1, nb(0, -1));
+    } else {
+      let mut off = 0i32;
+      let mut xmask = masks[0] as u32;
+      while pts.len() < 8 && xmask != 0 {
+        let tz = xmask.trailing_zeros() as i32;
+        off += tz;
+        xmask >>= tz;
+        add(&mut pts, off, 0, 1, -1, nb(off, -1));
+        xmask &= !1;
+      }
+    }
+    // left column
+    if pts.len() < 8 && masks[1] as u32 == 1 {
+      let off = by & (nb(-1, 0).n4_h as i32 - 1);
+      add(&mut pts, 0, -off, -1, 1, nb(-1, -off));
+    } else {
+      let mut off = 0i32;
+      let mut ymask = masks[1] as u32;
+      while pts.len() < 8 && ymask != 0 {
+        let tz = ymask.trailing_zeros() as i32;
+        off += tz;
+        ymask >>= tz;
+        add(&mut pts, 0, off, -1, 1, nb(-1, off));
+        ymask &= !1;
+      }
+    }
+    // top-left corner
+    if pts.len() < 8 && masks[1] >> 32 != 0 {
+      add(&mut pts, 0, 0, -1, -1, nb(-1, -1));
+    }
+    // top-right corner
+    if pts.len() < 8 && masks[0] >> 32 != 0 {
+      add(&mut pts, bw4, 0, 1, -1, nb(bw4, -1));
+    }
+    crate::warp::solve_warp(&pts, bw4, bh4, mv, bx, by)
   }
 
   // prom_av1e050/052: code the motion_mode symbol. When the block is

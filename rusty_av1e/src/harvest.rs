@@ -820,6 +820,17 @@ pub fn warp() -> bool {
   })
 }
 
+// prom_av1e052 WARP M2: force LOCALWARP on every warp-eligible block (the
+// prediction bring-up A/B, before RD). Requires RAV1E_WARP=1 too.
+static WARP_FORCE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn warp_force() -> bool {
+  *WARP_FORCE.get_or_init(|| match std::env::var("RAV1E_WARP_FORCE") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+
 // prom_av1e048c: extend the av1e045 per-frame filter trial from best-of-2
 // (REGULAR/SHARP) to best-of-3 (add SMOOTH). Clean win on SMOOTH-dominant
 // content, neutral elsewhere, zero syntax cost. Default ON (folds into fast).
