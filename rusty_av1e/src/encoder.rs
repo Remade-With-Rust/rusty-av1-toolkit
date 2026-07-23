@@ -2095,6 +2095,7 @@ pub fn motion_compensate<T: Pixel>(
     && fi.allow_warped_motion
     && cw.warp_allowed(tile_bo, bsize)
     && (crate::harvest::warp_force()
+      || crate::encoder::warp_frame::enabled()
       || cw.bc.blocks[tile_bo].motion_mode
         == crate::predict::MotionMode::WARPED_CAUSAL);
   let warpmv = if warp_elig {
@@ -2637,8 +2638,11 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         // The block's motion_mode is the RD winner (set by rdo_mode_decision);
         // obmc_force overrides it to OBMC for the bring-up A/B. Both the symbol
         // and the motion_compensate OBMC pass read this same value.
-        // prom_av1e052: WARP — warp-eligible blocks (allow_warped_motion + a
-        // non-empty matching-ref mask) code motion_mode via the 3-way CDF.
+        // prom_av1e052: WARP — warp-eligible blocks code motion_mode via the 3-way
+        // CDF (allow_warped_motion is a CONSTANT per-clip header flag; a dynamic
+        // per-frame flip 2-way↔3-way desyncs the motion_mode CDF context). The
+        // gate's ~+0.3% M1 overhead on non-affine clips is the price of keeping
+        // the flag stable — acceptable for an opt-in feature (−19% on affine).
         let allow_warp = crate::harvest::warp()
           && fi.allow_warped_motion
           && cw.warp_allowed(tile_bo, bsize);
@@ -2656,7 +2660,26 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         // neighbour-coherence level, and the per-CLIP loss clips (container/news)
         // are already gated off, so no cheap per-block signal separates a loss
         // subset. The per-clip motion-gate is the right granularity.
-        let mm = if crate::harvest::warp_force() && allow_warp {
+        // prom_av1e053 T3: on the first inter frame, sample the shear magnitude
+        // of eligible blocks' warp models to decide the per-clip WARP latch.
+        if crate::harvest::warp()
+          && !W::COUNTS_ONLY
+          && crate::encoder::warp_frame::measuring()
+          && cw.warp_allowed(tile_bo, bsize)
+        {
+          let wm = cw.derive_warpmv(tile_bo, bsize, mvs[0]);
+          let s = (wm.alpha().unsigned_abs() as u64)
+            .max(wm.beta().unsigned_abs() as u64)
+            .max(wm.gamma().unsigned_abs() as u64)
+            .max(wm.delta().unsigned_abs() as u64);
+          crate::encoder::warp_frame::add_shear(s);
+        }
+        // WARP is selected by RAV1E_WARP_FORCE (the A/B) or, per-clip, when the
+        // shear-latch found affine content (warp_frame::enabled).
+        let mm = if (crate::harvest::warp_force()
+          || crate::encoder::warp_frame::enabled())
+          && allow_warp
+        {
           crate::predict::MotionMode::WARPED_CAUSAL
         } else if crate::harvest::obmc_force()
           || crate::encoder::obmc_frame::force_clip()
@@ -3804,6 +3827,54 @@ pub(crate) mod obmc_frame {
   }
 }
 
+// prom_av1e053 T3: per-CLIP WARP dispatch. Local warped motion wins BIG on affine
+// content (rotation −21% BD) but loses on translational (Derf +3-4%). The signal:
+// on the FIRST inter frame, accumulate the SHEAR magnitude (max|alpha,beta,gamma,
+// delta|) of the derived warp models over eligible blocks; if the mean clears a
+// floor, the clip has real affine motion → force-warp the rest of the clip
+// (feedback-free, key-referenced latch, mirroring the OBMC motion-gate).
+pub(crate) mod warp_frame {
+  use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+  pub static SHEAR_SUM: AtomicU64 = AtomicU64::new(0);
+  pub static SHEAR_N: AtomicU64 = AtomicU64::new(0);
+  pub static DECIDED: AtomicBool = AtomicBool::new(false);
+  pub static ENABLE: AtomicBool = AtomicBool::new(false);
+  #[inline]
+  pub fn gate_on() -> bool {
+    crate::harvest::warp() && crate::harvest::warp_gate()
+  }
+  /// Accumulate on the first inter frame only (before the latch).
+  #[inline]
+  pub fn measuring() -> bool {
+    gate_on() && !DECIDED.load(Relaxed)
+  }
+  #[inline]
+  pub fn add_shear(s: u64) {
+    SHEAR_SUM.fetch_add(s, Relaxed);
+    SHEAR_N.fetch_add(1, Relaxed);
+  }
+  /// Force-warp verdict for the rest of the clip.
+  #[inline]
+  pub fn enabled() -> bool {
+    gate_on() && DECIDED.load(Relaxed) && ENABLE.load(Relaxed)
+  }
+  /// After the first inter frame, latch: mean shear > floor ⇒ affine content.
+  #[inline]
+  pub fn commit() {
+    if gate_on() && !DECIDED.load(Relaxed) {
+      let n = SHEAR_N.load(Relaxed);
+      if n > 0 {
+        let mean = SHEAR_SUM.load(Relaxed) / n;
+        ENABLE.store(mean > crate::harvest::warp_shear_t(), Relaxed);
+        DECIDED.store(true, Relaxed);
+        if std::env::var("RAV1E_WARP_GATE_DBG").is_ok() {
+          eprintln!("WARP_SHEAR mean={} n={} enable={}", mean, n, mean > crate::harvest::warp_shear_t());
+        }
+      }
+    }
+  }
+}
+
 // prom_av1e047: per-SB gate for the trellis — true when this SB is NOT flat
 // (absolute residual variance above the threshold), so the trellis (which
 // helps busy content, marginally hurts flat) is dispatched off akiyo-like SBs.
@@ -4673,6 +4744,7 @@ fn encode_tile_group<T: Pixel>(
 
   // prom_av1e050: latch the per-clip OBMC verdict from the first inter frame.
   obmc_frame::commit_adoption();
+  warp_frame::commit();
 
   /* Frame deblocking operates over a single large tile wrapping the
    * frame rather than the frame itself so that deblocking is

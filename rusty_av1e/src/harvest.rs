@@ -848,6 +848,28 @@ pub fn warp_force() -> bool {
   })
 }
 
+// prom_av1e053 T3: per-CLIP WARP dispatch — latch force-warp for the clip when
+// the first inter frame's mean shear magnitude clears a floor (affine content:
+// rotation/zoom). Off on translational content (no regression). Requires
+// RAV1E_WARP=1. RAV1E_WARP_SHEAR_T = the shear floor (max|abcd| units).
+static WARP_GATE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn warp_gate() -> bool {
+  *WARP_GATE.get_or_init(|| match std::env::var("RAV1E_WARP_GATE") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+static WARP_SHEAR_T: OnceLock<u64> = OnceLock::new();
+#[inline]
+pub fn warp_shear_t() -> u64 {
+  *WARP_SHEAR_T.get_or_init(|| {
+    // Calibrated: rot (affine) first-frame mean shear ≈ 4871 (WARP −21%); the
+    // busiest translational clip (bus) ≈ 3625 (WARP loses). Floor between them.
+    std::env::var("RAV1E_WARP_SHEAR_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4200)
+  })
+}
+
 // prom_av1e048c: extend the av1e045 per-frame filter trial from best-of-2
 // (REGULAR/SHARP) to best-of-3 (add SMOOTH). Clean win on SMOOTH-dominant
 // content, neutral elsewhere, zero syntax cost. Default ON (folds into fast).
