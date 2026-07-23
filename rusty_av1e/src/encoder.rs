@@ -2650,6 +2650,12 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         // state) wins on this TRANSLATIONAL corpus. Warp's payoff is affine
         // rotation/zoom motion (absent from Derf CIF); a prediction-quality RD
         // selection is the path to a win — deferred. Kept opt-in.
+        // prom_av1e053 T1 PRUNED: a per-block OBMC blend-coherence gate (skip the
+        // blend by neighbour-MV deviation) LOSES both ways (LO=16 +1.04%, HI=64
+        // +0.49%) — within the motion-gate-ENABLED clips OBMC helps at every
+        // neighbour-coherence level, and the per-CLIP loss clips (container/news)
+        // are already gated off, so no cheap per-block signal separates a loss
+        // subset. The per-clip motion-gate is the right granularity.
         let mm = if crate::harvest::warp_force() && allow_warp {
           crate::predict::MotionMode::WARPED_CAUSAL
         } else if crate::harvest::obmc_force()

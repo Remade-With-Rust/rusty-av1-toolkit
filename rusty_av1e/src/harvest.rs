@@ -59,7 +59,7 @@ pub fn trellis() -> bool {
     // tier fallback: a FREE quality win — dispatched to non-flat SBs it is
     // −0.506% mean BD (mobile −1.0%), every clip improves, ~0% wall (O(n)
     // symbol_bits rate, busy SBs only). RAV1E_TRELLIS=0 opts out.
-    Err(_) => fast_tier() == FastTier::Fast,
+    Err(_) => fast_tier() >= FastTier::Turbo,
   })
 }
 
@@ -153,11 +153,17 @@ pub fn lambda_mult() -> Option<LambdaMult> {
 // Unset = stock rav1e (byte-identical; FNV-proven). Deliberately NOT part of
 // --racecar, whose contract is byte-identical kernel swaps only.
 
-#[derive(Clone, Copy, PartialEq)]
+// prom_av1e053 T1: speed-tier ladder, ordered by quality effort (higher = more
+// bricks = slower). Turbo = Fast minus the one expensive brick (OBMC, −1% BD /
+// +12% compute); Quality = Fast plus the deep tx-type RDO (−1.7% / +36%). The
+// near-free bricks (interp, trellis) ride at every rung ≥ Turbo.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FastTier {
   Off,
   Clean,
+  Turbo,
   Fast,
+  Quality,
 }
 
 static FAST_TIER: OnceLock<FastTier> = OnceLock::new();
@@ -166,7 +172,9 @@ pub fn fast_tier() -> FastTier {
   *FAST_TIER.get_or_init(|| match std::env::var("RAV1E_FAST") {
     Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
       "clean" => FastTier::Clean,
+      "turbo" => FastTier::Turbo,
       "1" | "on" | "fast" => FastTier::Fast,
+      "quality" | "q" => FastTier::Quality,
       _ => FastTier::Off,
     },
     Err(_) => FastTier::Off,
@@ -233,7 +241,7 @@ pub fn part_gate() -> Option<(f64, f64, f64)> {
       // additive on top of the fast tier's pd0 gate. Unlike the refuted
       // variance/SATD partition PROXIES, the ACCURATE none_rd cost stays the
       // arbiter, so the prune only fires where full RD would also pick NONE.
-      Err(_) if fast_tier() == FastTier::Fast => {
+      Err(_) if fast_tier() >= FastTier::Turbo => {
         return Some((300.0, 150.0, 75.0))
       }
       Err(_) => return None,
@@ -268,7 +276,7 @@ pub fn fastrate() -> bool {
       Ok(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"),
       // tier fallback: fast tier includes fastrate (BD-negative standalone:
       // -0.117% mean; stack-measured +0.099% total)
-      Err(_) => fast_tier() == FastTier::Fast,
+      Err(_) => fast_tier() >= FastTier::Turbo,
     }
   })
 }
@@ -337,7 +345,7 @@ pub fn frozen() -> bool {
       // (349.9s vs 419.8s; trial14). NOTE fastsym does NOT get this
       // fallback: it leaks with both frozen (+0.201%) and the tier
       // (+0.313%) — approximations compose sub-additively in BD.
-      Err(_) => fast_tier() == FastTier::Fast,
+      Err(_) => fast_tier() >= FastTier::Turbo,
     }
   })
 }
@@ -536,7 +544,7 @@ pub fn fastrd() -> bool {
       // always ranked SATD+rate); at the tier's K=6 it is a free BD win
       // (−0.039% mean, ~0 speed; trial22) ⇒ folded on. RAV1E_FASTRD=0 opts
       // out.
-      Err(_) => fast_tier() == FastTier::Fast,
+      Err(_) => fast_tier() >= FastTier::Turbo,
     }
   })
 }
@@ -580,7 +588,7 @@ pub fn sb_skip() -> Option<u64> {
       // tier fallback: k=8 passed the composition gate CLEAN on both
       // resolutions — 1080p BD −0.001% @ +12.8% wall, CIF +0.000% @ +2.2%
       // (trial18/19; rotated arms). First clean tier leg since frozen.
-      Err(_) => (fast_tier() == FastTier::Fast).then_some(8),
+      Err(_) => (fast_tier() >= FastTier::Turbo).then_some(8),
     }
   })
 }
@@ -599,7 +607,7 @@ pub fn pd0_gate() -> Option<(f64, f64)> {
   *PD0_GATE.get_or_init(|| {
     let v = match std::env::var("RAV1E_PD0_GATE") {
       Ok(v) => v,
-      Err(_) if fast_tier() == FastTier::Fast => {
+      Err(_) if fast_tier() >= FastTier::Turbo => {
         return Some((-999.0, 0.134))
       }
       Err(_) => return None,
@@ -685,6 +693,10 @@ pub fn deep_q() -> Option<f64> {
       .ok()
       .and_then(|v| v.trim().parse().ok())
       .filter(|q: &f64| *q > 0.0 && *q <= 1.0)
+      // prom_av1e053 T1: the Quality rung enables the deep tx-type RDO at its
+      // concave sweet spot (q0.5 = 68% of the force-on gain for 58% of the cost,
+      // av1e041). Fast/Turbo leave it off (it costs +36% compute).
+      .or_else(|| (fast_tier() >= FastTier::Quality).then_some(0.5))
   })
 }
 
@@ -717,7 +729,7 @@ pub fn afilter() -> bool {
     // tier fallback: a FREE quality win (−0.859% mean BD, mobile −3.4%, ~0%
     // wall — the per-frame SATD trial is a coarse grid) ⇒ folded into the fast
     // tier. RAV1E_AFILTER=0 opts out; multi-tile frames fall back to REGULAR.
-    Err(_) => fast_tier() == FastTier::Fast,
+    Err(_) => fast_tier() >= FastTier::Turbo,
   })
 }
 
@@ -743,7 +755,9 @@ static OBMC: OnceLock<bool> = OnceLock::new();
 pub fn obmc() -> bool {
   *OBMC.get_or_init(|| match std::env::var("RAV1E_OBMC") {
     Ok(v) => v.trim() == "1",
-    Err(_) => fast_tier() == FastTier::Fast,
+    // prom_av1e053 T1: OBMC is the one expensive brick — on at Fast+, OFF at
+    // Turbo (the speed rung that drops it for +12% encode / +1% BD).
+    Err(_) => fast_tier() >= FastTier::Fast,
   })
 }
 
@@ -774,6 +788,10 @@ pub fn obmc_force() -> bool {
   })
 }
 
+// prom_av1e053 T1 PRUNED: a per-block OBMC blend-coherence gate (neighbour-MV
+// deviation band) LOSES both ways — within motion-gate-enabled clips OBMC helps
+// at every coherence level; the per-clip motion-gate is the right granularity.
+
 // prom_av1e051: per-CLIP MOTION-GATED force-on OBMC. Derf-CIF deployment showed
 // the per-block-RD dispatch is CONTAMINATED — it can't see OBMC's temporal-
 // reference-chain benefit, so it under-adopts (halves the win vs force-on) and
@@ -786,10 +804,9 @@ static OBMC_MGATE: OnceLock<bool> = OnceLock::new();
 pub fn obmc_mgate() -> bool {
   *OBMC_MGATE.get_or_init(|| match std::env::var("RAV1E_OBMC_MGATE") {
     Ok(v) => v.trim() == "1",
-    // tier fallback: the motion gate is the SHIPPING OBMC dispatch (force-on
-    // where clip motion clears the floor, byte-identical-off below) — the
-    // per-block RD is contaminated (blind to OBMC's temporal-reference gain).
-    Err(_) => fast_tier() == FastTier::Fast,
+    // tier fallback: the motion gate is the SHIPPING OBMC dispatch. Fast+ only
+    // (Turbo drops OBMC) — must track obmc() above.
+    Err(_) => fast_tier() >= FastTier::Fast,
   })
 }
 
