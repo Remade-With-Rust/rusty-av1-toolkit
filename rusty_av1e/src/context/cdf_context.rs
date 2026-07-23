@@ -59,6 +59,13 @@ pub struct CDFContext {
   // the neighbor cdf on RDO rollback → subtle desync (the av1e048b bug).
   pub switchable_interp_cdf:
     [[u16; SWITCHABLE_FILTERS]; SWITCHABLE_FILTER_CONTEXTS],
+  // prom_av1e052: WARP — 3-way motion_mode (SIMPLE/OBMC/LOCALWARP) coded when
+  // the block is warp-eligible (allow_warped_motion + a non-empty matching-ref
+  // mask). [u16;3] ⇒ MUST sit among the small-partition (CDF_LEN<=4) cdfs, next
+  // to another [u16;3] (switchable_interp / tx_size), same reason as the interp
+  // cdf above: the undo log's fixed 4-wide copy overshoots 1 into tx_size_cdf,
+  // safe only because it too is small.
+  pub motion_mode_cdf: [[u16; 3]; BlockSize::BLOCK_SIZES_ALL],
   pub tx_size_cdf: [[[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS]; BIG_TX_CATS],
 
   pub coeff_base_cdf:
@@ -154,6 +161,7 @@ impl CDFContext {
       drl_cdfs: default_drl_cdf,
       compound_mode_cdf: default_compound_mode_cdf,
       switchable_interp_cdf: default_switchable_interp_cdf,
+      motion_mode_cdf: default_motion_mode_cdf,
       nmv_context: default_nmv_context,
       deblock_delta_multi_cdf: default_delta_lf_multi_cdf,
       deblock_delta_cdf: default_delta_lf_cdf,
@@ -252,6 +260,7 @@ impl CDFContext {
     reset_2d!(self.drl_cdfs);
     reset_2d!(self.compound_mode_cdf);
     reset_2d!(self.switchable_interp_cdf);
+    reset_2d!(self.motion_mode_cdf);
     reset_2d!(self.deblock_delta_multi_cdf);
     reset_1d!(self.deblock_delta_cdf);
     reset_2d!(self.spatial_segmentation_cdfs);

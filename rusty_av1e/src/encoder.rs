@@ -307,7 +307,9 @@ impl Sequence {
       enable_order_hint: !config.still_picture,
       enable_jnt_comp: false,
       enable_ref_frame_mvs: false,
-      enable_warped_motion: false,
+      // prom_av1e052: WARP M1 — sequence-level enable (opt-in). Not for still
+      // pictures (the reduced_still_picture_hdr path asserts it off).
+      enable_warped_motion: crate::harvest::warp() && !config.still_picture,
       enable_superres: false,
       enable_cdef: config.speed_settings.cdef && enable_restoration_filters,
       enable_restoration: config.speed_settings.lrf
@@ -899,7 +901,9 @@ impl<T: Pixel> FrameInvariants<T> {
       is_filter_switchable: false,
       is_motion_mode_switchable: false, // 0: only the SIMPLE motion mode will be used.
       disable_frame_end_update_cdf: sequence.reduced_still_picture_hdr,
-      allow_warped_motion: false,
+      // prom_av1e052: WARP M1 — the frame-level warp_motion flag (decoder's
+      // allow_warp gate). Header (line 799) already guards intra/error-resilient.
+      allow_warped_motion: sequence.enable_warped_motion,
       cdef_search_method: CDEFSearchMethod::PickFromQ,
       cdef_damping: 3,
       cdef_bits: 0,
@@ -2597,7 +2601,14 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         } else {
           cw.bc.blocks[tile_bo].motion_mode
         };
-        cw.write_motion_mode(w, tile_bo, bsize, mm);
+        // prom_av1e052: WARP M1 — warp-eligible blocks (allow_warped_motion +
+        // a non-empty matching-ref mask) code motion_mode via the 3-way CDF.
+        // M1 never selects LOCALWARP, so `mm` stays SIMPLE/OBMC; the 3-way path
+        // only changes which CDF costs/codes that value (conformance only).
+        let allow_warp = crate::harvest::warp()
+          && fi.allow_warped_motion
+          && cw.warp_allowed(tile_bo, bsize);
+        cw.write_motion_mode(w, tile_bo, bsize, mm, allow_warp);
         if !W::COUNTS_ONLY {
           cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);
         }

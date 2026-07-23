@@ -1814,15 +1814,118 @@ impl ContextWriter<'_> {
     top || left
   }
 
-  // prom_av1e050: code the OBMC on/off symbol (warp off ⇒ the decoder takes the
-  // 2-way obmc_cdf path). Caller guards on obmc_allowed + the frame flag.
+  /// prom_av1e052: WARP M1 — the decoder's `find_matching_ref` BOOLEAN. Returns
+  /// whether any single-ref neighbour on the top row / left column shares this
+  /// block's reference (the `mask != 0` that makes the 3-way motion_mode CDF
+  /// active instead of the 2-way obmc CDF). Mirrors dav1d decode.rs
+  /// find_matching_ref's walk EXACTLY — the block-size stepping and the
+  /// `aw4 >= bw4` first-neighbour-only branch — since any divergence flips the
+  /// CDF choice and desyncs. Caller guards obmc_allowed + fi.allow_warped_motion.
+  pub(crate) fn warp_allowed(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> bool {
+    let bw4 = bsize.width_mi() as isize;
+    let bh4 = bsize.height_mi() as isize;
+    let (cols, rows) =
+      (self.bc.blocks.cols() as isize, self.bc.blocks.rows() as isize);
+    let w4 = bw4.min(cols - bo.0.x as isize);
+    let h4 = bh4.min(rows - bo.0.y as isize);
+    let our_ref = self.bc.blocks[bo].ref_frames[0];
+    let matches = |b: &Block| {
+      b.ref_frames[0] == our_ref
+        && b.ref_frames[1] == crate::partition::RefType::NONE_FRAME
+    };
+    // have_topleft / have_topright track whether the CORNER neighbours are valid
+    // candidates; the decoder clears them when the first above neighbour is
+    // wider than our block AND our position is offset within it. have_topright
+    // additionally needs the AV1 above-right availability (has_tr) — the same
+    // gate the encoder's MV prediction uses.
+    let mut have_topleft = bo.0.y > 0 && bo.0.x > 0;
+    let mut have_topright = bw4.max(bh4) < 32
+      && bo.0.y > 0
+      && (bo.0.x as isize + bw4) < cols
+      && crate::partition::has_tr(bo, bsize);
+    // top row: check the first above-neighbour; only walk further if it is
+    // narrower than our block (the decoder's `aw4 < bw4` else-branch).
+    if bo.0.y > 0 {
+      let n0 = &self.bc.blocks[bo.with_offset(0, -1)];
+      if matches(n0) {
+        return true;
+      }
+      let aw4 = n0.n4_w as isize;
+      if aw4 >= bw4 {
+        let off = bo.0.x as isize & (aw4 - 1);
+        if off != 0 {
+          have_topleft = false;
+        }
+        if aw4 - off > bw4 {
+          have_topright = false;
+        }
+      } else {
+        let mut x = aw4;
+        while x < w4 {
+          let n = &self.bc.blocks[bo.with_offset(x, -1)];
+          if matches(n) {
+            return true;
+          }
+          x += n.n4_w as isize;
+        }
+      }
+    }
+    // left column, symmetric on height.
+    if bo.0.x > 0 {
+      let n0 = &self.bc.blocks[bo.with_offset(-1, 0)];
+      if matches(n0) {
+        return true;
+      }
+      let lh4 = n0.n4_h as isize;
+      if lh4 >= bh4 {
+        if bo.0.y as isize & (lh4 - 1) != 0 {
+          have_topleft = false;
+        }
+      } else {
+        let mut y = lh4;
+        while y < h4 {
+          let n = &self.bc.blocks[bo.with_offset(-1, y)];
+          if matches(n) {
+            return true;
+          }
+          y += n.n4_h as isize;
+        }
+      }
+    }
+    // top-left corner (decode.rs:428) — only when still a valid candidate.
+    if have_topleft && matches(&self.bc.blocks[bo.with_offset(-1, -1)]) {
+      return true;
+    }
+    // top-right corner (decode.rs:435) — block just past our top row, one row up.
+    if have_topright && matches(&self.bc.blocks[bo.with_offset(bw4, -1)]) {
+      return true;
+    }
+    false
+  }
+
+  // prom_av1e050/052: code the motion_mode symbol. When the block is
+  // warp-eligible (allow_warp) the decoder reads the 3-way motion_mode_cdf
+  // (SIMPLE/OBMC/LOCALWARP); otherwise the 2-way obmc_cdf. M1 never emits
+  // LOCALWARP (no warp prediction yet), so motion_mode ∈ {SIMPLE, OBMC}.
   pub fn write_motion_mode<W: Writer>(
     &mut self, w: &mut W, _bo: TileBlockOffset, bsize: BlockSize,
-    motion_mode: crate::predict::MotionMode,
+    motion_mode: crate::predict::MotionMode, allow_warp: bool,
   ) {
-    let is_obmc =
-      (motion_mode == crate::predict::MotionMode::OBMC_CAUSAL) as u32;
-    symbol_with_update!(self, w, is_obmc, &self.fc.obmc_cdf[bsize as usize]);
+    if allow_warp {
+      let sym = motion_mode as u32; // SIMPLE=0, OBMC=1, WARP=2
+      symbol_with_update!(
+        self,
+        w,
+        sym,
+        &self.fc.motion_mode_cdf[bsize as usize]
+      );
+    } else {
+      let is_obmc =
+        (motion_mode == crate::predict::MotionMode::OBMC_CAUSAL) as u32;
+      symbol_with_update!(self, w, is_obmc, &self.fc.obmc_cdf[bsize as usize]);
+    }
   }
 
   /// # Panics

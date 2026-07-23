@@ -807,6 +807,19 @@ pub fn obmc_mt() -> f64 {
   })
 }
 
+// prom_av1e052: WARP (local warped motion) — the OTHER motion_mode, the twin of
+// OBMC. M1 = signaling only (3-way motion_mode_cdf + find_matching_ref
+// eligibility, motion_mode FORCED to SIMPLE/OBMC — no warp prediction yet).
+// Default OFF (from-scratch bitstream feature, opt-in until conformant + M2/M3).
+static WARP: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn warp() -> bool {
+  *WARP.get_or_init(|| match std::env::var("RAV1E_WARP") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+
 // prom_av1e048c: extend the av1e045 per-frame filter trial from best-of-2
 // (REGULAR/SHARP) to best-of-3 (add SMOOTH). Clean win on SMOOTH-dominant
 // content, neutral elsewhere, zero syntax cost. Default ON (folds into fast).
