@@ -2643,8 +2643,13 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
           && fi.allow_warped_motion
           && cw.warp_allowed(tile_bo, bsize);
         // M2: RAV1E_WARP_FORCE selects LOCALWARP on every warp-eligible block
-        // (the decoder derives the same warpmv + warp-predicts, or falls back to
-        // regular MC when the model is degenerate — motion_compensate mirrors it).
+        // (the prediction A/B). M3 PRUNED for now: neither force-warp (+3-4% BD
+        // on motion clips — displaces OBMC on degenerate/translation blocks) nor
+        // a `warpmv.valid`-gated heuristic (+13% — the affine over-fits coherent
+        // translation, and the derive runs mid-RD-search on incomplete neighbour
+        // state) wins on this TRANSLATIONAL corpus. Warp's payoff is affine
+        // rotation/zoom motion (absent from Derf CIF); a prediction-quality RD
+        // selection is the path to a win — deferred. Kept opt-in.
         let mm = if crate::harvest::warp_force() && allow_warp {
           crate::predict::MotionMode::WARPED_CAUSAL
         } else if crate::harvest::obmc_force()
