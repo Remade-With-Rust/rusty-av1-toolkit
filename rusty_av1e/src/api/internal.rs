@@ -769,6 +769,14 @@ impl<T: Pixel> ContextInner<T> {
     // Compute the motion vectors.
     compute_motion_vectors(fi, fs, &self.inter_cfg);
 
+    // prom_av1e053 T3b: PRE-PASS WARP probe. These MVs are a SOURCE-domain
+    // field (rec_buffer above was filled from lookahead_rec_buffer, which holds
+    // original frame contents), and the lookahead runs ahead of the encode — so
+    // fitting a global affine here decides allow_warped_motion for the clip
+    // BEFORE frame 0 writes its header. Costs one least-squares solve over an
+    // already-computed field; no-op unless RAV1E_WARP_PRE=1.
+    crate::encoder::warp_prepass::probe(fi, fs);
+
     let coded_data = fi.coded_frame_data.as_mut().unwrap();
 
     #[cfg(feature = "dump_lookahead_data")]

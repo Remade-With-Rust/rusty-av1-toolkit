@@ -364,7 +364,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     } else {
       self.write_bit(seq.enable_interintra_compound)?;
       self.write_bit(seq.enable_masked_compound)?;
-      self.write_bit(seq.enable_warped_motion)?;
+      self.write_bit(seq.warp_seq_flag())?;
       self.write_bit(seq.enable_dual_filter)?;
       self.write_bit(seq.enable_order_hint)?;
 
@@ -796,10 +796,10 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write_bit(false)?; // skip_mode_present
     }
 
-    if fi.intra_only || fi.error_resilient || !fi.sequence.enable_warped_motion
+    if fi.intra_only || fi.error_resilient || !fi.sequence.warp_seq_flag()
     {
     } else {
-      self.write_bit(fi.allow_warped_motion)?; // allow_warped_motion
+      self.write_bit(fi.warp_header_flag())?; // allow_warped_motion
     }
 
     self.write_bit(fi.use_reduced_tx_set)?; // reduced tx

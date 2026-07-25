@@ -870,6 +870,44 @@ pub fn warp_shear_t() -> u64 {
   })
 }
 
+// prom_av1e053 T3b: PRE-PASS WARP dispatch. The T3 latch has to measure on the
+// first inter frame, so `allow_warped_motion` must already be committed in the
+// header by then (it is a per-clip constant — a dynamic 2-way↔3-way motion_mode
+// flip desyncs the CDF context), costing translational clips the ~+0.3% 3-way
+// signaling overhead for nothing. The pre-pass instead fits a GLOBAL affine to
+// rav1e's LOOKAHEAD motion field — computed on ORIGINAL frame contents before
+// any frame is encoded — so the flag is decided BEFORE frame 0 emits: off ⇒
+// byte-identical to warp-off (a clean zero), on ⇒ warp from the very first
+// inter frame (no measuring frame wasted). Requires RAV1E_WARP=1.
+static WARP_PRE: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn warp_prepass_on() -> bool {
+  *WARP_PRE.get_or_init(|| match std::env::var("RAV1E_WARP_PRE") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}
+static WARP_PRE_T: OnceLock<u64> = OnceLock::new();
+#[inline]
+pub fn warp_pre_t() -> u64 {
+  *WARP_PRE_T.get_or_init(|| {
+    // Shear floor: is the motion gradient big enough to be worth warping.
+    std::env::var("RAV1E_WARP_PRE_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600)
+  })
+}
+// Affine-explanatory gain floor, in 1/1000 (the linear part's R²). Shear alone
+// does not separate affine content from a pan over a scene with depth — that
+// parallax reads as a gradient too (bus 1226 vs a rotating clip's 2042). The
+// gain asks the decisive question instead: does an AFFINE model actually explain
+// this motion field, or is the gradient just the residue of unrelated motion?
+static WARP_PRE_GAIN_T: OnceLock<u64> = OnceLock::new();
+#[inline]
+pub fn warp_pre_gain_t() -> u64 {
+  *WARP_PRE_GAIN_T.get_or_init(|| {
+    std::env::var("RAV1E_WARP_PRE_GAIN_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
+  })
+}
+
 // prom_av1e048c: extend the av1e045 per-frame filter trial from best-of-2
 // (REGULAR/SHARP) to best-of-3 (add SMOOTH). Clean win on SMOOTH-dominant
 // content, neutral elsewhere, zero syntax cost. Default ON (folds into fast).

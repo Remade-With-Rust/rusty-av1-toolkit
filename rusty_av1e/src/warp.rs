@@ -289,6 +289,186 @@ pub fn solve_warp(
   wm
 }
 
+// --- prom_av1e053 T3b: PRE-PASS global shear estimate -------------------------
+
+/// One weighted least-squares affine solve over the kept samples. Coordinates
+/// are CENTERED on both sides so the translation term drops out of the normal
+/// equations — we only ever want the linear part (the shear), and centering also
+/// conditions the system (raw frame coordinates are large and nearly collinear).
+/// Returns `[a, b, d, e]` = the Jacobian rows (du/dx, du/dy, dv/dx, dv/dy).
+fn solve_affine_ls(
+  samples: &[(f32, f32, f32, f32)], keep: &[bool], min_n: usize,
+) -> Option<[f64; 4]> {
+  let (mut n, mut mx, mut my, mut mu, mut mv) = (0f64, 0f64, 0f64, 0f64, 0f64);
+  for (i, &(x, y, dx, dy)) in samples.iter().enumerate() {
+    if !keep[i] {
+      continue;
+    }
+    n += 1.0;
+    mx += x as f64;
+    my += y as f64;
+    mu += (x + dx) as f64;
+    mv += (y + dy) as f64;
+  }
+  if n < min_n as f64 {
+    return None;
+  }
+  mx /= n;
+  my /= n;
+  mu /= n;
+  mv /= n;
+  let (mut sxx, mut sxy, mut syy) = (0f64, 0f64, 0f64);
+  let (mut sxu, mut syu, mut sxv, mut syv) = (0f64, 0f64, 0f64, 0f64);
+  for (i, &(x, y, dx, dy)) in samples.iter().enumerate() {
+    if !keep[i] {
+      continue;
+    }
+    let (px, py) = (x as f64 - mx, y as f64 - my);
+    let (pu, pv) = ((x + dx) as f64 - mu, (y + dy) as f64 - mv);
+    sxx += px * px;
+    sxy += px * py;
+    syy += py * py;
+    sxu += px * pu;
+    syu += py * pu;
+    sxv += px * pv;
+    syv += py * pv;
+  }
+  let det = sxx * syy - sxy * sxy;
+  // Degenerate: all samples collinear (or a single row/column of blocks).
+  if det.abs() <= 1e-6 * (sxx * syy).abs().max(1.0) {
+    return None;
+  }
+  Some([
+    (syy * sxu - sxy * syu) / det,
+    (sxx * syu - sxy * sxu) / det,
+    (syy * sxv - sxy * syv) / det,
+    (sxx * syv - sxy * sxv) / det,
+  ])
+}
+
+/// prom_av1e053 T3b: fit ONE affine model to a source-domain MV field. Returns
+/// `(shear, gain)`:
+///
+/// * `shear` = max|alpha,beta,gamma,delta| in the same 1/65536 units as the
+///   per-block latch, so the two dispatch signals are directly comparable. It
+///   answers "is there a motion GRADIENT, and is it big enough to be worth
+///   warping?"
+/// * `gain` = how much of the field's motion variance the AFFINE terms explain
+///   over a pure TRANSLATION model (the linear part's R², in 1/1000). It answers
+///   the different and decisive question, "is the motion actually AFFINE?"
+///
+/// Both are needed, because shear alone does not predict warp's payoff: a camera
+/// PAN across a scene with depth produces a genuine motion gradient (parallax +
+/// object motion) that least-squares reports as shear — `bus` measured 1226
+/// against a rotating clip's 2042, far too narrow a margin to gate on. That
+/// gradient is not affine, so the fit explains little of the field and `gain`
+/// separates it cleanly where magnitude cannot.
+///
+/// `samples` are `(x, y, dx, dy)` in PIXELS: a block's centre and its motion
+/// displacement. The model therefore maps current-frame → reference-frame coords
+/// exactly as `matrix` does, and pure translation fits to the identity → shear 0.
+///
+/// Robustness beats precision here: plain least squares is dragged by foreground
+/// object motion, so the fit runs TWICE — the second pass drops samples whose
+/// residual exceeds twice the median, which keeps a rotating BACKGROUND from
+/// being averaged into a translation by a handful of moving objects. The matrix
+/// is clamped exactly as `find_affine_int`'s `get_mult_shift_{diag,ndiag}` clamp
+/// it, so a saturating global fit saturates identically to a per-block one.
+pub fn fit_global_shear(
+  samples: &[(f32, f32, f32, f32)],
+) -> Option<(u64, u32)> {
+  const MIN_SAMPLES: usize = 16;
+  if samples.len() < MIN_SAMPLES {
+    return None;
+  }
+  let mut keep = vec![true; samples.len()];
+  let m1 = solve_affine_ls(samples, &keep, MIN_SAMPLES)?;
+
+  // Residual trim (pass 2). Residuals are measured against pass 1's own model
+  // in centered coordinates, so the intercept cancels the same way it did there.
+  let (mut n, mut mx, mut my, mut mu, mut mv) = (0f64, 0f64, 0f64, 0f64, 0f64);
+  for &(x, y, dx, dy) in samples {
+    n += 1.0;
+    mx += x as f64;
+    my += y as f64;
+    mu += (x + dx) as f64;
+    mv += (y + dy) as f64;
+  }
+  mx /= n;
+  my /= n;
+  mu /= n;
+  mv /= n;
+  let resid: Vec<f64> = samples
+    .iter()
+    .map(|&(x, y, dx, dy)| {
+      let (px, py) = (x as f64 - mx, y as f64 - my);
+      let (pu, pv) = ((x + dx) as f64 - mu, (y + dy) as f64 - mv);
+      (pu - (m1[0] * px + m1[1] * py)).abs()
+        + (pv - (m1[2] * px + m1[3] * py)).abs()
+    })
+    .collect();
+  let mut sorted = resid.clone();
+  sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+  let med = sorted[sorted.len() / 2];
+  // Absolute floor: on a CLEAN fit the median residual is ~0, and a pure ratio
+  // test would then trim almost every sample as an "outlier".
+  let thr = (2.0 * med).max(1.0);
+  for (i, r) in resid.iter().enumerate() {
+    keep[i] = *r <= thr;
+  }
+  // Keep pass 1 if the trim left too little to solve (e.g. heavy uniform noise).
+  let m = solve_affine_ls(samples, &keep, MIN_SAMPLES).unwrap_or(m1);
+
+  let fp = |v: f64| -> i64 { (v * 65536.0).round() as i64 };
+  let diag = |v: f64| iclip(fp(v).clamp(-(1 << 30), 1 << 30) as i32, 0xe001, 0x11fff);
+  let ndiag =
+    |v: f64| iclip(fp(v).clamp(-(1 << 30), 1 << 30) as i32, -0x1fff, 0x1fff);
+  let mut wm = WarpedMotionParams {
+    matrix: [0, 0, diag(m[0]), ndiag(m[1]), ndiag(m[2]), diag(m[3])],
+    abcd: [0; 4],
+    valid: false,
+  };
+  // Fills abcd. The bool ("too sheared for a BLOCK to warp") is irrelevant to a
+  // frame-level magnitude estimate, so it is deliberately ignored.
+  let _ = get_shear_params(&mut wm);
+  let shear = (wm.alpha().unsigned_abs() as u64)
+    .max(wm.beta().unsigned_abs() as u64)
+    .max(wm.gamma().unsigned_abs() as u64)
+    .max(wm.delta().unsigned_abs() as u64);
+
+  // Model selection, over the WHOLE field — deliberately NOT the trimmed subset.
+  // The trim exists to ESTIMATE the model robustly; evaluating on the survivors
+  // would be circular (they are precisely the samples the model fits, which read
+  // ~1.000 for every clip, affine or not). The question here is how much of ALL
+  // the observed motion this one affine model accounts for. E_trans is the
+  // field's variance once the global translation is removed; E_affine is what
+  // the affine terms leave behind. `mx`/`my`/`mu`/`mv` are already the
+  // all-sample means computed for the trim above.
+  //
+  // The translation baseline predicts the IDENTITY linear part (dst = src + t),
+  // so its residual is each block's MV deviation from the mean MV — NOT the
+  // centered destination, which is dominated by the ±176px position spread and
+  // pins R² at ~1.000 for every clip regardless of content.
+  let (mut e_trans, mut e_affine) = (0f64, 0f64);
+  for &(x, y, dx, dy) in samples {
+    let (px, py) = (x as f64 - mx, y as f64 - my);
+    let (pu, pv) = ((x + dx) as f64 - mu, (y + dy) as f64 - mv);
+    let (ddx, ddy) = (pu - px, pv - py);
+    e_trans += ddx * ddx + ddy * ddy;
+    let ru = pu - (m[0] * px + m[1] * py);
+    let rv = pv - (m[2] * px + m[3] * py);
+    e_affine += ru * ru + rv * rv;
+  }
+  // A field with no residual motion at all (every block moved identically) has
+  // nothing for the affine terms to explain — and nothing to warp.
+  let gain = if e_trans <= 1e-9 {
+    0.0
+  } else {
+    (1.0 - e_affine / e_trans).clamp(0.0, 1.0)
+  };
+  Some((shear, (gain * 1000.0) as u32))
+}
+
 /// dav1d warp_affine block loop + warp_affine_8x8 kernel (fused). Predicts a
 /// warped block into `dst` from `ref_plane`, reading pixels with explicit edge
 /// clamp (== dav1d emu_edge). Coordinates: `bx_luma`/`by_luma` = block top-left
@@ -365,5 +545,104 @@ pub fn predict_warp<T: Pixel>(
       bx += 8;
     }
     by += 8;
+  }
+}
+
+#[cfg(test)]
+mod prepass_tests {
+  use super::*;
+
+  /// Build an MV field over a 352x288 (CIF) grid from a known affine model:
+  /// the reference position of a block centred at (x, y) is `M*(x,y) + t`.
+  fn field(
+    a: f64, b: f64, d: f64, e: f64, tx: f64, ty: f64,
+  ) -> Vec<(f32, f32, f32, f32)> {
+    let mut v = Vec::new();
+    let (cx, cy) = (176.0, 144.0);
+    let mut y = 8.0;
+    while y < 288.0 {
+      let mut x = 8.0;
+      while x < 352.0 {
+        // Rotate/scale about the frame centre so the fit sees the linear part
+        // regardless of where the origin sits.
+        let (px, py) = (x - cx, y - cy);
+        let ux = a * px + b * py + cx + tx;
+        let uy = d * px + e * py + cy + ty;
+        v.push((x as f32, y as f32, (ux - x) as f32, (uy - y) as f32));
+        x += 16.0;
+      }
+      y += 16.0;
+    }
+    v
+  }
+
+  #[test]
+  fn pure_translation_has_zero_shear() {
+    // The whole point of the gate: a pan — however fast — must read exactly 0.
+    for (tx, ty) in [(0.0, 0.0), (3.0, 0.0), (-7.0, 11.0), (24.0, -19.0)] {
+      let (s, _) = fit_global_shear(&field(1.0, 0.0, 0.0, 1.0, tx, ty)).unwrap();
+      assert_eq!(s, 0, "translation ({tx},{ty}) must have zero shear");
+    }
+  }
+
+  #[test]
+  fn rotation_recovers_expected_shear() {
+    // 3 degrees: beta = -65536*sin(3 deg) = -3430 -> rounded to a multiple of 64.
+    let th: f64 = 3.0_f64.to_radians();
+    let (c, s) = (th.cos(), th.sin());
+    let (got, gain) = fit_global_shear(&field(c, -s, s, c, 0.0, 0.0)).unwrap();
+    let want = (65536.0 * s) as u64; // ~3430
+    // A pure rotation IS affine, so the model explains essentially all of it.
+    assert!(gain > 950, "clean rotation should be near-fully explained, got {gain}");
+    assert!(
+      got.abs_diff(want) <= 128,
+      "rotation shear {got} not within a rounding step of {want}"
+    );
+  }
+
+  #[test]
+  fn zoom_recovers_expected_shear() {
+    // 5% zoom: alpha = 65536*0.05 = 3277.
+    let (got, gain) = fit_global_shear(&field(1.05, 0.0, 0.0, 1.05, 0.0, 0.0)).unwrap();
+    assert!(gain > 950, "clean zoom should be near-fully explained, got {gain}");
+    assert!(
+      got.abs_diff(3277) <= 128,
+      "zoom shear {got} not within a rounding step of 3277"
+    );
+  }
+
+  #[test]
+  fn foreground_outliers_do_not_hide_a_rotating_background() {
+    // The robustness claim: a quarter of the field carries unrelated object
+    // motion, and the trimmed refit must still report the background rotation.
+    let th: f64 = 3.0_f64.to_radians();
+    let (c, s) = (th.cos(), th.sin());
+    let mut f = field(c, -s, s, c, 0.0, 0.0);
+    let mut lcg: u32 = 12345;
+    let n = f.len();
+    for i in 0..n / 4 {
+      lcg = lcg.wrapping_mul(1103515245).wrapping_add(12345);
+      let jx = ((lcg >> 16) % 32) as f32 - 16.0;
+      lcg = lcg.wrapping_mul(1103515245).wrapping_add(12345);
+      let jy = ((lcg >> 16) % 32) as f32 - 16.0;
+      f[i * 4].2 = jx;
+      f[i * 4].3 = jy;
+    }
+    let (got, _) = fit_global_shear(&f).unwrap();
+    let want = (65536.0 * s) as u64;
+    assert!(
+      got.abs_diff(want) <= 384,
+      "outlier-contaminated rotation shear {got} strayed from {want}"
+    );
+  }
+
+  #[test]
+  fn degenerate_inputs_return_none() {
+    assert!(fit_global_shear(&[]).is_none());
+    assert!(fit_global_shear(&[(0.0, 0.0, 1.0, 1.0); 4]).is_none());
+    // All samples on one horizontal line: the system has no y information.
+    let collinear: Vec<_> =
+      (0..40).map(|i| (i as f32 * 8.0, 16.0, 1.0, 0.0)).collect();
+    assert!(fit_global_shear(&collinear).is_none());
   }
 }

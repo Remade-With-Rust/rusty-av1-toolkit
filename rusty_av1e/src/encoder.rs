@@ -199,6 +199,22 @@ pub struct Sequence {
 }
 
 impl Sequence {
+  /// prom_av1e053 T3b: the SEQUENCE-level warp capability as actually written.
+  /// `enable_warped_motion` is the configured capability; the pre-pass verdict
+  /// decides whether this clip advertises it at all. Both matter for a clean
+  /// zero: the sequence bit itself costs a bit, and advertising the capability
+  /// makes EVERY inter frame header emit an `allow_warped_motion` bit. Gating
+  /// only the frame-level flag therefore still perturbs the bitstream — the
+  /// sequence flag has to follow the same verdict.
+  ///
+  /// Reading the latch here is safe because the sequence header is written
+  /// during encoding, by which point the lookahead probes have run; the raw
+  /// field (not this accessor) is what `FrameInvariants::new` copies at setup.
+  #[inline]
+  pub fn warp_seq_flag(&self) -> bool {
+    self.enable_warped_motion && crate::encoder::warp_prepass::allowed()
+  }
+
   /// # Panics
   ///
   /// Panics if the resulting tile sizes would be too large.
@@ -1136,6 +1152,17 @@ impl<T: Pixel> FrameInvariants<T> {
 
   pub fn is_show_existing_frame(&self) -> bool {
     self.coded_frame_data.is_none()
+  }
+
+  /// prom_av1e053 T3b: the per-clip `allow_warped_motion` header flag — the
+  /// sequence capability AND the pre-pass verdict. Single accessor on purpose:
+  /// the header bit and the two block-level eligibility checks MUST agree, and
+  /// the value must be constant for the whole clip (a per-frame 2-way↔3-way
+  /// motion_mode flip desyncs the CDF context). `warp_prepass::allowed()`
+  /// latches on its first read, which is this call on frame 0's header.
+  #[inline]
+  pub fn warp_header_flag(&self) -> bool {
+    self.allow_warped_motion && crate::encoder::warp_prepass::allowed()
   }
 
   pub fn clone_without_coded_data(&self) -> Self {
@@ -2092,7 +2119,7 @@ pub fn motion_compensate<T: Pixel>(
     && !luma_mode.is_compound()
     && crate::encoder::obmc_frame::on()
     && cw.obmc_allowed(tile_bo, bsize)
-    && fi.allow_warped_motion
+    && fi.warp_header_flag()
     && cw.warp_allowed(tile_bo, bsize)
     && (crate::harvest::warp_force()
       || crate::encoder::warp_frame::enabled()
@@ -2644,7 +2671,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         // gate's ~+0.3% M1 overhead on non-affine clips is the price of keeping
         // the flag stable — acceptable for an opt-in feature (−19% on affine).
         let allow_warp = crate::harvest::warp()
-          && fi.allow_warped_motion
+          && fi.warp_header_flag()
           && cw.warp_allowed(tile_bo, bsize);
         // M2: RAV1E_WARP_FORCE selects LOCALWARP on every warp-eligible block
         // (the prediction A/B). M3 PRUNED for now: neither force-warp (+3-4% BD
@@ -3843,19 +3870,28 @@ pub(crate) mod warp_frame {
   pub fn gate_on() -> bool {
     crate::harvest::warp() && crate::harvest::warp_gate()
   }
-  /// Accumulate on the first inter frame only (before the latch).
+  /// Accumulate on the first inter frame only (before the latch). The PRE-PASS
+  /// supersedes this in-encoder measurement entirely.
   #[inline]
   pub fn measuring() -> bool {
-    gate_on() && !DECIDED.load(Relaxed)
+    gate_on()
+      && !crate::harvest::warp_prepass_on()
+      && !DECIDED.load(Relaxed)
   }
   #[inline]
   pub fn add_shear(s: u64) {
     SHEAR_SUM.fetch_add(s, Relaxed);
     SHEAR_N.fetch_add(1, Relaxed);
   }
-  /// Force-warp verdict for the rest of the clip.
+  /// Force-warp verdict for the rest of the clip. Under the T3b PRE-PASS the
+  /// verdict is already known before frame 0 emits, so warp engages from the
+  /// FIRST inter frame — no measuring frame is spent coding it warp-less.
   #[inline]
   pub fn enabled() -> bool {
+    if crate::harvest::warp_prepass_on() {
+      return crate::harvest::warp()
+        && crate::encoder::warp_prepass::allowed();
+    }
     gate_on() && DECIDED.load(Relaxed) && ENABLE.load(Relaxed)
   }
   /// After the first inter frame, latch: mean shear > floor ⇒ affine content.
@@ -3870,6 +3906,142 @@ pub(crate) mod warp_frame {
         if std::env::var("RAV1E_WARP_GATE_DBG").is_ok() {
           eprintln!("WARP_SHEAR mean={} n={} enable={}", mean, n, mean > crate::harvest::warp_shear_t());
         }
+      }
+    }
+  }
+}
+
+// prom_av1e053 T3b: the PRE-PASS WARP decision — the T3 latch moved AHEAD of the
+// bitstream. `allow_warped_motion` is a per-clip constant (flipping it mid-clip
+// desyncs the motion_mode CDF context), so the T3 latch, which can only measure
+// once the first inter frame is being coded, had to leave the flag ON for every
+// clip and eat ~+0.3% of 3-way signaling on translational content. Here the
+// verdict comes from rav1e's LOOKAHEAD motion field instead: it is computed on
+// the ORIGINAL frame contents (see compute_lookahead_motion_vectors — the
+// lookahead rec buffer holds source frames), so a global affine fit over it is a
+// pure SOURCE-domain measurement available before frame 0 writes its header.
+//
+// Off ⇒ the flag is never set ⇒ output byte-identical to warp-off (a clean zero
+// on translational clips). On ⇒ warp engages from the first inter frame.
+pub(crate) mod warp_prepass {
+  use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+  // Accumulated global shear + affine-explanatory gain over probed frames.
+  static SHEAR_SUM: AtomicU64 = AtomicU64::new(0);
+  static GAIN_SUM: AtomicU64 = AtomicU64::new(0);
+  static SHEAR_N: AtomicU64 = AtomicU64::new(0);
+  // 0 = open (still accepting probes), 1 = LOCKED OFF, 2 = LOCKED ON.
+  static STATE: AtomicU8 = AtomicU8::new(0);
+
+  #[inline]
+  pub fn gate_on() -> bool {
+    crate::harvest::warp() && crate::harvest::warp_prepass_on()
+  }
+
+  /// Still accepting probe frames — nothing has consumed the verdict yet.
+  #[inline]
+  pub fn open() -> bool {
+    gate_on() && STATE.load(Relaxed) == 0
+  }
+
+  #[inline]
+  pub fn add_shear(s: u64, gain: u32) {
+    SHEAR_SUM.fetch_add(s, Relaxed);
+    GAIN_SUM.fetch_add(gain as u64, Relaxed);
+    SHEAR_N.fetch_add(1, Relaxed);
+  }
+
+  /// The per-clip verdict, LATCHED on first read. Every frame header and every
+  /// block therefore sees one value for the whole clip, which is exactly what
+  /// keeps the motion_mode CDF context stable. Reading it before any probe
+  /// landed (a lookahead too short to reach an inter frame) locks OFF — the
+  /// no-regression default.
+  pub fn allowed() -> bool {
+    if !gate_on() {
+      return true; // gate off ⇒ caller's own flag stands, unchanged
+    }
+    let mut st = STATE.load(Relaxed);
+    if st == 0 {
+      let n = SHEAR_N.load(Relaxed);
+      let mean = if n > 0 { SHEAR_SUM.load(Relaxed) / n } else { 0 };
+      let gain = if n > 0 { GAIN_SUM.load(Relaxed) / n } else { 0 };
+      // BOTH must clear: the shear says the warp is worth signalling, the gain
+      // says the motion really is affine (a pan over a scene with depth shows
+      // shear without being affine — see fit_global_shear).
+      let on = n > 0
+        && mean > crate::harvest::warp_pre_t()
+        && gain > crate::harvest::warp_pre_gain_t();
+      let want = if on { 2 } else { 1 };
+      st = match STATE.compare_exchange(0, want, Relaxed, Relaxed) {
+        Ok(_) => want,
+        Err(prev) => prev,
+      };
+      if std::env::var("RAV1E_WARP_PRE_DBG").is_ok() {
+        eprintln!(
+          "WARP_PRE mean={} gain={} n={} enable={}",
+          mean,
+          gain,
+          n,
+          st == 2
+        );
+      }
+    }
+    st == 2
+  }
+
+  /// Fit a global affine to one lookahead frame's motion field and accumulate
+  /// its shear. Samples the field on a coarse grid (this is a frame-level
+  /// classifier, not a per-block model) and skips cells whose ME found nothing.
+  pub fn probe<T: crate::util::Pixel>(
+    fi: &crate::encoder::FrameInvariants<T>, fs: &crate::encoder::FrameState<T>,
+  ) {
+    if !open() {
+      return;
+    }
+    let stats = match fs.frame_me_stats.try_read() {
+      Ok(s) => s,
+      Err(_) => return,
+    };
+    let me = &stats[0];
+    if me.rows == 0 || me.cols == 0 {
+      return;
+    }
+    // MV units are 1/8 pel and the ME grid is in 4x4 mi units, so cell (r, c)
+    // covers the pixel block at (c*4, r*4) — sample its centre on the same 8x8
+    // stride the lookahead's own importance pass uses.
+    //
+    // EVERY cell is a sample, including zero-MV ones: "this block did not move"
+    // is a measurement that constrains the model toward the identity, and it is
+    // the majority measurement on static content. Filtering to non-zero MVs
+    // instead selects precisely the ME noise on a static clip — akiyo then fit a
+    // spurious shear of 933 off 12 stray vectors, well above a rotating scene's
+    // floor. The trimmed refit is what rejects genuine outliers; sample
+    // selection must stay unbiased.
+    let mut samples: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut r = 1;
+    while r < me.rows {
+      let mut c = 1;
+      while c < me.cols {
+        let mv = me[r][c].mv;
+        samples.push((
+          (c * 4 + 2) as f32,
+          (r * 4 + 2) as f32,
+          mv.col as f32 / 8.0,
+          mv.row as f32 / 8.0,
+        ));
+        c += 2;
+      }
+      r += 2;
+    }
+    if let Some((s, gain)) = crate::warp::fit_global_shear(&samples) {
+      add_shear(s, gain);
+      if std::env::var("RAV1E_WARP_PRE_DBG").is_ok() {
+        eprintln!(
+          "WARP_PRE_PROBE frame={} shear={} gain={} samples={}",
+          fi.input_frameno,
+          s,
+          gain,
+          samples.len()
+        );
       }
     }
   }
