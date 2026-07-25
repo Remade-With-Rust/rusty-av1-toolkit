@@ -399,3 +399,114 @@ mod noop {
   #[inline(always)]
   pub fn dump(_label: &str) {}
 }
+
+// --- prom_av1e054 Phase 1: the BIT ACCOUNTANT ------------------------------
+//
+// Where do the BITS go, as opposed to the time? The stage profiler answers
+// "which code is slow"; this answers "which syntax is expensive", which is the
+// question a compression deficit actually poses. Gated on RAV1E_BITACCT so the
+// default path is untouched — it only reads the writer's position, never
+// changes what is written.
+//
+// Accounting is at the FINAL emit only (trial/counting writers are excluded by
+// the caller), and every site instrumented is a LEAF, so nothing double-counts:
+// write_tx_tree is a container and is deliberately NOT bracketed — its
+// coefficient cost is captured inside write_coeffs_lv_map.
+pub mod bitacct {
+  use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+  #[derive(Clone, Copy)]
+  pub enum Class {
+    Coeff = 0,
+    Mv = 1,
+    InterMode = 2,
+    IntraMode = 3,
+    Partition = 4,
+    TxSize = 5,
+    MotionMode = 6,
+    Interp = 7,
+    Skip = 8,
+    Other = 9,
+  }
+  pub const NAMES: [&str; 10] = [
+    "coefficients", "motion vectors", "inter mode", "intra mode", "partition",
+    "tx size/type", "motion_mode", "interp filter", "skip", "other",
+  ];
+  // Accumulated in EIGHTHS of a bit (tell_frac units).
+  pub static BITS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+  #[inline]
+  pub fn on() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("RAV1E_BITACCT").is_ok())
+  }
+  #[inline]
+  pub fn add(c: Class, eighths: u64) {
+    BITS[c as usize].fetch_add(eighths, Relaxed);
+  }
+  /// Counters as of now (stored in a Writer checkpoint).
+  #[inline]
+  pub fn snapshot() -> [u64; 10] {
+    let mut o = [0u64; 10];
+    for (i, b) in BITS.iter().enumerate() {
+      o[i] = b.load(Relaxed);
+    }
+    o
+  }
+  /// Unwind counters to a checkpoint — called when a trial is rolled back.
+  #[inline]
+  pub fn restore(s: &[u64; 10]) {
+    for (i, b) in BITS.iter().enumerate() {
+      b.store(s[i], Relaxed);
+    }
+  }
+  pub fn reset() {
+    for b in BITS.iter() {
+      b.store(0, Relaxed);
+    }
+  }
+  /// One line per syntax class: bits, and share of the accounted total.
+  pub fn dump(tag: &str) {
+    if !on() {
+      return;
+    }
+    let v: Vec<u64> = BITS.iter().map(|b| b.load(Relaxed)).collect();
+    let tot: u64 = v.iter().sum();
+    if tot == 0 {
+      return;
+    }
+    eprintln!("BITACCT {tag} — accounted {:.0} bits", tot as f64 / 8.0);
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_by_key(|&i| std::cmp::Reverse(v[i]));
+    for i in idx {
+      if v[i] == 0 {
+        continue;
+      }
+      eprintln!(
+        "BITACCT   {:<16} {:>12.0} bits  {:>6.2}%",
+        NAMES[i],
+        v[i] as f64 / 8.0,
+        v[i] as f64 / tot as f64 * 100.0
+      );
+    }
+  }
+}
+
+/// Bracket one syntax write and attribute its cost. No-op unless RAV1E_BITACCT.
+#[macro_export]
+macro_rules! acct {
+  ($w:expr, $class:expr, $body:expr) => {{
+    if cfg!(feature = "bitacct")
+      && $crate::prof::bitacct::on()
+      && !W::COUNTS_ONLY
+    {
+      let before = $w.tell_frac() as u64;
+      let r = $body;
+      let after = $w.tell_frac() as u64;
+      $crate::prof::bitacct::add($class, after.saturating_sub(before));
+      r
+    } else {
+      $body
+    }
+  }};
+}

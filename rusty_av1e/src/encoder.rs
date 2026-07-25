@@ -18,6 +18,7 @@ use arrayvec::*;
 use bitstream_io::{BigEndian, BitWrite, BitWriter};
 use rayon::iter::*;
 
+use crate::acct;
 use crate::activity::*;
 use crate::api::*;
 use crate::cdef::*;
@@ -1879,7 +1880,7 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
       (((fi.h_in_b - frame_bo.0.y) << MI_SIZE_LOG2) >> ydec)
         .min(tx_size.height());
 
-    cw.write_coeffs_lv_map(
+    acct!(w, crate::prof::bitacct::Class::Coeff, cw.write_coeffs_lv_map(
       w,
       p,
       tx_bo,
@@ -1894,7 +1895,7 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
       fi.use_reduced_tx_set,
       frame_clipped_txw,
       frame_clipped_txh,
-    )
+    ))
   } else {
     true
   };
@@ -2404,7 +2405,7 @@ pub fn encode_block_pre_cdef<T: Pixel, W: Writer>(
       ts.segmentation.last_active_segid,
     );
   }
-  cw.write_skip(w, tile_bo, skip);
+  acct!(w, crate::prof::bitacct::Class::Skip, cw.write_skip(w, tile_bo, skip));
   if ts.segmentation.enabled
     && ts.segmentation.update_map
     && !ts.segmentation.preskip
@@ -2559,15 +2560,15 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   cw.bc.code_deltas = false;
 
   if fi.frame_type.has_inter() {
-    cw.write_is_inter(w, tile_bo, is_inter);
+    acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_is_inter(w, tile_bo, is_inter));
     if is_inter {
       cw.fill_neighbours_ref_counts(tile_bo);
-      cw.write_ref_frames(w, fi, tile_bo);
+      acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_ref_frames(w, fi, tile_bo));
 
       if luma_mode.is_compound() {
-        cw.write_compound_mode(w, luma_mode, mode_context);
+        acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_compound_mode(w, luma_mode, mode_context));
       } else {
-        cw.write_inter_mode(w, luma_mode, mode_context);
+        acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_inter_mode(w, luma_mode, mode_context));
       }
 
       let ref_mv_idx = 0;
@@ -2610,12 +2611,12 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         || luma_mode == PredictionMode::NEW_NEWMV
         || luma_mode == PredictionMode::NEW_NEARESTMV
       {
-        cw.write_mv(w, mvs[0], ref_mvs[0], mv_precision);
+        acct!(w, crate::prof::bitacct::Class::Mv, cw.write_mv(w, mvs[0], ref_mvs[0], mv_precision));
       }
       if luma_mode == PredictionMode::NEW_NEWMV
         || luma_mode == PredictionMode::NEAREST_NEWMV
       {
-        cw.write_mv(w, mvs[1], ref_mvs[1], mv_precision);
+        acct!(w, crate::prof::bitacct::Class::Mv, cw.write_mv(w, mvs[1], ref_mvs[1], mv_precision));
       }
 
       if luma_mode.has_nearmv() {
@@ -2715,7 +2716,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         } else {
           cw.bc.blocks[tile_bo].motion_mode
         };
-        cw.write_motion_mode(w, tile_bo, bsize, mm, allow_warp);
+        acct!(w, crate::prof::bitacct::Class::MotionMode, cw.write_motion_mode(w, tile_bo, bsize, mm, allow_warp));
         if !W::COUNTS_ONLY {
           cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);
         }
@@ -2763,10 +2764,10 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
         }
       }
     } else {
-      cw.write_intra_mode(w, bsize, luma_mode);
+      acct!(w, crate::prof::bitacct::Class::IntraMode, cw.write_intra_mode(w, bsize, luma_mode));
     }
   } else {
-    cw.write_intra_mode_kf(w, tile_bo, luma_mode);
+    acct!(w, crate::prof::bitacct::Class::IntraMode, cw.write_intra_mode_kf(w, tile_bo, luma_mode));
   }
 
   if !is_inter {
@@ -2774,7 +2775,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
       cw.write_angle_delta(w, angle_delta.y, luma_mode);
     }
     if has_chroma(tile_bo, bsize, xdec, ydec, fi.sequence.chroma_sampling) {
-      cw.write_intra_uv_mode(w, chroma_mode, luma_mode, bsize);
+      acct!(w, crate::prof::bitacct::Class::IntraMode, cw.write_intra_uv_mode(w, chroma_mode, luma_mode, bsize));
       if chroma_mode.is_cfl() {
         assert!(bsize.cfl_allowed());
         cw.write_cfl_alphas(w, cfl);
@@ -3416,7 +3417,7 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
     let cost = if bsize >= BlockSize::BLOCK_8X8 && is_square {
       let w: &mut W = if cw.bc.cdef_coded { w_post_cdef } else { w_pre_cdef };
       let tell = w.tell_frac();
-      cw.write_partition(w, tile_bo, PartitionType::PARTITION_NONE, bsize);
+      acct!(w, crate::prof::bitacct::Class::Partition, cw.write_partition(w, tile_bo, PartitionType::PARTITION_NONE, bsize));
       compute_rd_cost(fi, w.tell_frac() - tell, ScaledDistortion::zero())
     } else {
       0.0
@@ -3509,7 +3510,7 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
         let w: &mut W =
           if cw.bc.cdef_coded { w_post_cdef } else { w_pre_cdef };
         let tell = w.tell_frac();
-        cw.write_partition(w, tile_bo, partition, bsize);
+        acct!(w, crate::prof::bitacct::Class::Partition, cw.write_partition(w, tile_bo, partition, bsize));
         rd_cost =
           compute_rd_cost(fi, w.tell_frac() - tell, ScaledDistortion::zero());
       }
@@ -3590,7 +3591,7 @@ fn encode_partition_bottomup<T: Pixel, W: Writer>(
       if bsize >= BlockSize::BLOCK_8X8 {
         let w: &mut W =
           if cw.bc.cdef_coded { w_post_cdef } else { w_pre_cdef };
-        cw.write_partition(w, tile_bo, best_partition, bsize);
+        acct!(w, crate::prof::bitacct::Class::Partition, cw.write_partition(w, tile_bo, best_partition, bsize));
       }
       for mode in rdo_output.part_modes.clone() {
         assert!(subsize == mode.bsize);
@@ -4629,7 +4630,7 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
 
   if bsize >= BlockSize::BLOCK_8X8 && is_square {
     let w: &mut W = if cw.bc.cdef_coded { w_post_cdef } else { w_pre_cdef };
-    cw.write_partition(w, tile_bo, partition, bsize);
+    acct!(w, crate::prof::bitacct::Class::Partition, cw.write_partition(w, tile_bo, partition, bsize));
   }
 
   match partition {

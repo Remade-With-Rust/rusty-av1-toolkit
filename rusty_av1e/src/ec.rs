@@ -37,6 +37,9 @@ type ec_window = u32;
 pub trait Writer {
   /// See `StorageBackend::COUNTS_ONLY` — true only for counting writers.
   const COUNTS_ONLY: bool = false;
+  /// True only for the writer that emits the FINAL bitstream (see
+  /// `CountsOnly::EMITS`) — the gate bit accounting must use.
+  const EMITS: bool = false;
   /// Write a symbol `s`, using the passed in cdf reference; leaves `cdf` unchanged
   fn symbol<const CDF_LEN: usize>(&mut self, s: u32, cdf: &[u16; CDF_LEN]);
   /// return approximate number of fractional bits in `OD_BITRES`
@@ -110,12 +113,20 @@ pub trait Writer {
 /// VALUES matter (Encoder writes them, Recorder replays them).
 pub trait CountsOnly {
   const COUNTS_ONLY: bool = false;
+  /// prom_av1e054: true ONLY for the writer that emits the final bitstream.
+  /// `COUNTS_ONLY` cannot serve this purpose — it is false for the Recorder
+  /// too, and the partition search drives Recorders for its trial candidates,
+  /// so bit accounting keyed on `!COUNTS_ONLY` sums every rolled-back trial
+  /// along with the real emit (measured 4x the actual file size).
+  const EMITS: bool = false;
 }
 impl CountsOnly for WriterBase<WriterCounter> {
   const COUNTS_ONLY: bool = true;
 }
 impl CountsOnly for WriterBase<WriterRecorder> {}
-impl CountsOnly for WriterBase<WriterEncoder> {}
+impl CountsOnly for WriterBase<WriterEncoder> {
+  const EMITS: bool = true;
+}
 
 pub trait StorageBackend {
   /// Store partially-computed range code into given storage backend
@@ -168,6 +179,12 @@ pub struct WriterEncoder {
 
 #[derive(Clone)]
 pub struct WriterCheckpoint {
+  /// prom_av1e054: per-syntax bit counters at checkpoint time. The partition
+  /// search writes trial candidates into a Recorder and rolls back the losers,
+  /// so accounting must unwind with them or it sums every abandoned trial
+  /// (measured 4x the real stream).
+  #[cfg(feature = "bitacct")]
+  pub ba: [u64; 10],
   /// Stream length coded/recorded to date, in the unit used by the Writer,
   /// which may be bytes or bits. This depends on the assumption
   /// that a Writer will only ever restore its own Checkpoint.
@@ -230,6 +247,8 @@ impl StorageBackend for WriterBase<WriterCounter> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.bits,
       backend_var: 0,
       rng: self.rng,
@@ -240,6 +259,8 @@ impl StorageBackend for WriterBase<WriterCounter> {
   }
   #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.s.bits = checkpoint.stream_size;
   }
@@ -277,6 +298,8 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.bits,
       backend_var: self.s.storage.len(),
       rng: self.rng,
@@ -285,6 +308,8 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   }
   #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
     self.s.bits = checkpoint.stream_size;
@@ -328,6 +353,8 @@ impl StorageBackend for WriterBase<WriterEncoder> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.precarry.len(),
       backend_var: self.s.low as usize,
       rng: self.rng,
@@ -335,6 +362,8 @@ impl StorageBackend for WriterBase<WriterEncoder> {
     }
   }
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
     self.s.low = checkpoint.backend_var as ec_window;
@@ -515,6 +544,7 @@ where
   WriterBase<S>: StorageBackend + CountsOnly,
 {
   const COUNTS_ONLY: bool = <WriterBase<S> as CountsOnly>::COUNTS_ONLY;
+  const EMITS: bool = <WriterBase<S> as CountsOnly>::EMITS;
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
   /// `f`: The probability that the val is one, scaled by 32768.
