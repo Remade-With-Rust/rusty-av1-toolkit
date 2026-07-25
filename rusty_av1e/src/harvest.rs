@@ -826,14 +826,25 @@ pub fn obmc_mt() -> f64 {
 
 // prom_av1e052: WARP (local warped motion) — the OTHER motion_mode, the twin of
 // OBMC. M1 = signaling only (3-way motion_mode_cdf + find_matching_ref
-// eligibility, motion_mode FORCED to SIMPLE/OBMC — no warp prediction yet).
-// Default OFF (from-scratch bitstream feature, opt-in until conformant + M2/M3).
+// eligibility), M2 = the affine prediction (bit-exact vs dav1d).
+// prom_av1e053 T3b: DEFAULT ON at the Fast rung. Warp is only ever applied when
+// the pre-pass shear gate fires, and that gate is calibrated against per-clip
+// forced-warp ground truth over 18 clips: every firing clip is a real BD win,
+// and every non-firing clip is BYTE-IDENTICAL to warp-off. So the default costs
+// nothing where it does not help and pays -1.5%..-21.3% where it does.
+//
+// It rides the SAME rung as OBMC because it structurally depends on it: a warp
+// block is selected through the motion_mode symbol, which is only coded when
+// `obmc_frame::on()`. Below Fast the gate could still fire and set the header
+// flag, spending a bit per inter frame on a tool that can never engage —
+// measured as a same-size-but-different bitstream at stock/clean/turbo.
+// RAV1E_WARP=1/0 overrides in either direction.
 static WARP: OnceLock<bool> = OnceLock::new();
 #[inline]
 pub fn warp() -> bool {
   *WARP.get_or_init(|| match std::env::var("RAV1E_WARP") {
     Ok(v) => v.trim() == "1",
-    Err(_) => false,
+    Err(_) => fast_tier() >= FastTier::Fast,
   })
 }
 
@@ -878,33 +889,46 @@ pub fn warp_shear_t() -> u64 {
 // rav1e's LOOKAHEAD motion field — computed on ORIGINAL frame contents before
 // any frame is encoded — so the flag is decided BEFORE frame 0 emits: off ⇒
 // byte-identical to warp-off (a clean zero), on ⇒ warp from the very first
-// inter frame (no measuring frame wasted). Requires RAV1E_WARP=1.
+// inter frame (no measuring frame wasted).
+// DEFAULT ON — it is what makes warp safe to enable by default, and it strictly
+// dominates the T3 in-encoder latch (RAV1E_WARP_GATE): better BD on affine
+// content (no measuring frame) and an exact zero elsewhere (the flag never
+// enters the bitstream). RAV1E_WARP_PRE=0 falls back to the T3 latch behaviour.
 static WARP_PRE: OnceLock<bool> = OnceLock::new();
 #[inline]
 pub fn warp_prepass_on() -> bool {
   *WARP_PRE.get_or_init(|| match std::env::var("RAV1E_WARP_PRE") {
-    Ok(v) => v.trim() == "1",
-    Err(_) => false,
+    Ok(v) => v.trim() != "0",
+    Err(_) => true,
   })
 }
+// Shear floor — the ONE gate term. Calibrated against per-clip FORCED-warp
+// ground truth over 18 clips (8 Derf + 8 synthesized affine/boundary + rot/zoom):
+//   winners  shear 1200..6982  (BD -1.5% .. -21.3%)   min winner 1200
+//   losers   shear    8.. 976  (BD +0.02% .. +4.6%)   max loser   976
+// A single floor between them classifies all 18 correctly; 1100 sits mid-gap.
 static WARP_PRE_T: OnceLock<u64> = OnceLock::new();
 #[inline]
 pub fn warp_pre_t() -> u64 {
   *WARP_PRE_T.get_or_init(|| {
-    // Shear floor: is the motion gradient big enough to be worth warping.
-    std::env::var("RAV1E_WARP_PRE_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(600)
+    std::env::var("RAV1E_WARP_PRE_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1100)
   })
 }
-// Affine-explanatory gain floor, in 1/1000 (the linear part's R²). Shear alone
-// does not separate affine content from a pan over a scene with depth — that
-// parallax reads as a gradient too (bus 1226 vs a rotating clip's 2042). The
-// gain asks the decisive question instead: does an AFFINE model actually explain
-// this motion field, or is the gradient just the residue of unrelated motion?
+// The affine-explanatory gain (linear-part R²) is COMPUTED and reported under
+// RAV1E_WARP_PRE_DBG, but deliberately does NOT gate. It was added on the
+// premise that `bus` — a pan whose depth parallax reads as a motion gradient —
+// was a warp LOSER that shear alone would wrongly admit. Per-clip forced-warp
+// ground truth refuted that: bus is the LARGEST real-content win (-6.481%),
+// because LOCAL warped motion models exactly that depth-varying motion even
+// though no single GLOBAL affine explains the field (bus gain = 90). Gating on
+// gain therefore costs -6.5% and buys nothing shear does not already give.
+// Kept as a diagnostic, and as the record of a refuted hypothesis.
+// Default 0 = disabled; set RAV1E_WARP_PRE_GAIN_T to re-enable for experiments.
 static WARP_PRE_GAIN_T: OnceLock<u64> = OnceLock::new();
 #[inline]
 pub fn warp_pre_gain_t() -> u64 {
   *WARP_PRE_GAIN_T.get_or_init(|| {
-    std::env::var("RAV1E_WARP_PRE_GAIN_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
+    std::env::var("RAV1E_WARP_PRE_GAIN_T").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
   })
 }
 

@@ -3964,12 +3964,12 @@ pub(crate) mod warp_prepass {
       let n = SHEAR_N.load(Relaxed);
       let mean = if n > 0 { SHEAR_SUM.load(Relaxed) / n } else { 0 };
       let gain = if n > 0 { GAIN_SUM.load(Relaxed) / n } else { 0 };
-      // BOTH must clear: the shear says the warp is worth signalling, the gain
-      // says the motion really is affine (a pan over a scene with depth shows
-      // shear without being affine — see fit_global_shear).
+      // SHEAR is the gate; the gain is diagnostic only (see warp_pre_gain_t —
+      // its floor defaults to 0 because per-clip ground truth refuted the
+      // premise that shear alone over-admits).
       let on = n > 0
         && mean > crate::harvest::warp_pre_t()
-        && gain > crate::harvest::warp_pre_gain_t();
+        && gain >= crate::harvest::warp_pre_gain_t();
       let want = if on { 2 } else { 1 };
       st = match STATE.compare_exchange(0, want, Relaxed, Relaxed) {
         Ok(_) => want,
