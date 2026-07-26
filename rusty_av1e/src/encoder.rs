@@ -1072,7 +1072,14 @@ impl<T: Pixel> FrameInvariants<T> {
     let ref_in_previous_group = LAST3_FRAME;
 
     // reuse probability estimates from previous frames only in top level frames
-    fi.primary_ref_frame = if fi.error_resilient || (fi.pyramid_level > 2) {
+    // prom_av1e056: the level cap was written when the pyramid could not exceed
+    // depth 2, so no frame ever tripped it. At depth 3 it disqualifies HALF the
+    // frames (every level-3 frame) from CDF inheritance, which is a candidate
+    // explanation for the deeper pyramid failing to pay. RAV1E_PRIMREF_LVL
+    // raises the cap so this can be measured rather than assumed.
+    fi.primary_ref_frame = if fi.error_resilient
+      || (fi.pyramid_level > crate::harvest::primref_max_level())
+    {
       PRIMARY_REF_NONE
     } else {
       (ref_in_previous_group.to_index()) as u32
@@ -1264,7 +1271,15 @@ impl<T: Pixel> FrameInvariants<T> {
     if self.frame_type == FrameType::KEY {
       FRAME_SUBTYPE_I
     } else {
-      FRAME_SUBTYPE_P + (self.pyramid_level as usize)
+      // prom_av1e056: the rate controller's taxonomy is I/P/B0/B1 —
+      // FRAME_NSUBTYPES is 4 and index 4 is FRAME_SUBTYPE_SEF, which carries no
+      // rate tables. A pyramid deeper than 2 produces levels beyond B1, so the
+      // level must SATURATE here rather than index past the end (it panicked in
+      // rate.rs at MQP_Q12[fti] the moment depth 3 emitted a level-3 frame).
+      // Deep levels therefore share B1's QP offset — coarser than ideal but
+      // correct; giving each level its own offset means widening
+      // FRAME_NSUBTYPES and the two-pass header format along with it.
+      (FRAME_SUBTYPE_P + self.pyramid_level as usize).min(crate::rate::FRAME_SUBTYPE_B1)
     }
   }
 

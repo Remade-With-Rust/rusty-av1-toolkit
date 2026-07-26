@@ -1048,3 +1048,38 @@ pub fn lrf_gate() -> Option<(f64, f64)> {
     }
   })
 }
+
+// prom_av1e056: re-ordering PYRAMID DEPTH. depth 2 = a 4-frame group (the
+// long-standing default, previously hard-coded behind a "only works for
+// pyramid_depth <= 2" TODO); 3 = 8 frames; 4 = 16, libaom's default shape.
+// The pyramid is the single biggest measured lever on these clips — turning it
+// OFF entirely (--low-latency, depth 0) costs +5.5pp on bus and +38.6pp on
+// tempete against libaom — so deeper groups are the natural next rung.
+// Default stays 2: the shipped bitstream is unchanged until deeper rungs gate.
+static PYRAMID: OnceLock<u64> = OnceLock::new();
+#[inline]
+pub fn pyramid_depth() -> u64 {
+  *PYRAMID.get_or_init(|| {
+    std::env::var("RAV1E_PYRAMID")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .map(|d: u64| d.clamp(1, 4))
+      .unwrap_or(2)
+  })
+}
+
+// prom_av1e056: maximum pyramid level still allowed to inherit CDFs from a
+// reference (above it, primary_ref_frame = PRIMARY_REF_NONE and the frame
+// starts from default CDFs). The historical value is 2, which was unreachable
+// while the pyramid was capped at depth 2 — at depth 3 it silently disqualifies
+// every level-3 frame, i.e. half the group.
+static PRIMREF_LVL: OnceLock<u64> = OnceLock::new();
+#[inline]
+pub fn primref_max_level() -> u64 {
+  *PRIMREF_LVL.get_or_init(|| {
+    std::env::var("RAV1E_PRIMREF_LVL")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(2)
+  })
+}
