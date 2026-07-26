@@ -435,6 +435,25 @@ pub mod bitacct {
   // Accumulated in EIGHTHS of a bit (tell_frac units).
   pub static BITS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
+  /// prom_av1e055: compound-prediction usage, counted at the EMIT site so both
+  /// numbers share one population (mixing an rdo-call count with a block-emit
+  /// count in the same table is how this instrument first misled us).
+  /// 0 = inter blocks emitted, 3 = of which compound.
+  ///
+  /// Placement matters more than it looks: the first version sat inside the
+  /// `mm_elig` branch, whose condition includes `!luma_mode.is_compound()`, so
+  /// it structurally could never observe a compound block and reported a
+  /// confident 0.00%. Compound is in fact chosen on ~42% of inter blocks.
+  pub static FUNNEL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+  pub const FUNNEL_NAMES: [&str; 4] =
+    ["inter blocks emitted", "-", "-", "of which COMPOUND"];
+  #[inline]
+  pub fn funnel(i: usize) {
+    if on() {
+      FUNNEL[i].fetch_add(1, Relaxed);
+    }
+  }
+
   #[inline]
   pub fn on() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -474,6 +493,16 @@ pub mod bitacct {
     let tot: u64 = v.iter().sum();
     if tot == 0 {
       return;
+    }
+    let f: Vec<u64> = FUNNEL.iter().map(|b| b.load(Relaxed)).collect();
+    if f[0] > 0 {
+      eprintln!("COMPOUND funnel:");
+      for i in [0usize, 3] {
+        eprintln!(
+          "COMPOUND   {:<24} {:>12}  {:>6.2}% of inter",
+          FUNNEL_NAMES[i], f[i], f[i] as f64 / f[0] as f64 * 100.0
+        );
+      }
     }
     eprintln!("BITACCT {tag} — accounted {:.0} bits", tot as f64 / 8.0);
     let mut idx: Vec<usize> = (0..v.len()).collect();

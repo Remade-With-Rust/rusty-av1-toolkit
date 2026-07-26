@@ -2562,6 +2562,12 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   if fi.frame_type.has_inter() {
     acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_is_inter(w, tile_bo, is_inter));
     if is_inter {
+      crate::prof::bitacct::funnel(0);
+      if luma_mode.is_compound() {
+        crate::prof::bitacct::funnel(3);
+      }
+    }
+    if is_inter {
       cw.fill_neighbours_ref_counts(tile_bo);
       acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_ref_frames(w, fi, tile_bo));
 
