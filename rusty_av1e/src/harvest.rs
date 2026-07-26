@@ -1200,3 +1200,21 @@ pub fn tpl() -> bool {
     Err(_) => true,
   })
 }
+
+// --- prom_av1e060 M4a: RANSAC global-motion fit (A/B knob) -------------------
+//
+// `RAV1E_GM_RANSAC=1` replaces the M2 per-component median with a RANSAC fit +
+// inlier refit (see `ransac_translation`). Kept as its own knob so it can be
+// measured ALONE: M3b changed the estimator and the validation gate in the same
+// step and lost, which left neither attributable — the same fault as pricing
+// three mechanisms with one `--tune` flag.
+
+static GM_RANSAC: OnceLock<bool> = OnceLock::new();
+
+/// True when the global-motion model is fitted by RANSAC instead of the median.
+#[inline]
+pub fn gm_ransac() -> bool {
+  *GM_RANSAC.get_or_init(|| {
+    matches!(std::env::var("RAV1E_GM_RANSAC"), Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
+  })
+}

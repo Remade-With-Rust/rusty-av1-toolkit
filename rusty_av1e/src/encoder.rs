@@ -4306,6 +4306,73 @@ fn pick_frame_filter<T: Pixel>(
 /// agreeing with the global model.
 const GM_NEAR: i16 = 4;
 
+/// How many candidate models RANSAC scores. The candidates are drawn on a fixed
+/// stride rather than at random: the encode path must stay reproducible.
+const GM_RANSAC_CANDIDATES: usize = 64;
+
+/// prom_av1e060 M4a: RANSAC fit of a translation to the motion field.
+///
+/// M2 took the median of each COMPONENT independently, so the fitted vector is
+/// not necessarily any block's real motion — on a diagonal pan the row median
+/// and the column median can come from different blocks, and the pair they form
+/// may be a motion no block actually has. RANSAC scores REAL MVs from the field
+/// as candidate models by inlier count, then refits on that model's inliers.
+///
+/// The refit is also the answer to why M3 failed. M3 refined over INTEGER-pel
+/// offsets (chosen so the measured model needed no interpolation) and lost to
+/// M2's cruder sub-pel median — it searched better over a strictly worse
+/// candidate set. Here the refit is a mean over 1/8-pel MVs, so the model is
+/// sub-pel by construction, with no interpolated SAD anywhere.
+fn ransac_translation(rows: &[i16], cols: &[i16]) -> (i16, i16) {
+  let n = rows.len();
+  let near = GM_NEAR as i32;
+  let stride = (n / GM_RANSAC_CANDIDATES).max(1);
+  let inliers_of = |cr: i32, cc: i32| -> usize {
+    (0..n)
+      .filter(|&j| {
+        (rows[j] as i32 - cr).abs() <= near && (cols[j] as i32 - cc).abs() <= near
+      })
+      .count()
+  };
+  let (mut best_r, mut best_c, mut best_in) = (rows[0] as i32, cols[0] as i32, 0);
+  let mut k = 0;
+  while k < n {
+    let (cr, cc) = (rows[k] as i32, cols[k] as i32);
+    let inl = inliers_of(cr, cc);
+    // Ties break toward the SMALLER model so the choice is stable frame to
+    // frame; an unstable model costs the per-frame delta coding for nothing.
+    if inl > best_in
+      || (inl == best_in && cr.abs() + cc.abs() < best_r.abs() + best_c.abs())
+    {
+      best_in = inl;
+      best_r = cr;
+      best_c = cc;
+    }
+    k += stride;
+  }
+  // Refit on the inliers — this is the refinement, and it lands sub-pel.
+  let (mut sr, mut sc, mut cnt) = (0i64, 0i64, 0i64);
+  for j in 0..n {
+    if (rows[j] as i32 - best_r).abs() <= near
+      && (cols[j] as i32 - best_c).abs() <= near
+    {
+      sr += rows[j] as i64;
+      sc += cols[j] as i64;
+      cnt += 1;
+    }
+  }
+  if cnt == 0 {
+    return (best_r as i16, best_c as i16);
+  }
+  // Round half away from zero, symmetrically, so a pan and its mirror quantise
+  // to mirrored models.
+  let div = |s: i64| -> i16 {
+    let h = cnt / 2;
+    (if s >= 0 { (s + h) / cnt } else { (s - h) / cnt }) as i16
+  };
+  (div(sr), div(sc))
+}
+
 pub fn estimate_global_motion<T: Pixel>(
   fi: &mut FrameInvariants<T>, fs: &FrameState<T>,
 ) {
@@ -4342,7 +4409,12 @@ pub fn estimate_global_motion<T: Pixel>(
     let (urows, ucols) = (rows.clone(), cols.clone());
     rows.sort_unstable();
     cols.sort_unstable();
-    let (mr, mc) = (rows[rows.len() / 2], cols[cols.len() / 2]);
+    // prom_av1e060 M4a: RANSAC fit instead of the per-component median.
+    let (mr, mc) = if crate::harvest::gm_ransac() {
+      ransac_translation(&urows, &ucols)
+    } else {
+      (rows[rows.len() / 2], cols[cols.len() / 2])
+    };
     if mr == 0 && mc == 0 {
       continue;
     }
