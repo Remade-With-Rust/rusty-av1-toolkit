@@ -213,7 +213,15 @@ impl EncoderConfig {
 
   /// Is temporal RDO enabled ?
   #[inline]
-  pub const fn temporal_rdo(&self) -> bool {
+  pub fn temporal_rdo(&self) -> bool {
+    // prom_av1e061 (diagnostic, default ON): `RAV1E_TPL=0` disables the TPL
+    // through the encoder's OWN already-supported "no temporal RDO" path,
+    // WITHOUT touching tx_domain_distortion. That distinction is the point:
+    // `--tune Psnr` also swaps the RD distortion domain, so it prices the TPL
+    // and the distortion approximation together and can attribute neither.
+    if !crate::harvest::tpl() {
+      return false;
+    }
     // Note: This function is called frequently, unlike most other functions here.
 
     // `compute_distortion_scale` computes a scaling factor for the distortion

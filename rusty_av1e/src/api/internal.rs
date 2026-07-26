@@ -1426,7 +1426,8 @@ impl<T: Pixel> ContextInner<T> {
     let mut log_isqrt_mean_scale = 0i64;
 
     if let Some(coded_data) = frame_data.fi.coded_frame_data.as_mut() {
-      if self.config.tune == Tune::Psychovisual {
+      if self.config.tune == Tune::Psychovisual && crate::harvest::activity_mask()
+      {
         let frame =
           self.frame_q[&frame_data.fi.input_frameno].as_ref().unwrap();
         coded_data.activity_mask = ActivityMask::from_plane(&frame.planes[0]);

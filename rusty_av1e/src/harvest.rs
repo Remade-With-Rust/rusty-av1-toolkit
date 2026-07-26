@@ -1158,3 +1158,45 @@ pub fn gm_coherence() -> f64 {
       .unwrap_or(0.30)
   })
 }
+
+// --- prom_av1e061: activity-mask isolation knob (diagnostic, default ON) -----
+//
+// `--tune Psychovisual` (the CLI default) turns on TWO content-adaptive
+// mechanisms at once — the psychovisual ACTIVITY mask (ssim_boost over 8x8
+// variance) and, via tx_domain_distortion=false, the whole TPL/mbtree
+// propagation. Measuring `--tune Psnr` therefore prices them TOGETHER and also
+// swaps the RD distortion domain, so it cannot attribute a result to either.
+// `RAV1E_AQ=0` drops ONLY the activity mask, leaving TPL and the distortion
+// domain exactly as they were — which is what makes the split clean.
+// Unset (or any value but 0/off) = stock behaviour, byte-identical.
+
+static ACTIVITY_MASK: OnceLock<bool> = OnceLock::new();
+
+/// False only when `RAV1E_AQ=0` explicitly disables the psychovisual
+/// activity mask; the default is unconditionally stock.
+#[inline]
+pub fn activity_mask() -> bool {
+  *ACTIVITY_MASK.get_or_init(|| match std::env::var("RAV1E_AQ") {
+    Ok(v) => !(v.trim() == "0" || v.trim().eq_ignore_ascii_case("off")),
+    Err(_) => true,
+  })
+}
+
+// --- prom_av1e061: TPL isolation knob (diagnostic, default ON) ---------------
+//
+// `RAV1E_TPL=0` routes `EncoderConfig::temporal_rdo()` to false, which is a
+// path the encoder already supports and tests (it is what `--tune Psnr` reaches
+// via tx_domain_distortion). Using it directly leaves the RD distortion domain
+// untouched, so the BD delta is the TPL's price ALONE.
+// Unset (or any value but 0/off) = stock behaviour, byte-identical.
+
+static TPL: OnceLock<bool> = OnceLock::new();
+
+/// False only when `RAV1E_TPL=0` explicitly disables temporal RDO.
+#[inline]
+pub fn tpl() -> bool {
+  *TPL.get_or_init(|| match std::env::var("RAV1E_TPL") {
+    Ok(v) => !(v.trim() == "0" || v.trim().eq_ignore_ascii_case("off")),
+    Err(_) => true,
+  })
+}
