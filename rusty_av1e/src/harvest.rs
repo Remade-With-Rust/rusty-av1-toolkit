@@ -1057,9 +1057,43 @@ pub fn lrf_gate() -> Option<(f64, f64)> {
 // tempete against libaom — so deeper groups are the natural next rung.
 // Default stays 2: the shipped bitstream is unchanged until deeper rungs gate.
 static PYRAMID: OnceLock<u64> = OnceLock::new();
+static PYRAMID_OVERRIDE: OnceLock<u64> = OnceLock::new();
+
+/// prom_av1e058: `RAV1E_PYRAMID=auto` asks the CLI to choose the depth from a
+/// source probe. The CLI computes it and calls this BEFORE the first
+/// `pyramid_depth()` (which caches), because InterConfig is built from it.
+pub fn set_pyramid_override(d: u64) {
+  let _ = PYRAMID_OVERRIDE.set(d.clamp(1, 4));
+}
+#[inline]
+pub fn pyramid_auto() -> bool {
+  std::env::var("RAV1E_PYRAMID")
+    .map(|v| v.trim().eq_ignore_ascii_case("auto"))
+    .unwrap_or(false)
+}
+/// Motion-compensated decay ratio (mc8/mc1) below which a deeper pyramid is
+/// selected. Deliberately CONSERVATIVE: ordering 18 measured clips by this
+/// ratio, the first clip a deeper pyramid HURTS sits at 1.272, so a floor of
+/// 1.2 routes only clips comfortably inside the winning region. That captures
+/// 2 of the 9 available winners and — the point of the exercise — cannot make
+/// any clip worse. A separating threshold of 2.17 would route 8 winners but
+/// regresses one clip by +1.81%, which fails monotone non-regression.
+static PYRAMID_T: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn pyramid_ratio_t() -> f64 {
+  *PYRAMID_T.get_or_init(|| {
+    std::env::var("RAV1E_PYRAMID_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(1.2)
+  })
+}
 #[inline]
 pub fn pyramid_depth() -> u64 {
   *PYRAMID.get_or_init(|| {
+    if let Some(d) = PYRAMID_OVERRIDE.get() {
+      return *d;
+    }
     std::env::var("RAV1E_PYRAMID")
       .ok()
       .and_then(|v| v.trim().parse().ok())
