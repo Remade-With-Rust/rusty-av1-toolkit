@@ -2710,17 +2710,20 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
             }
           }
         }
+        // prom_av1e060 M1b: a lookup past the real candidate count lands in
+        // the decoder's GLOBAL-MV padding, so the expected value there is the
+        // global mv, not zero. These assertions encoded the old
+        // identity-only assumption and are what caught the change.
+        let gmv0 = fi.global_mv(ref_frames[0].to_index());
         if mv_stack.len() > 1 {
           assert!(mv_stack[ref_mv_idx].this_mv.row == mvs[0].row);
           assert!(mv_stack[ref_mv_idx].this_mv.col == mvs[0].col);
         } else {
-          assert!(0 == mvs[0].row);
-          assert!(0 == mvs[0].col);
+          assert_eq!(gmv0, mvs[0]);
         }
       } else if luma_mode == PredictionMode::NEARESTMV {
         if mv_stack.is_empty() {
-          assert_eq!(mvs[0].row, 0);
-          assert_eq!(mvs[0].col, 0);
+          assert_eq!(fi.global_mv(ref_frames[0].to_index()), mvs[0]);
         } else {
           assert_eq!(mvs[0].row, mv_stack[0].this_mv.row);
           assert_eq!(mvs[0].col, mv_stack[0].this_mv.col);
@@ -2800,7 +2803,16 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
       // compound_type after mv). Value = frame_filter (REGULAR in
       // the minimal version). Skipped when the block infers REGULAR.
       if crate::encoder::frame_dispatch::switchable() {
-        let needs = crate::context::needs_interp_filter(bsize, luma_mode);
+        let gm_types = [
+          fi.globalmv_transformation_type[ref_frames[0].to_index()],
+          if ref_frames[1] != NONE_FRAME {
+            fi.globalmv_transformation_type[ref_frames[1].to_index()]
+          } else {
+            GlobalMVMode::IDENTITY
+          },
+        ];
+        let needs =
+          crate::context::needs_interp_filter(bsize, luma_mode, gm_types);
         // Per-block RD filter search. When RAV1E_PBINTERP_RDO is set it runs in
         // RDO trials too (co-optimises mode/tx with the filter); otherwise only
         // at the final encode (cheaper, decoupled). The chosen filter drives

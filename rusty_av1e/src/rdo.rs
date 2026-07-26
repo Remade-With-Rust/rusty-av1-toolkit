@@ -124,6 +124,22 @@ impl Default for PartitionParameters {
   }
 }
 
+/// prom_av1e060: the (ref0, ref1) pair of GLOBAL motion vectors for a candidate.
+/// Used both for GLOBALMV blocks and for MV-stack slots past the real candidate
+/// count, which the decoder fills with the global MV rather than zero.
+fn gmv_pair<T: Pixel>(
+  fi: &FrameInvariants<T>, rf: [RefType; 2],
+) -> [MotionVector; 2] {
+  [
+    fi.global_mv(rf[0].to_index()),
+    if rf[1] != NONE_FRAME {
+      fi.global_mv(rf[1].to_index())
+    } else {
+      MotionVector::default()
+    },
+  ]
+}
+
 pub fn estimate_rate(qindex: u8, ts: TxSize, fast_distortion: u64) -> u64 {
   let bs_index = ts as usize;
   let q_bin_idx = (qindex as usize) / RDO_QUANT_DIV;
@@ -1632,18 +1648,20 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   inter_mode_set.iter().for_each(|&(luma_mode, i)| {
     let mvs = match luma_mode {
       PredictionMode::NEWMV | PredictionMode::NEW_NEWMV => mvs_from_me[i],
+      // prom_av1e060 M1b: slots past the real candidate count are the
+      // decoder's GLOBAL-MV padding (`mvstack[min(cnt,2)..2] = tgmv`), not zero.
       PredictionMode::NEARESTMV | PredictionMode::NEAREST_NEARESTMV => {
         if !mv_stacks[i].is_empty() {
           [mv_stacks[i][0].this_mv, mv_stacks[i][0].comp_mv]
         } else {
-          [MotionVector::default(); 2]
+          gmv_pair(fi, ref_frames_set[i])
         }
       }
       PredictionMode::NEAR0MV | PredictionMode::NEAR_NEAR0MV => {
         if mv_stacks[i].len() > 1 {
           [mv_stacks[i][1].this_mv, mv_stacks[i][1].comp_mv]
         } else {
-          [MotionVector::default(); 2]
+          gmv_pair(fi, ref_frames_set[i])
         }
       }
       PredictionMode::NEAR1MV
@@ -1659,8 +1677,13 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
       PredictionMode::NEW_NEARESTMV => {
         [mvs_from_me[i][0], mv_stacks[i][0].comp_mv]
       }
+      // prom_av1e060 M1b: a GLOBALMV block's motion vector comes from the
+      // GLOBAL MOTION model, not zero. The two coincide only under IDENTITY,
+      // which is why a hardcoded zero worked until a model was signalled — the
+      // decoder derives this with get_gmv_2d and would otherwise predict from
+      // a different reference position than the encoder did.
       PredictionMode::GLOBALMV | PredictionMode::GLOBAL_GLOBALMV => {
-        [MotionVector::default(); 2]
+        gmv_pair(fi, ref_frames_set[i])
       }
       _ => {
         unimplemented!();

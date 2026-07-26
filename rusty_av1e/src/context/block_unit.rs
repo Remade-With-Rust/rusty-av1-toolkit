@@ -218,16 +218,34 @@ impl Default for Block {
   }
 }
 
-// prom_av1e048c: AV1 needs_interp_filter() reduced to this fork's feature set
-// (no skip_mode, no warp, GM always IDENTITY): a LARGE GLOBALMV/GLOBAL_GLOBALMV
-// block infers REGULAR (codes no filter symbol); every other inter block codes
-// one. Encoder and decoder compute this identically.
+// AV1 needs_interp_filter(), reduced to this fork's feature set (no skip_mode,
+// no LOCALWARP here). A LARGE GLOBALMV/GLOBAL_GLOBALMV block codes a filter
+// symbol only when its reference's GLOBAL MOTION type is TRANSLATION; every
+// other inter block codes one.
+//
+// prom_av1e060 M1b: the GM type is now a parameter. This used to assume
+// IDENTITY and return `!(large && is_global)`, which is the right answer ONLY
+// while global motion is identity — the decoder sets `has_subpel_filter` for a
+// GLOBALMV block exactly when the model is TRANSLATION (rusty_av1d_stock
+// decode.rs), so signalling a translation model made the decoder read a filter
+// symbol the encoder never wrote. That was the first-inter-frame desync.
+// Note the spec's asymmetry: ROTZOOM/AFFINE code NO filter (warp handles the
+// subpel), so this is specifically `== TRANSLATION`, not `>= TRANSLATION`.
 #[inline]
-pub fn needs_interp_filter(bsize: BlockSize, mode: PredictionMode) -> bool {
+pub fn needs_interp_filter(
+  bsize: BlockSize, mode: PredictionMode, gm_types: [GlobalMVMode; 2],
+) -> bool {
   let large = bsize.width().min(bsize.height()) >= 8;
-  let is_global = mode == PredictionMode::GLOBALMV
-    || mode == PredictionMode::GLOBAL_GLOBALMV;
-  !(large && is_global)
+  if large {
+    if mode == PredictionMode::GLOBALMV {
+      return gm_types[0] == GlobalMVMode::TRANSLATION;
+    }
+    if mode == PredictionMode::GLOBAL_GLOBALMV {
+      return gm_types[0] == GlobalMVMode::TRANSLATION
+        || gm_types[1] == GlobalMVMode::TRANSLATION;
+    }
+  }
+  true
 }
 
 #[derive(Clone)]
