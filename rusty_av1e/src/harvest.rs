@@ -1073,6 +1073,11 @@ pub fn pyramid_depth() -> u64 {
 // starts from default CDFs). The historical value is 2, which was unreachable
 // while the pyramid was capped at depth 2 — at depth 3 it silently disqualifies
 // every level-3 frame, i.e. half the group.
+//
+// prom_av1e057: default raised 2 -> 4. This is a NO-OP at the shipped depth
+// (levels only reach 2 there and the test is `level > max`), verified
+// byte-identical, and worth -1.49pp on bus / -1.27pp on tempete at depth 3 —
+// so enabling a deeper pyramid does not also require setting a second knob.
 static PRIMREF_LVL: OnceLock<u64> = OnceLock::new();
 #[inline]
 pub fn primref_max_level() -> u64 {
@@ -1080,6 +1085,6 @@ pub fn primref_max_level() -> u64 {
     std::env::var("RAV1E_PRIMREF_LVL")
       .ok()
       .and_then(|v| v.trim().parse().ok())
-      .unwrap_or(2)
+      .unwrap_or(4)
   })
 }
