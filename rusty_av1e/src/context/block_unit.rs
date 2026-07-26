@@ -1367,7 +1367,21 @@ impl ContextWriter<'_> {
       }
 
       if is_compound {
-        let mut combined_mvs = [[MotionVector::default(); 2]; 2];
+        // prom_av1e060 M1d: slots this extra search cannot fill are the
+        // decoder's GLOBAL-MV padding (`same[m..2] = tgmv[n]`), NOT zero.
+        // Seeding with zero was invisible while global motion was identity and
+        // is the last of the "assumed IDENTITY" desyncs: on a frame's very
+        // FIRST block there are no spatial neighbours at all, so both slots are
+        // padding, and the compound NEW_NEWMV predictor came out short by
+        // exactly the global MV.
+        let mut combined_mvs = [[
+          fi.global_mv(ref_frames[0].to_index()),
+          if ref_frames[1] != NONE_FRAME {
+            fi.global_mv(ref_frames[1].to_index())
+          } else {
+            MotionVector::default()
+          },
+        ]; 2];
 
         for list in 0..2 {
           let mut comp_count = 0;

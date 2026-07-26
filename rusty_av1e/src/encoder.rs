@@ -2628,25 +2628,6 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
 
   if fi.frame_type.has_inter() {
     acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_is_inter(w, tile_bo, is_inter));
-    // prom_av1e060 M1c: clean-stream diff tap. Dumps this block's FINAL derived
-    // motion state so it can be diffed against the decoder's. rav1e re-encodes
-    // a block for every partition candidate through a REAL recorder, so the
-    // same (frame, x, y) appears many times — the post-processor keeps the LAST
-    // occurrence, which is the emit that survived. Same trick that cracked the
-    // WARP M1 desync.
-    if is_inter && std::env::var("RAV1E_GMDBG").is_ok() && !W::COUNTS_ONLY {
-      eprintln!(
-        "GMDBG oh={} x={} y={} bs={:?} mode={:?} r0={} r1={} mv0={},{} mv1={},{}",
-        fi.order_hint,
-        tile_bo.0.x,
-        tile_bo.0.y,
-        bsize,
-        luma_mode,
-        ref_frames[0].to_index(),
-        if ref_frames[1] == NONE_FRAME { 99 } else { ref_frames[1].to_index() },
-        mvs[0].row, mvs[0].col, mvs[1].row, mvs[1].col
-      );
-    }
     if is_inter {
       crate::prof::bitacct::funnel(0);
       if luma_mode.is_compound() {
@@ -4319,7 +4300,6 @@ fn pick_frame_filter<T: Pixel>(
 pub fn estimate_global_motion<T: Pixel>(
   fi: &mut FrameInvariants<T>, fs: &FrameState<T>,
 ) {
-  let dbg = std::env::var("RAV1E_GMDBG").is_ok();
   if !crate::harvest::global_motion() || fi.intra_only {
     return;
   }
@@ -4367,12 +4347,6 @@ pub fn estimate_global_motion<T: Pixel>(
     }
     fi.gm_params[r] = [p0, p1, 1 << 16, 0, 0, 1 << 16];
     fi.globalmv_transformation_type[r] = GlobalMVMode::TRANSLATION;
-    if dbg {
-      eprintln!(
-        "GMSET oh={} ref={} slot={} params={},{} derived_mv={},{}",
-        fi.order_hint, r, slot, p0, p1, p0 >> 13, p1 >> 13
-      );
-    }
   }
 }
 
