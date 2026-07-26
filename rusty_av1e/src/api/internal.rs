@@ -817,6 +817,7 @@ impl<T: Pixel> ContextInner<T> {
         frame_me_stats: fs.frame_me_stats.clone(),
         output_frameno,
         segmentation: fs.segmentation,
+        gm_params: fi.gm_params,
       });
       for i in 0..REF_FRAMES {
         if (fi.refresh_frame_flags & (1 << i)) != 0 {
@@ -907,6 +908,7 @@ impl<T: Pixel> ContextInner<T> {
       frame_me_stats: fs.frame_me_stats.clone(),
       output_frameno,
       segmentation: fs.segmentation,
+      gm_params: fi.gm_params,
     });
     for i in 0..REF_FRAMES {
       if (fi.refresh_frame_flags & (1 << i)) != 0 {
@@ -1470,6 +1472,11 @@ impl<T: Pixel> ContextInner<T> {
       log_isqrt_mean_scale,
     );
     frame_data.fi.set_quantizers(&qps);
+
+    // prom_av1e060 M1: the global-motion model must be fixed BEFORE the frame
+    // is encoded — encode_tile_group runs first and write_frame_header_obu
+    // takes `fi` immutably, so this is the last point where it can be set.
+    crate::encoder::estimate_global_motion(&mut frame_data.fi, &frame_data.fs);
 
     if self.rc_state.needs_trial_encode(fti) {
       let mut trial_fs = frame_data.fs.clone();

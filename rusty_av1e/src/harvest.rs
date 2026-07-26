@@ -1130,3 +1130,17 @@ pub fn primref_max_level() -> u64 {
       .unwrap_or(4)
   })
 }
+
+// prom_av1e060: GLOBAL MOTION. Per-tool pricing against libaom put this at
+// +4.10% mean / +6.71% on bus — 10x masked-compound wedge, the brick the
+// campaign had queued. Default OFF during bring-up: signalling a non-identity
+// model changes GLOBALMV's meaning everywhere the decoder derives it, so it
+// stays opt-in until conformance is proven.
+static GLOBAL_MOTION: OnceLock<bool> = OnceLock::new();
+#[inline]
+pub fn global_motion() -> bool {
+  *GLOBAL_MOTION.get_or_init(|| match std::env::var("RAV1E_GM") {
+    Ok(v) => v.trim() == "1",
+    Err(_) => false,
+  })
+}

@@ -87,6 +87,11 @@ pub struct ReferenceFrame<T: Pixel> {
   pub frame_me_stats: RefMEStats,
   pub output_frameno: u64,
   pub segmentation: SegmentationState,
+  /// prom_av1e060 M1: this frame's global-motion models. The header codes
+  /// gm params as a DELTA against the primary reference frame's values
+  /// (decoder `parse_gmv` reads `ref_mat` from `refs[primary_ref].gmv`), so the
+  /// encoder has to carry them forward exactly as it already carries CDFs.
+  pub gm_params: [[i32; 6]; INTER_REFS_PER_FRAME],
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1162,6 +1167,21 @@ impl<T: Pixel> FrameInvariants<T> {
     }
 
     Some(fi)
+  }
+
+  /// prom_av1e060 M1: the gm params the header delta-codes AGAINST — the
+  /// primary reference frame's models, or identity when there is no primary
+  /// reference. Mirrors the decoder's `ref_gmv` selection in `parse_gmv`.
+  pub fn gm_ref_params(&self, ref_idx: usize) -> [i32; 6] {
+    const IDENTITY: [i32; 6] = [0, 0, 1 << 16, 0, 0, 1 << 16];
+    if self.primary_ref_frame == PRIMARY_REF_NONE {
+      return IDENTITY;
+    }
+    let slot = self.ref_frames[self.primary_ref_frame as usize] as usize;
+    match &self.rec_buffer.frames[slot] {
+      Some(r) => r.gm_params[ref_idx],
+      None => IDENTITY,
+    }
   }
 
   /// prom_av1e060: the motion vector a GLOBALMV block gets for `ref_idx`.
@@ -4236,6 +4256,74 @@ fn pick_frame_filter<T: Pixel>(
   cands[best]
 }
 
+/// prom_av1e060 M1: estimate a per-reference GLOBAL TRANSLATION from the
+/// frame's motion field and signal it.
+///
+/// Per-tool pricing put global motion at +4.10% mean / +6.71% on bus — an order
+/// of magnitude above every other tool we lack — and on a pan a single global
+/// translation captures nearly all of the motion, which is why TRANSLATION is
+/// the first increment. Types above TRANSLATION additionally change PREDICTION
+/// (the decoder warps those blocks), so they need the warp path wired first.
+///
+/// The estimator is the MEDIAN of each reference's motion field, not the mean:
+/// a pan's MV field is a tight cluster plus outliers from independently moving
+/// objects, and the median ignores those where a mean is dragged by them.
+/// Signalling is skipped when the median is zero (identity is already free) or
+/// when too few blocks voted, so a frame with no coherent global motion pays
+/// nothing.
+pub fn estimate_global_motion<T: Pixel>(
+  fi: &mut FrameInvariants<T>, fs: &FrameState<T>,
+) {
+  if !crate::harvest::global_motion() || fi.intra_only {
+    return;
+  }
+  let stats = match fs.frame_me_stats.try_read() {
+    Ok(s) => s,
+    Err(_) => return,
+  };
+  for r in 0..INTER_REFS_PER_FRAME {
+    let slot = fi.ref_frames[r] as usize;
+    let me = &stats[slot];
+    if me.rows == 0 || me.cols == 0 {
+      continue;
+    }
+    let (mut rows, mut cols) = (Vec::new(), Vec::new());
+    let mut y = 1;
+    while y < me.rows {
+      let mut x = 1;
+      while x < me.cols {
+        let mv = me[y][x].mv;
+        rows.push(mv.row);
+        cols.push(mv.col);
+        x += 2;
+      }
+      y += 2;
+    }
+    if rows.len() < 64 {
+      continue;
+    }
+    rows.sort_unstable();
+    cols.sort_unstable();
+    let (mr, mc) = (rows[rows.len() / 2], cols[cols.len() / 2]);
+    if mr == 0 && mc == 0 {
+      continue;
+    }
+    // The MV field is in 1/8 pel; gm matrix translation is at
+    // WARPEDMODEL_PREC_BITS (16), and `global_mv` recovers the MV with >> 13.
+    // Quantise to what the header can actually carry (shift = 13 + !hp) so the
+    // signalled model and the derived MV agree exactly.
+    let hp = fi.allow_high_precision_mv;
+    let shift = 13 + !hp as i32;
+    let q = |v: i16| -> i32 { ((v as i32) << 13 >> shift) << shift };
+    let (p0, p1) = (q(mr), q(mc));
+    if p0 == 0 && p1 == 0 {
+      continue;
+    }
+    fi.gm_params[r] = [p0, p1, 1 << 16, 0, 0, 1 << 16];
+    fi.globalmv_transformation_type[r] = GlobalMVMode::TRANSLATION;
+  }
+}
+
 /// prom_av1e051: per-CLIP OBMC gate signal — coarse-grid ZERO-MV SAD on the
 /// first inter frame (feedback-free, key-referenced). High = real scene motion
 /// (OBMC's boundary blend pays); low-but-nonzero = the loss band (slight
@@ -5780,6 +5868,7 @@ pub fn update_rec_buffer<T: Pixel>(
     frame_me_stats: fs.frame_me_stats.clone(),
     output_frameno,
     segmentation: fs.segmentation,
+    gm_params: fi.gm_params,
   });
   for i in 0..REF_FRAMES {
     if (fi.refresh_frame_flags & (1 << i)) != 0 {
