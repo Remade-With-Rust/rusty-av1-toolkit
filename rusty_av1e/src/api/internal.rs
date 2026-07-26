@@ -552,19 +552,24 @@ impl<T: Pixel> ContextInner<T> {
   ) -> Result<(), EncoderStatus> {
     let fi = self.build_frame_properties(output_frameno)?;
 
-    self.frame_data.insert(
-      output_frameno,
-      fi.map(|fi| {
-        let frame = self
-          .frame_q
-          .get(&fi.input_frameno)
-          .as_ref()
-          .unwrap()
-          .as_ref()
-          .unwrap();
-        FrameData::new(fi, frame.clone())
-      }),
-    );
+    let fd = fi.map(|fi| {
+      let frame = self
+        .frame_q
+        .get(&fi.input_frameno)
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+      // prom_av1e062: the alt-ref temporal filter substitutes a denoised SOURCE
+      // here, before FrameData::new derives the half/quarter-res ME pyramids
+      // from it — so the motion search and the encode see the same frame.
+      // `frame_q` itself is left pristine: the neighbours this frame is
+      // filtered against must stay unfiltered, and later frames re-read them.
+      let frame = crate::tempfilter::maybe_filter_altref(&fi, frame, &self.frame_q);
+      FrameData::new(fi, frame)
+    });
+    self.frame_data.insert(output_frameno, fd);
 
     Ok(())
   }

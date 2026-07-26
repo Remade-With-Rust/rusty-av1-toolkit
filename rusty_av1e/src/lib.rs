@@ -117,6 +117,7 @@ mod warp;
 mod warp_tables;
 mod segmentation;
 mod stats;
+mod tempfilter;
 #[doc(hidden)]
 pub mod tiling;
 mod token_cdfs;

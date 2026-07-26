@@ -1218,3 +1218,50 @@ pub fn gm_ransac() -> bool {
     matches!(std::env::var("RAV1E_GM_RANSAC"), Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
   })
 }
+
+// --- prom_av1e062: alt-ref temporal filter (ARNR) ---------------------------
+//
+// `RAV1E_ARNR=1` motion-compensated-denoises the SOURCE of hidden alt-ref
+// frames before encoding them (src/tempfilter.rs). Priced at +5.02% on libaom
+// and wholly absent here. A pure source transform: no syntax, no decoder
+// change, conformant by construction — so it is BD-gated only.
+// `RAV1E_ARNR_STRENGTH` (default 4) widens the difference window treated as
+// noise; higher filters harder.
+
+static ARNR: OnceLock<bool> = OnceLock::new();
+
+/// True when hidden alt-ref sources are temporally filtered.
+#[inline]
+pub fn arnr() -> bool {
+  *ARNR.get_or_init(|| {
+    matches!(std::env::var("RAV1E_ARNR"), Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
+  })
+}
+
+static ARNR_STRENGTH: OnceLock<u32> = OnceLock::new();
+
+/// Filter strength; higher treats larger differences as noise.
+#[inline]
+pub fn arnr_strength() -> u32 {
+  *ARNR_STRENGTH.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_STRENGTH")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(4)
+  })
+}
+
+static ARNR_MAX_LEVEL: OnceLock<u64> = OnceLock::new();
+
+/// Deepest pyramid level whose hidden frames get temporally filtered.
+/// 0 = only the top anchor (libaom's behaviour); raise to filter deeper
+/// hidden frames too.
+#[inline]
+pub fn arnr_max_level() -> u64 {
+  *ARNR_MAX_LEVEL.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_MAX_LEVEL")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0)
+  })
+}
