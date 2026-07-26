@@ -445,8 +445,12 @@ pub mod bitacct {
   /// it structurally could never observe a compound block and reported a
   /// confident 0.00%. Compound is in fact chosen on ~42% of inter blocks.
   pub static FUNNEL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-  pub const FUNNEL_NAMES: [&str; 4] =
-    ["inter blocks emitted", "-", "-", "of which COMPOUND"];
+  pub const FUNNEL_NAMES: [&str; 4] = [
+    "inter blocks emitted",
+    "of which GLOBALMV",
+    "-",
+    "of which COMPOUND",
+  ];
   #[inline]
   pub fn funnel(i: usize) {
     if on() {
@@ -497,7 +501,7 @@ pub mod bitacct {
     let f: Vec<u64> = FUNNEL.iter().map(|b| b.load(Relaxed)).collect();
     if f[0] > 0 {
       eprintln!("COMPOUND funnel:");
-      for i in [0usize, 3] {
+      for i in [0usize, 1, 3] {
         eprintln!(
           "COMPOUND   {:<24} {:>12}  {:>6.2}% of inter",
           FUNNEL_NAMES[i], f[i], f[i] as f64 / f[0] as f64 * 100.0

@@ -1144,3 +1144,17 @@ pub fn global_motion() -> bool {
     Err(_) => false,
   })
 }
+
+// prom_av1e060 M2: minimum fraction of the motion field that must agree with
+// the global model before it is signalled. Signalling rewrites the MV predictor
+// for every block, so an incoherent field pays the cost with no takers.
+static GM_COH: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn gm_coherence() -> f64 {
+  *GM_COH.get_or_init(|| {
+    std::env::var("RAV1E_GM_COH")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0.30)
+  })
+}

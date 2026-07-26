@@ -2630,6 +2630,11 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
     acct!(w, crate::prof::bitacct::Class::InterMode, cw.write_is_inter(w, tile_bo, is_inter));
     if is_inter {
       crate::prof::bitacct::funnel(0);
+      if luma_mode == PredictionMode::GLOBALMV
+        || luma_mode == PredictionMode::GLOBAL_GLOBALMV
+      {
+        crate::prof::bitacct::funnel(1);
+      }
       if luma_mode.is_compound() {
         crate::prof::bitacct::funnel(3);
       }
@@ -4297,6 +4302,10 @@ fn pick_frame_filter<T: Pixel>(
 /// Signalling is skipped when the median is zero (identity is already free) or
 /// when too few blocks voted, so a frame with no coherent global motion pays
 /// nothing.
+/// How close (in 1/8 pel) a block's MV must be to the median to count as
+/// agreeing with the global model.
+const GM_NEAR: i16 = 4;
+
 pub fn estimate_global_motion<T: Pixel>(
   fi: &mut FrameInvariants<T>, fs: &FrameState<T>,
 ) {
@@ -4328,10 +4337,29 @@ pub fn estimate_global_motion<T: Pixel>(
     if rows.len() < 64 {
       continue;
     }
+    // keep the unsorted field for the coherence test below; sorting the two
+    // component vectors independently destroys their pairing
+    let (urows, ucols) = (rows.clone(), cols.clone());
     rows.sort_unstable();
     cols.sort_unstable();
     let (mr, mc) = (rows[rows.len() / 2], cols[cols.len() / 2]);
     if mr == 0 && mc == 0 {
+      continue;
+    }
+    // prom_av1e060 M2: BENEFIT GATE. Signalling a model is not free — it
+    // rewrites the MV predictor for EVERY block through the stack padding, a
+    // cost paid whether or not any block chooses GLOBALMV. So only signal when
+    // the field is genuinely coherent: enough blocks must sit close to the
+    // median for GLOBALMV to be a real option for them. Without this the
+    // estimator signalled whenever median motion was non-zero and lost BD on
+    // every clip (foreman, whose motion is local rather than global, worst at
+    // +2.379%).
+    let near = (0..urows.len())
+      .filter(|&k| {
+        (urows[k] - mr).abs() <= GM_NEAR && (ucols[k] - mc).abs() <= GM_NEAR
+      })
+      .count();
+    if (near as f64) < crate::harvest::gm_coherence() * rows.len() as f64 {
       continue;
     }
     // The MV field is in 1/8 pel; gm matrix translation is at

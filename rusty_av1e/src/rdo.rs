@@ -1554,7 +1554,16 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     if !mv_stack.is_empty() {
       inter_mode_set.push((PredictionMode::NEAR0MV, i));
     }
-    if mv_stack.len() >= 2 {
+    // prom_av1e060 M2: GLOBALMV is always a legal mode; gating it on a
+    // 2-deep MV stack kept it out of the RD on exactly the blocks a global
+    // model is meant to serve. When a real (non-identity) model exists, always
+    // offer it — measured: enabling global motion previously made GLOBALMV
+    // usage go DOWN (4.11% -> 3.64%), because the model's cost was paid
+    // everywhere while the mode was rarely trialled. The identity path keeps
+    // the old condition, so the default bitstream is unchanged.
+    let has_gm = fi.globalmv_transformation_type[ref_frames_set[i][0].to_index()]
+      != crate::partition::GlobalMVMode::IDENTITY;
+    if mv_stack.len() >= 2 || has_gm {
       inter_mode_set.push((PredictionMode::GLOBALMV, i));
     }
     let include_near_mvs = fi.config.speed_settings.motion.include_near_mvs;
