@@ -646,6 +646,11 @@ pub struct FrameInvariants<T: Pixel> {
   pub use_prev_frame_mvs: bool,
   pub partition_range: PartitionRange,
   pub globalmv_transformation_type: [GlobalMVMode; INTER_REFS_PER_FRAME],
+  /// prom_av1e060: per-reference global motion model, in the AV1 warp-matrix
+  /// layout (`matrix[0]`/`[1]` are the translation, `[2..6]` the linear part).
+  /// Identity until an estimate is signalled. Kept alongside
+  /// `globalmv_transformation_type`, which selects how much of it is coded.
+  pub gm_params: [[i32; 6]; INTER_REFS_PER_FRAME],
   pub num_tg: usize,
   pub large_scale_tile: bool,
   pub disable_cdf_update: bool,
@@ -906,6 +911,7 @@ impl<T: Pixel> FrameInvariants<T> {
       partition_range: config.speed_settings.partition.partition_range,
       globalmv_transformation_type: [GlobalMVMode::IDENTITY;
         INTER_REFS_PER_FRAME],
+      gm_params: [[0, 0, 1 << 16, 0, 0, 1 << 16]; INTER_REFS_PER_FRAME],
       num_tg: 1,
       large_scale_tile: false,
       disable_cdf_update: false,
@@ -1158,6 +1164,27 @@ impl<T: Pixel> FrameInvariants<T> {
     Some(fi)
   }
 
+  /// prom_av1e060: the motion vector a GLOBALMV block gets for `ref_idx`.
+  ///
+  /// Ported from the decoder's `get_gmv_2d` (rusty_av1d_stock env.rs), which is
+  /// the oracle: IDENTITY yields a zero MV, TRANSLATION reads the two
+  /// translation params directly, and the higher types evaluate the affine at
+  /// the block centre. Only IDENTITY and TRANSLATION are derived here — the
+  /// warp types additionally change PREDICTION (the decoder warps blocks whose
+  /// model is above TRANSLATION), so they cannot be signalled until that path
+  /// is wired too, and are rejected loudly rather than silently mis-derived.
+  #[inline]
+  pub fn global_mv(&self, ref_idx: usize) -> MotionVector {
+    match self.globalmv_transformation_type[ref_idx] {
+      GlobalMVMode::IDENTITY => MotionVector::default(),
+      GlobalMVMode::TRANSLATION => {
+        let m = self.gm_params[ref_idx];
+        MotionVector { row: (m[0] >> 13) as i16, col: (m[1] >> 13) as i16 }
+      }
+      _ => unimplemented!("global motion above TRANSLATION needs the warp path"),
+    }
+  }
+
   pub fn is_show_existing_frame(&self) -> bool {
     self.coded_frame_data.is_none()
   }
@@ -1203,6 +1230,7 @@ impl<T: Pixel> FrameInvariants<T> {
       use_prev_frame_mvs: self.use_prev_frame_mvs,
       partition_range: self.partition_range,
       globalmv_transformation_type: self.globalmv_transformation_type,
+      gm_params: self.gm_params,
       num_tg: self.num_tg,
       large_scale_tile: self.large_scale_tile,
       disable_cdf_update: self.disable_cdf_update,
@@ -1797,7 +1825,9 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
   let residual = &mut residual.data[..tx_size.area()];
   let coeffs = &mut coeffs.data[..tx_size.area()];
   let qcoeffs = {
-    let _s = crate::prof::scope(crate::prof::Stage::QcoeffsZero);
+    // TAP REMOVED: measured at/below the rdtsc-pair floor — the bucket was the
+    // instrument, and the guard's atomic add leaked into the parent scope.
+    // let _s = crate::prof::scope(crate::prof::Stage::QcoeffsZero);
     init_slice_repeat_mut(
       &mut qcoeffs.data[..coded_tx_area],
       T::Coeff::cast_from(0),
@@ -1944,7 +1974,9 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
     );
   }
 
-  let _txd = crate::prof::scope(crate::prof::Stage::TxDistLoop);
+  // TAP REMOVED: measured at/below the rdtsc-pair floor — the bucket was the
+  // instrument, and the guard's atomic add leaked into the parent scope.
+  // let _txd = crate::prof::scope(crate::prof::Stage::TxDistLoop);
   let tx_dist =
     if rdo_type.needs_tx_dist() && visible_tx_w != 0 && visible_tx_h != 0 {
       // Store tx-domain distortion of this block
@@ -4737,11 +4769,14 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
             PredictionMode::NEW_NEWMV
           };
 
+          // prom_av1e060: a compound block is GLOBAL_GLOBALMV when both MVs
+          // equal their reference's GLOBAL motion vector — not when they are
+          // zero. The two coincide only while the model is IDENTITY.
+          let g0 = fi.global_mv(ref_frames[0].to_index());
+          let g1 = fi.global_mv(ref_frames[1].to_index());
           if mode_luma != PredictionMode::NEAREST_NEARESTMV
-            && mvs[0].row == 0
-            && mvs[0].col == 0
-            && mvs[1].row == 0
-            && mvs[1].col == 0
+            && mvs[0] == g0
+            && mvs[1] == g1
           {
             mode_luma = PredictionMode::GLOBAL_GLOBALMV;
           }
@@ -4762,8 +4797,7 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
             }
           }
           if mode_luma == PredictionMode::NEWMV
-            && mvs[0].row == 0
-            && mvs[0].col == 0
+            && mvs[0] == fi.global_mv(ref_frames[0].to_index())
           {
             mode_luma = if mv_stack.is_empty() {
               PredictionMode::NEARESTMV

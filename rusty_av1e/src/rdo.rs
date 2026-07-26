@@ -729,7 +729,9 @@ impl std::ops::AddAssign for ScaledDistortion {
 pub fn compute_rd_cost<T: Pixel>(
   fi: &FrameInvariants<T>, rate: u32, distortion: ScaledDistortion,
 ) -> f64 {
-  let _prof = crate::prof::scope(crate::prof::Stage::ComputeRdCost);
+  // TAP REMOVED: measured at/below the rdtsc-pair floor — the bucket was
+  // the instrument, and the guard's atomic add leaked into the parent.
+  // let _prof = crate::prof::scope(crate::prof::Stage::ComputeRdCost);
   let rate_in_bits = (rate as f64) / ((1 << OD_BITRES) as f64);
   fi.lambda.mul_add(rate_in_bits, distortion.0 as f64)
 }

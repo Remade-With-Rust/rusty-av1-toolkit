@@ -718,7 +718,14 @@ impl CDFContextLog {
   ) -> &mut [u16; CDF_LEN] {
     // brick-D2 prize measure: under the frozen tier, counters never push,
     // so this call count = the recorder-path undo-log volume.
-    let _prof = crate::prof::scope(crate::prof::Stage::RecLogPush);
+    // TAP REMOVED (2026-07-26): this fires ~30.6M times on a 10-frame CIF encode
+    // and measured 13.9 ns/call — at or below the cost of the rdtsc pair itself,
+    // i.e. the bucket was the instrument measuring itself. Worse, the guard's
+    // atomic add lands AFTER its closing timestamp, so ~1.5 s of probe overhead
+    // leaked into the PARENT scope and showed up as a fake 28% of encode in
+    // `partition+mode RDO(self)`. Profile-ON wall was 3.45x profile-OFF.
+    // Re-enable only with a sampling guard (e.g. 1-in-1024).
+    // let _prof = crate::prof::scope(crate::prof::Stage::RecLogPush);
     if CDF_LEN <= CDF_LEN_SMALL {
       self.small.push(fc, cdf)
     } else {
