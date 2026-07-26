@@ -1065,11 +1065,19 @@ static PYRAMID_OVERRIDE: OnceLock<u64> = OnceLock::new();
 pub fn set_pyramid_override(d: u64) {
   let _ = PYRAMID_OVERRIDE.set(d.clamp(1, 4));
 }
+/// prom_av1e058b: the per-clip probe is now the DEFAULT at the Fast rung and
+/// above. It is strictly safe to default: on every clip it declines, the output
+/// is BYTE-IDENTICAL to the previous default (verified), and on the clips it
+/// routes it is a measured win (mobile −4.07%, shake −2.94%). Stock rav1e (no
+/// RAV1E_FAST) is left untouched, as with every other brick in this campaign.
+/// `RAV1E_PYRAMID=auto` forces it on at any tier; a numeric value pins the
+/// depth and skips the probe entirely.
 #[inline]
 pub fn pyramid_auto() -> bool {
-  std::env::var("RAV1E_PYRAMID")
-    .map(|v| v.trim().eq_ignore_ascii_case("auto"))
-    .unwrap_or(false)
+  match std::env::var("RAV1E_PYRAMID") {
+    Ok(v) => v.trim().eq_ignore_ascii_case("auto"),
+    Err(_) => fast_tier() >= FastTier::Fast,
+  }
 }
 /// Motion-compensated decay ratio (mc8/mc1) below which a deeper pyramid is
 /// selected. Deliberately CONSERVATIVE: ordering 18 measured clips by this
