@@ -113,6 +113,15 @@ impl Default for SpeedSettings {
 impl SpeedSettings {
   /// Set the speed setting according to a numeric speed preset.
   pub fn from_preset(speed: u8) -> Self {
+    // prom_av1e065: MINPART content dispatch. On high spatial-detail content
+    // the measured-better configuration for the speed-4 operating point is
+    // `speed 6 + include_near_mvs + 4x4 partitions` (bus -2.01%, tempete
+    // -2.22%, mobile -2.86% BD, none slower). Only speed 4 is dispatched --
+    // that is the only rung the substitution was measured against. Declining
+    // reproduces the s4 preset byte-for-byte.
+    let dispatch = speed == 4 && crate::harvest::minpart_dispatch();
+    let speed = if dispatch { 6 } else { speed };
+
     // The default settings are equivalent to speed 0
     let mut settings = SpeedSettings::default();
 
@@ -188,6 +197,14 @@ impl SpeedSettings {
         PartitionRange::new(BlockSize::BLOCK_32X32, BlockSize::BLOCK_32X32);
 
       settings.motion.use_satd_subpel = false;
+    }
+
+    if dispatch {
+      // the two knobs the substitution adds on top of the speed-6 base
+      settings.motion.include_near_mvs = true;
+      let max = settings.partition.partition_range.max;
+      settings.partition.partition_range =
+        PartitionRange::new(BlockSize::BLOCK_4X4, max);
     }
 
     settings.apply_env_overrides();

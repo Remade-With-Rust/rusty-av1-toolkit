@@ -565,6 +565,46 @@ fn probe_pyramid_depth(path: &std::path::Path) -> Option<u64> {
   Some(depth)
 }
 
+/// prom_av1e065: mean |horizontal luma gradient| over the first frames -- the
+/// SPATIAL DETAIL classifier for the minpart dispatch. Cheap (O(pixels), no
+/// motion search) and computed on the source before any encode.
+fn probe_detail(path: &std::path::Path) -> Option<f64> {
+  const NF: usize = 9;
+  let f = File::open(path).ok()?;
+  let mut dec = y4m::Decoder::new(f).ok()?;
+  let (w, h) = (dec.get_width(), dec.get_height());
+  if w < 16 || h < 16 {
+    return None;
+  }
+  let (mut tot, mut n) = (0f64, 0usize);
+  for _ in 0..NF {
+    let fm = match dec.read_frame() {
+      Ok(fm) => fm,
+      Err(_) => break,
+    };
+    let y = fm.get_y_plane();
+    for row in 0..h {
+      let r = &y[row * w..row * w + w];
+      for x in 1..w {
+        tot += (r[x] as i32 - r[x - 1] as i32).unsigned_abs() as f64;
+        n += 1;
+      }
+    }
+  }
+  if n == 0 {
+    return None;
+  }
+  let detail = tot / n as f64;
+  if std::env::var("RAV1E_MINPART_DBG").is_ok() {
+    eprintln!(
+      "MINPART_PROBE detail={detail:.3} t={:.3} engage={}",
+      rav1e::harvest::minpart_detail_t(),
+      detail > rav1e::harvest::minpart_detail_t()
+    );
+  }
+  Some(detail)
+}
+
   let os_input = &matches.input;
   // Pick the pyramid depth from the source before the Config (and with it
   // InterConfig) is constructed — `harvest::pyramid_depth()` caches its first
@@ -573,6 +613,15 @@ fn probe_pyramid_depth(path: &std::path::Path) -> Option<u64> {
   if rav1e::harvest::pyramid_auto() && os_input.to_str() != Some("-") {
     if let Some(d) = probe_pyramid_depth(os_input) {
       rav1e::harvest::set_pyramid_override(d);
+    }
+  }
+  // prom_av1e065: the minpart dispatch reads the same source before the Config
+  // is built (SpeedSettings::from_preset consults it).
+  if rav1e::harvest::minpart_auto() && os_input.to_str() != Some("-") {
+    if let Some(d) = probe_detail(os_input) {
+      rav1e::harvest::set_minpart_dispatch(
+        d > rav1e::harvest::minpart_detail_t(),
+      );
     }
   }
   let io = EncoderIO {

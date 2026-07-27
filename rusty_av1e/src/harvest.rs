@@ -1110,6 +1110,56 @@ pub fn pyramid_depth() -> u64 {
   })
 }
 
+// prom_av1e065: MINPART content dispatch. Measured on the 8-clip Derf CIF
+// corpus: at speed 4, on high spatial-DETAIL content, the configuration
+// `speed 6 + include_near_mvs + 4x4 partitions` beats the s4 preset on BOTH
+// axes -- bus -2.01%, tempete -2.22%, mobile -2.86% BD, none of them slower
+// (paired win-rate, 9 rounds). On the rest it declines and the output is
+// byte-identical to the s4 preset.
+//
+// The signal is SPATIAL DETAIL (mean |horizontal luma gradient|), not motion.
+// That matters: `minpart4` pays where there is fine spatial STRUCTURE for a
+// 4x4 partition to model. coastguard is water -- high apparent motion but low
+// detail (6.19) -- so every motion signal misclassified it as a win when it
+// measures +0.54%, while detail places it correctly among the declines.
+// Ordering the corpus by detail, the last loser (news 6.91) and the first win
+// (bus 10.51) leave a 52% gap, four times wider than the best motion signal.
+static MINPART_DISPATCH: OnceLock<bool> = OnceLock::new();
+
+/// Set by the CLI from a source probe, BEFORE the first `from_preset`.
+pub fn set_minpart_dispatch(on: bool) {
+  let _ = MINPART_DISPATCH.set(on);
+}
+#[inline]
+pub fn minpart_dispatch() -> bool {
+  *MINPART_DISPATCH.get().unwrap_or(&false)
+}
+/// `RAV1E_MINPART=auto` forces the probe on at any tier; `0` disables it.
+#[inline]
+pub fn minpart_auto() -> bool {
+  match std::env::var("RAV1E_MINPART") {
+    Ok(v) => {
+      let v = v.trim();
+      v.eq_ignore_ascii_case("auto") || v == "1"
+    }
+    Err(_) => fast_tier() >= FastTier::Fast,
+  }
+}
+/// Detail floor above which the dispatch engages. CONSERVATIVE: it sits in the
+/// 6.91..10.51 gap, so it routes only clips comfortably inside the measured
+/// winning region and concedes foreman (detail 4.68, a -0.81% win) rather than
+/// risk coastguard (6.19, a +0.54% loss).
+static MINPART_T: OnceLock<f64> = OnceLock::new();
+#[inline]
+pub fn minpart_detail_t() -> f64 {
+  *MINPART_T.get_or_init(|| {
+    std::env::var("RAV1E_MINPART_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(8.7)
+  })
+}
+
 // prom_av1e056: maximum pyramid level still allowed to inherit CDFs from a
 // reference (above it, primary_ref_frame = PRIMARY_REF_NONE and the frame
 // starts from default CDFs). The historical value is 2, which was unreachable
