@@ -98,34 +98,126 @@ fn mc_block<T: Pixel>(
 fn sad_mc<T: Pixel>(
   tgt: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize, pred: &Plane<T>,
 ) -> u64 {
+  // The target block is always inside the frame, so this never needs the clamp.
+  let (ts, ps) = (tgt.cfg.stride, pred.cfg.stride);
+  let (t, p) = (tgt.data_origin(), pred.data_origin());
   let mut sad = 0u64;
+  for y in 0..bh {
+    let tr = &t[(by + y) * ts + bx..][..bw];
+    let pr = &p[y * ps..][..bw];
+    for x in 0..bw {
+      sad +=
+        (i32::cast_from(tr[x]) - i32::cast_from(pr[x])).unsigned_abs() as u64;
+    }
+  }
+  sad
+}
+
+/// SAD of the block against `nb` displaced by an integer offset.
+///
+/// Two paths, byte-identical in result. The search evaluates this hundreds of
+/// times per block, and the general path clamps EVERY pixel read — which both
+/// costs a compare per sample and blocks vectorisation. Interior blocks (the
+/// overwhelming majority) need no clamping at all, so they take a straight
+/// row-slice loop that LLVM can vectorise; only blocks whose displaced window
+/// actually crosses the frame edge pay for the clamp.
+fn sad_int<T: Pixel>(
+  tgt: &Plane<T>, nb: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize,
+  dx: isize, dy: isize,
+) -> u64 {
+  let (x0, y0) = (bx as isize + dx, by as isize + dy);
+  let (nw, nh) = (nb.cfg.width as isize, nb.cfg.height as isize);
+  let mut sad = 0u64;
+  if x0 >= 0 && y0 >= 0 && x0 + bw as isize <= nw && y0 + bh as isize <= nh {
+    let (ts, ns) = (tgt.cfg.stride, nb.cfg.stride);
+    let (t, n) = (tgt.data_origin(), nb.data_origin());
+    let (x0, y0) = (x0 as usize, y0 as usize);
+    for y in 0..bh {
+      let tr = &t[(by + y) * ts + bx..][..bw];
+      let nr = &n[(y0 + y) * ns + x0..][..bw];
+      for x in 0..bw {
+        sad +=
+          (i32::cast_from(tr[x]) - i32::cast_from(nr[x])).unsigned_abs() as u64;
+      }
+    }
+    return sad;
+  }
   for y in 0..bh {
     for x in 0..bw {
       let a = px(tgt, (bx + x) as isize, (by + y) as isize);
-      let b = i32::cast_from(pred.data_origin()[y * pred.cfg.stride + x]);
+      let b = px(nb, (bx + x) as isize + dx, (by + y) as isize + dy);
       sad += (a - b).unsigned_abs() as u64;
     }
   }
   sad
 }
 
-/// Integer-pel full search — stage 1. Full rather than stepped: the neighbours
-/// of an alt-ref are temporally close so the window is small, and a full search
-/// keeps the result deterministic (no early-exit ordering effects).
+/// Coarse step search, used only when the configured range exceeds the fine
+/// window. A full search over a wide window is quadratic and unaffordable; this
+/// halves the step from `range/2` down to 2, which reaches a far offset in
+/// ~8*log2(range) probes.
+///
+/// This exists because of `bus`: it pans fast enough that its true
+/// frame-to-frame motion leaves a +-4 window, so the fine search saturated at
+/// the window edge and the filter blended MISMATCHED content — the same
+/// alignment failure the sub-pel work fixed, arriving via range instead of
+/// precision. A filter that cannot reach the motion cannot align to it.
+fn search_coarse<T: Pixel>(
+  tgt: &Plane<T>, nb: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize,
+  range: isize,
+) -> (isize, isize) {
+  let (mut cx, mut cy) = (0isize, 0isize);
+  let mut best = sad_int(tgt, nb, bx, by, bw, bh, 0, 0);
+  let mut step = range / 2;
+  while step >= 2 {
+    let (mut nx, mut ny) = (cx, cy);
+    for (dy, dx) in [
+      (-step, 0),
+      (step, 0),
+      (0, -step),
+      (0, step),
+      (-step, -step),
+      (-step, step),
+      (step, -step),
+      (step, step),
+    ] {
+      let (ty, tx) = (cy + dy, cx + dx);
+      if ty.abs() > range || tx.abs() > range {
+        continue;
+      }
+      let sad = sad_int(tgt, nb, bx, by, bw, bh, tx, ty);
+      if sad < best {
+        best = sad;
+        nx = tx;
+        ny = ty;
+      }
+    }
+    if nx == cx && ny == cy {
+      step /= 2;
+    } else {
+      cx = nx;
+      cy = ny;
+    }
+  }
+  (cx, cy)
+}
+
+/// Integer-pel search — stage 1. A full search over the fine window (optionally
+/// recentred by a coarse pass): full rather than stepped so the result is
+/// deterministic, with no early-exit ordering effects.
 fn search_integer<T: Pixel>(
   tgt: &Plane<T>, nb: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize,
 ) -> (isize, isize) {
-  let (mut best, mut bdx, mut bdy) = (u64::MAX, 0isize, 0isize);
-  for dy in -SEARCH..=SEARCH {
-    for dx in -SEARCH..=SEARCH {
-      let mut sad = 0u64;
-      for y in 0..bh {
-        for x in 0..bw {
-          let a = px(tgt, (bx + x) as isize, (by + y) as isize);
-          let b = px(nb, (bx + x) as isize + dx, (by + y) as isize + dy);
-          sad += (a - b).unsigned_abs() as u64;
-        }
-      }
+  let range = crate::harvest::arnr_range() as isize;
+  let (cx, cy) = if range > SEARCH {
+    search_coarse(tgt, nb, bx, by, bw, bh, range)
+  } else {
+    (0, 0)
+  };
+  let (mut best, mut bdx, mut bdy) = (u64::MAX, cx, cy);
+  for dy in (cy - SEARCH)..=(cy + SEARCH) {
+    for dx in (cx - SEARCH)..=(cx + SEARCH) {
+      let sad = sad_int(tgt, nb, bx, by, bw, bh, dx, dy);
       // Ties prefer the smaller offset, so a static block stays at (0,0).
       if sad < best
         || (sad == best && dx.abs() + dy.abs() < bdx.abs() + bdy.abs())

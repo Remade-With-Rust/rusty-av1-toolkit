@@ -1231,10 +1231,17 @@ pub fn gm_ransac() -> bool {
 static ARNR: OnceLock<bool> = OnceLock::new();
 
 /// True when hidden alt-ref sources are temporally filtered.
+///
+/// Default-ON from the Fast tier (prom_av1e062c). With sub-pel alignment and a
+/// search range that reaches real motion, this is -0.589% BD-rate over the
+/// 6-clip corpus with EVERY clip winning (worst -0.150%) — a monotone
+/// non-regression, so it needs no content dispatch. Stock/clean tiers are left
+/// byte-identical.
 #[inline]
 pub fn arnr() -> bool {
-  *ARNR.get_or_init(|| {
-    matches!(std::env::var("RAV1E_ARNR"), Ok(v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"))
+  *ARNR.get_or_init(|| match std::env::var("RAV1E_ARNR") {
+    Ok(v) => v.trim() == "1" || v.trim().eq_ignore_ascii_case("on"),
+    Err(_) => fast_tier() >= FastTier::Fast,
   })
 }
 
@@ -1291,5 +1298,24 @@ pub fn arnr_subpel_margin() -> f64 {
       .ok()
       .and_then(|v| v.trim().parse().ok())
       .unwrap_or(0.0)
+  })
+}
+
+static ARNR_RANGE: OnceLock<u32> = OnceLock::new();
+
+/// Full reach of the temporal filter's integer search, in pixels. Values above
+/// the fine window add a coarse step-search pre-pass to recentre it.
+///
+/// 12, not 4: at 4 the search saturated on fast-panning content and the filter
+/// blended MISMATCHED blocks — bus alone went +0.340% at range 4 and -0.492% at
+/// range 12. Not larger either: 24 measured +0.280% on bus, the coarse pass
+/// locking onto spurious far matches in repetitive texture.
+#[inline]
+pub fn arnr_range() -> u32 {
+  *ARNR_RANGE.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_RANGE")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(12)
   })
 }
