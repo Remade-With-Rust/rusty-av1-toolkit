@@ -49,13 +49,49 @@
 | Language | Rust | **Rust** (fork + tuned) |
 | Encoder, default (`--racecar off`) | baseline | **~1.10× faster, byte-identical bitstream** |
 | Encoder, opt-in (`--racecar on`) | — | **~1.69× faster** (bitstream changes; pair `--tune Psnr`) |
+| Encoder, opt-in (`RAV1E_FAST=fast`) | — | **content-adaptive quality tier** — per-clip dispatches, each gated so declined content stays byte-identical |
 | Decoder | rav1d (safe-Rust dav1d port) | **same, profiled at its performance floor** |
 | Memory safety | encoder mixed · decoder safe-forward | **same** — `unsafe`/asm isolated |
 | License (copyright) | BSD-2 | **BSD-2** — embed freely, no copyleft |
 
-<sub>Encoder figures are whole-encode wall-clock vs stock rav1e via real CLI A/B on
+<sub>Encoder speed figures are whole-encode wall-clock vs stock rav1e via real CLI A/B on
 this machine; `--racecar off` is verified byte-identical to stock output. Your
 mileage varies with clip, speed level, and CPU.</sub>
+
+### The content-adaptive tier (`RAV1E_FAST=fast`, opt-in)
+
+A quality tier built brick by brick, where each brick that helps some content and
+hurts other content is **dispatched on a measured content signal** rather than
+shipped as a fixed compromise. Every dispatch is gated the same way: on content it
+declines, the bitstream is **byte-identical** to the tier without it, so a
+misclassification cannot regress quality — it can only miss a win.
+
+The most recent addition (partition dispatch, `prom_av1e065`) routes by **spatial
+detail** — mean |horizontal luma gradient| measured on the source before encoding:
+
+| | measured |
+|---|---|
+| Corpus | 8 Derf CIF clips, 32 frames, 7-point quality ladders |
+| Engaged on | 3 clips (mobile −1.98%, tempete −1.70%, bus −0.44% BD-rate) |
+| Declined on | 5 clips — **byte-identical**, 0.00% |
+| Mean / worst clip | **−0.52% / 0.00%** (monotone non-regression) |
+
+Two things worth stating plainly, because they are easy to get wrong:
+
+- **The tier's bricks are sub-additive.** The same partition dispatch measured
+  −2.01% on bus in isolation and **−0.44%** inside the tier, because the tier's
+  other tools already capture part of the same gain. Tier figures are measured in
+  the tier; brick figures do not add up.
+- **The tier is a quality/speed *trade*, not a free win.** Against the
+  byte-identical default it is content-dependent (measured +5.3% on bus, +3.3% on
+  akiyo, −8.7% on mobile at speed 6) — which is precisely why it is opt-in and why
+  its bricks are dispatched rather than defaulted globally.
+
+<sub>BD-rate is Bjøntegaard-Delta over PCHIP-interpolated ladders on the measured
+PSNR overlap only, computed frame-by-index on decoded output. Encodes are
+deterministic, so BD figures are exact; timing verdicts use a paired win-rate
+(both arms per round, alternating order) because wall-clock on this machine drifts
+far more than the effects being measured.</sub>
 
 ---
 
