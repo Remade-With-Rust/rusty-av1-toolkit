@@ -16,9 +16,21 @@
 // code and then propagates as a worse prediction for everything referencing it.
 // Averaging along the motion trajectory removes noise while preserving real
 // detail, because real detail is what the motion search aligns.
+//
+// SUB-PEL (prom_av1e062b): the first version blended at INTEGER pel, and its
+// strength sweep on clean content was monotone toward "barely filter at all" —
+// the signature of a filter destroying as much as it removes. Blending a
+// neighbour that is misaligned by a fraction of a pixel mixes a shifted copy of
+// the image into itself, which is a low-pass blur applied to exactly the real
+// detail the filter is supposed to preserve. Real motion is not integer, so at
+// integer pel most blocks are misaligned by construction. The fix is to align
+// with the same 8-tap sub-pel MC the encoder itself predicts with: refine the
+// integer match to 1/8 pel and blend against the INTERPOLATED block.
 
+use crate::cpu_features::CpuFeatureLevel;
 use crate::encoder::FrameInvariants;
 use crate::frame::*;
+use crate::mc::*;
 use crate::util::{CastFromPrimitive, Pixel};
 use std::sync::Arc;
 
@@ -26,7 +38,8 @@ use std::sync::Arc;
 const RADIUS: i64 = 2;
 /// Half-extent of the integer-pel block search, in pixels.
 const SEARCH: isize = 4;
-/// Filter block size, in luma pixels.
+/// Filter block size, in luma pixels. A power of two and even, which is what
+/// `put_8tap` requires of its output block.
 const BLK: usize = 16;
 /// Weight given to the target frame's own pixels. Neighbours contribute 0..16
 /// depending on how well they match, so this holds the target at 2x the weight
@@ -43,11 +56,63 @@ fn px<T: Pixel>(p: &Plane<T>, x: isize, y: isize) -> i32 {
   i32::cast_from(p.data_origin()[yc * p.cfg.stride + xc])
 }
 
-/// Best integer-pel offset of `nb` against `tgt` for the block at (bx, by),
-/// by SAD. Full search over a small window: the neighbours of an alt-ref are
-/// temporally close, so the true offset is small, and a full search keeps the
-/// result deterministic (no seeded/early-exit ordering effects).
-fn search_block<T: Pixel>(
+/// Motion-compensate a `bw`x`bh` block of `src` at (bx, by) displaced by the
+/// 1/8-pel LUMA motion vector (mv_row, mv_col), into `dst`.
+///
+/// The MV is expressed in luma units for every plane and rescaled here exactly
+/// as `PredictionMode::get_mv_params` does for inter prediction — that shared
+/// convention is the point. The integer version scaled chroma by `dx >> xdec`,
+/// which silently dropped the sub-pel part of the chroma displacement; here
+/// chroma gets the same treatment the encoder's own predictor gives it.
+fn mc_block<T: Pixel>(
+  dst: &mut Plane<T>, src: &Plane<T>, bx: usize, by: usize, bw: usize,
+  bh: usize, mv_row: i32, mv_col: i32, bit_depth: usize,
+) {
+  let &PlaneConfig { xdec, ydec, .. } = &src.cfg;
+  let row_offset = mv_row >> (3 + ydec);
+  let col_offset = mv_col >> (3 + xdec);
+  let row_frac = (mv_row << (1 - ydec)) & 0xf;
+  let col_frac = (mv_col << (1 - xdec)) & 0xf;
+  let po = PlaneOffset {
+    x: bx as isize + col_offset as isize - 3,
+    y: by as isize + row_offset as isize - 3,
+  };
+  // `clamp()` edge-extends, so a block at the frame border - and the 3-pixel
+  // filter margin around it - reads defined pixels instead of running off.
+  let slice = src.slice(po).clamp().subslice(3, 3);
+  put_8tap(
+    &mut dst.as_region_mut(),
+    slice,
+    bw,
+    bh,
+    col_frac,
+    row_frac,
+    FilterMode::REGULAR,
+    FilterMode::REGULAR,
+    bit_depth,
+    CpuFeatureLevel::default(),
+  );
+}
+
+/// SAD between the target block and an already motion-compensated block.
+fn sad_mc<T: Pixel>(
+  tgt: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize, pred: &Plane<T>,
+) -> u64 {
+  let mut sad = 0u64;
+  for y in 0..bh {
+    for x in 0..bw {
+      let a = px(tgt, (bx + x) as isize, (by + y) as isize);
+      let b = i32::cast_from(pred.data_origin()[y * pred.cfg.stride + x]);
+      sad += (a - b).unsigned_abs() as u64;
+    }
+  }
+  sad
+}
+
+/// Integer-pel full search — stage 1. Full rather than stepped: the neighbours
+/// of an alt-ref are temporally close so the window is small, and a full search
+/// keeps the result deterministic (no early-exit ordering effects).
+fn search_integer<T: Pixel>(
   tgt: &Plane<T>, nb: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize,
 ) -> (isize, isize) {
   let (mut best, mut bdx, mut bdy) = (u64::MAX, 0isize, 0isize);
@@ -74,6 +139,70 @@ fn search_block<T: Pixel>(
   (bdx, bdy)
 }
 
+/// Refine an integer match to sub-pel by successive halving: half-pel (4/8),
+/// then quarter-pel (2/8), then eighth-pel (1/8). Each stage tests the eight
+/// neighbours of the current best at that step size and keeps it only if it
+/// actually lowers SAD, so the result can never be worse than the integer match
+/// it started from.
+fn refine_subpel<T: Pixel>(
+  tgt: &Plane<T>, nb: &Plane<T>, tmp: &mut Plane<T>, bx: usize, by: usize,
+  bw: usize, bh: usize, mut mv_row: i32, mut mv_col: i32, bit_depth: usize,
+) -> (i32, i32) {
+  let (int_row, int_col) = (mv_row, mv_col);
+  mc_block(tmp, nb, bx, by, bw, bh, mv_row, mv_col, bit_depth);
+  let int_sad = sad_mc(tgt, bx, by, bw, bh, tmp);
+  let mut best = int_sad;
+  for step in [4i32, 2, 1] {
+    loop {
+      let (mut br, mut bc) = (mv_row, mv_col);
+      let mut improved = false;
+      for (dr, dc) in [
+        (-step, 0),
+        (step, 0),
+        (0, -step),
+        (0, step),
+        (-step, -step),
+        (-step, step),
+        (step, -step),
+        (step, step),
+      ] {
+        let (r, c) = (mv_row + dr, mv_col + dc);
+        mc_block(tmp, nb, bx, by, bw, bh, r, c, bit_depth);
+        let sad = sad_mc(tgt, bx, by, bw, bh, tmp);
+        if sad < best {
+          best = sad;
+          br = r;
+          bc = c;
+          improved = true;
+        }
+      }
+      mv_row = br;
+      mv_col = bc;
+      if !improved {
+        break;
+      }
+    }
+  }
+  // Sub-pel alignment is not free: `put_8tap` at a fractional position is an
+  // interpolation, and interpolation low-passes. Where the true motion IS
+  // integer — a static or near-static block — the integer match is already
+  // exact, and any sub-pel offset that "wins" is fitting noise while paying
+  // that blur on real detail. So only take the refinement when it beats the
+  // integer match by a real margin, never on a noise-level improvement.
+  // MEASURED AND DEFAULTED OFF (margin 0.0): the hypothesis was that sub-pel
+  // blur explained the near-static akiyo's +1.041%, but margins of 0.02/0.05/
+  // 0.10 left akiyo at +0.971/+1.483/+1.332 and made every mean worse. Akiyo's
+  // R-D points then showed differences of 0.02-0.09 dB and ~0.5% of a ~1-5
+  // kbit/frame rate, non-monotone in QP — an ill-conditioned BD fit amplifying
+  // encoder noise, not a regression to chase. The knob stays for content where
+  // the trade is real.
+  let margin = crate::harvest::arnr_subpel_margin();
+  if (best as f64) > (int_sad as f64) * (1.0 - margin) {
+    return (int_row, int_col);
+  }
+  (mv_row, mv_col)
+}
+
 /// Per-pixel blend weight for a neighbour, from how well it matches.
 ///
 /// A large difference means the motion search did NOT find this pixel's true
@@ -87,75 +216,106 @@ fn weight(diff: i32, strength: u32) -> u32 {
   16 - m
 }
 
-fn filter_plane<T: Pixel>(
-  out: &mut Plane<T>, tgt: &Plane<T>, nbs: &[&Plane<T>], mvs: &[(isize, isize)],
-  bx: usize, by: usize, bw: usize, bh: usize, strength: u32, maxval: i32,
-) {
-  for y in 0..bh {
-    for x in 0..bw {
-      let (px_, py_) = ((bx + x) as isize, (by + y) as isize);
-      let c = px(tgt, px_, py_);
-      let mut acc = c as u32 * CENTER_W;
-      let mut cnt = CENTER_W;
-      for (nb, &(dx, dy)) in nbs.iter().zip(mvs.iter()) {
-        let v = px(nb, px_ + dx, py_ + dy);
-        let w = weight(c - v, strength);
-        acc += v as u32 * w;
-        cnt += w;
-      }
-      let val = ((acc + cnt / 2) / cnt) as i32;
-      let stride = out.cfg.stride;
-      out.data_origin_mut()[(by + y) * stride + (bx + x)] =
-        T::cast_from(val.clamp(0, maxval));
-    }
-  }
-}
-
 /// Temporally filter `tgt` against `nbs`, returning a new frame.
 pub fn filter_frame<T: Pixel>(
   tgt: &Frame<T>, nbs: &[Arc<Frame<T>>], strength: u32, bit_depth: usize,
 ) -> Frame<T> {
   let mut out = tgt.clone();
   let maxval = (1i32 << bit_depth) - 1;
+  let subpel = crate::harvest::arnr_subpel();
   let (w, h) = (tgt.planes[0].cfg.width, tgt.planes[0].cfg.height);
-  let luma_nbs: Vec<&Plane<T>> = nbs.iter().map(|f| &f.planes[0]).collect();
+  let nplanes = tgt.planes.len();
+
+  // Scratch for the motion-compensated block, one per plane subsampling, plus
+  // one prediction buffer per neighbour so the blend can read them together.
+  let mut tmp: Plane<T> = Plane::new(BLK, BLK, 0, 0, 0, 0);
+  let mut preds: Vec<Plane<T>> =
+    (0..nbs.len()).map(|_| Plane::new(BLK, BLK, 0, 0, 0, 0)).collect();
 
   let mut by = 0;
   while by < h {
-    let mut bx = 0;
     let bh = BLK.min(h - by);
+    let mut bx = 0;
     while bx < w {
       let bw = BLK.min(w - bx);
-      // The motion is found ONCE on luma and reused by chroma — the planes
-      // describe the same moving content, and a chroma-only search would let
-      // the planes disagree about where a block came from.
-      let mvs: Vec<(isize, isize)> = luma_nbs
+
+      // The motion is found ONCE on luma and reused by every plane — the planes
+      // describe the same moving content, and a per-plane search would let them
+      // disagree about where a block came from.
+      let mvs: Vec<(i32, i32)> = nbs
         .iter()
-        .map(|nb| search_block(&tgt.planes[0], nb, bx, by, bw, bh))
+        .map(|f| {
+          let nb = &f.planes[0];
+          let (dx, dy) = search_integer(&tgt.planes[0], nb, bx, by, bw, bh);
+          let (mut r, mut c) = (dy as i32 * 8, dx as i32 * 8);
+          if subpel {
+            let (rr, cc) = refine_subpel(
+              &tgt.planes[0],
+              nb,
+              &mut tmp,
+              bx,
+              by,
+              bw,
+              bh,
+              r,
+              c,
+              bit_depth,
+            );
+            r = rr;
+            c = cc;
+          }
+          (r, c)
+        })
         .collect();
 
-      for pli in 0..tgt.planes.len() {
-        let (xdec, ydec) =
-          (tgt.planes[pli].cfg.xdec, tgt.planes[pli].cfg.ydec);
-        let (pbx, pby) = (bx >> xdec, by >> ydec);
-        let (pw, ph) =
-          (tgt.planes[pli].cfg.width, tgt.planes[pli].cfg.height);
-        if pbx >= pw || pby >= ph {
+      for pli in 0..nplanes {
+        let cfg = &tgt.planes[pli].cfg;
+        let (pbx, pby) = (bx >> cfg.xdec, by >> cfg.ydec);
+        if pbx >= cfg.width || pby >= cfg.height {
           continue;
         }
-        let (pbw, pbh) =
-          (((bw + (1 << xdec) - 1) >> xdec).min(pw - pbx),
-           ((bh + (1 << ydec) - 1) >> ydec).min(ph - pby));
-        let pmvs: Vec<(isize, isize)> =
-          mvs.iter().map(|&(dx, dy)| (dx >> xdec, dy >> ydec)).collect();
-        let pnbs: Vec<&Plane<T>> =
-          nbs.iter().map(|f| &f.planes[pli]).collect();
-        // Split the borrow: read the pristine target, write the copy.
+        let pbw = (((bw + (1 << cfg.xdec) - 1) >> cfg.xdec)
+          .min(cfg.width - pbx))
+        .max(1);
+        let pbh = (((bh + (1 << cfg.ydec) - 1) >> cfg.ydec)
+          .min(cfg.height - pby))
+        .max(1);
+        // put_8tap needs a power-of-two width and an even height, so always
+        // compensate the full scratch block and use only the valid corner.
+        let (fw, fh) = (BLK >> cfg.xdec, BLK >> cfg.ydec);
+        for (n, f) in nbs.iter().enumerate() {
+          mc_block(
+            &mut preds[n],
+            &f.planes[pli],
+            pbx,
+            pby,
+            fw,
+            fh,
+            mvs[n].0,
+            mvs[n].1,
+            bit_depth,
+          );
+        }
+
         let tgt_p = &tgt.planes[pli];
-        filter_plane(
-          &mut out.planes[pli], tgt_p, &pnbs, &pmvs, pbx, pby, pbw, pbh,
-          strength, maxval,
-        );
+        let stride = out.planes[pli].cfg.stride;
+        for y in 0..pbh {
+          for x in 0..pbw {
+            let c = px(tgt_p, (pbx + x) as isize, (pby + y) as isize);
+            let mut acc = c as u32 * CENTER_W;
+            let mut cnt = CENTER_W;
+            for p in preds.iter() {
+              let v = i32::cast_from(p.data_origin()[y * p.cfg.stride + x]);
+              let wt = weight(c - v, strength);
+              acc += v as u32 * wt;
+              cnt += wt;
+            }
+            let val = ((acc + cnt / 2) / cnt) as i32;
+            out.planes[pli].data_origin_mut()
+              [(pby + y) * stride + (pbx + x)] =
+              T::cast_from(val.clamp(0, maxval));
+          }
+        }
       }
       bx += BLK;
     }

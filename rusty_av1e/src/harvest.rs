@@ -1265,3 +1265,31 @@ pub fn arnr_max_level() -> u64 {
       .unwrap_or(0)
   })
 }
+
+static ARNR_SUBPEL: OnceLock<bool> = OnceLock::new();
+
+/// True when the temporal filter aligns neighbours at 1/8 pel with the 8-tap
+/// MC instead of blending at integer pel. Kept switchable so the sub-pel
+/// increment can be measured ALONE against the integer version.
+#[inline]
+pub fn arnr_subpel() -> bool {
+  *ARNR_SUBPEL.get_or_init(|| match std::env::var("RAV1E_ARNR_SUBPEL") {
+    Ok(v) => !(v.trim() == "0" || v.trim().eq_ignore_ascii_case("off")),
+    Err(_) => true,
+  })
+}
+
+static ARNR_SUBPEL_MARGIN: OnceLock<f64> = OnceLock::new();
+
+/// Fractional SAD improvement a sub-pel refinement must achieve over the
+/// integer match before the temporal filter will use it. Guards against paying
+/// interpolation blur for alignment that static content never needed.
+#[inline]
+pub fn arnr_subpel_margin() -> f64 {
+  *ARNR_SUBPEL_MARGIN.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_SUBPEL_MARGIN")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0.0)
+  })
+}
