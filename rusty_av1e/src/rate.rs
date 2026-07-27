@@ -81,6 +81,52 @@ const DQP_Q57: &[i64; FRAME_NSUBTYPES] = &[
   (2.0 * (33_810_170.0 / 86_043_287.0) * (1i64 << 57) as f64) as i64,
 ];
 
+// --- D4b/D5 probe: scale the per-frame-type QP ladder -----------------------
+// Measured (bus, 32f, q100): our per-display-frame PSNR is a sawtooth with
+// std 1.11 dB (peak-to-trough 3.3 dB excluding the key frame) while libaom
+// runs std 0.49 dB -- we concentrate quality in periodic anchors. The ladder
+// above is the mechanism: one unit == 15 quantizer steps, so I..B1 spans 45
+// steps. `RAV1E_DQP_SCALE` scales the whole ladder (1.0 = stock, 0.0 = flat)
+// so the spread can be swept against BD-rate. UNSET => stock, byte-identical.
+fn dqp_scale() -> f64 {
+  static S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+  *S.get_or_init(|| {
+    std::env::var("RAV1E_DQP_SCALE")
+      .ok()
+      .and_then(|v| v.trim().parse::<f64>().ok())
+      .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 4.0)
+      .unwrap_or(1.0)
+  })
+}
+
+// D4a probe: scale ONLY the key-frame (FRAME_SUBTYPE_I) entry, so the
+// key-frame allocation can be isolated from the rest of the ladder (the
+// RAV1E_DQP_SCALE sweep moves all four entries together and cannot separate
+// them). Measured: our key frame is 21625 B @ 39.56 dB, +3.98 dB above our
+// own stream mean, vs libaom 14343 B @ 36.11 dB, +0.94 dB above its mean.
+// 0.0 = key coded at the base quantizer. UNSET => stock.
+fn dqp_i_scale() -> f64 {
+  static S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+  *S.get_or_init(|| {
+    std::env::var("RAV1E_DQP_I_SCALE")
+      .ok()
+      .and_then(|v| v.trim().parse::<f64>().ok())
+      .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 4.0)
+      .unwrap_or(1.0)
+  })
+}
+
+#[inline]
+fn dqp(fti: usize) -> i64 {
+  let s = dqp_scale()
+    * if fti == FRAME_SUBTYPE_I { dqp_i_scale() } else { 1.0 };
+  if s == 1.0 {
+    DQP_Q57[fti]
+  } else {
+    (DQP_Q57[fti] as f64 * s) as i64
+  }
+}
+
 // For 8-bit-depth inter frames, log_q_y is derived from log_target_q with a
 //  linear model:
 //  log_q_y = log_target_q + (log_target_q >> 32) * Q_MODEL_MUL + Q_MODEL_ADD
@@ -707,7 +753,7 @@ impl RCState {
     // Adjust the quantizer for the frame type, result is Q57:
     let log_q = ((self.pass1_log_base_q + (1i64 << 11)) >> 12)
       * (MQP_Q12[fti] as i64)
-      + DQP_Q57[fti];
+      + dqp(fti);
     QuantizerParameters::new_from_log_q(
       self.pass1_log_base_q,
       log_q,
@@ -926,7 +972,7 @@ impl RCState {
           // Modulate base quantizer by frame type.
           let log_q = ((log_base_q + (1i64 << 11)) >> 12)
             * (MQP_Q12[ftj] as i64)
-            + DQP_Q57[ftj];
+            + dqp(ftj);
           // All the fields here are Q57 except for the exponent, which is
           //  Q6.
           bits += (nframes[ftj] as i64)
@@ -960,7 +1006,7 @@ impl RCState {
       // Modulate base quantizer by frame type.
       let mut log_q = ((log_base_q + (1i64 << 11)) >> 12)
         * (MQP_Q12[fti] as i64)
-        + DQP_Q57[fti];
+        + dqp(fti);
       // The above allocation looks only at the total rate we'll accumulate
       //  in the next reservoir_frame_delay frames.
       // However, we could overflow the bit reservoir on the very next
@@ -1064,7 +1110,7 @@ impl RCState {
     let log_base_q = (log_ac_q + log_dc_q + 1) >> 1;
     // Adjust the quantizer for the frame type, result is Q57:
     let log_q = ((log_base_q + (1i64 << 11)) >> 12) * (MQP_Q12[fti] as i64)
-      + DQP_Q57[fti];
+      + dqp(fti);
     (log_base_q, log_q)
   }
 
