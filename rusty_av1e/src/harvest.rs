@@ -1319,3 +1319,49 @@ pub fn arnr_range() -> u32 {
       .unwrap_or(12)
   })
 }
+
+static ARNR_STRENGTH_HI: OnceLock<u32> = OnceLock::new();
+
+/// Strength used for blocks whose neighbour aligned WELL (residual at or below
+/// `arnr_resid_t`). Higher than the base strength: where the match is genuinely
+/// good the remaining difference is noise, and averaging it harder is free.
+#[inline]
+pub fn arnr_strength_hi() -> u32 {
+  *ARNR_STRENGTH_HI.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_STRENGTH_HI")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(6)
+  })
+}
+
+static ARNR_RESID_T: OnceLock<u32> = OnceLock::new();
+
+/// Mean per-pixel post-MC residual at or below which a block/neighbour pair is
+/// treated as well-aligned and filtered at `arnr_strength_hi`.
+///
+/// 0 disables the dispatch and is BYTE-IDENTICAL to a flat base strength: a
+/// pair with zero residual has every per-pixel diff zero, and `weight(0, s)` is
+/// 16 for every s, so the strength cannot change the blend.
+#[inline]
+pub fn arnr_resid_t() -> u32 {
+  *ARNR_RESID_T.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_RESID_T")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(0)
+  })
+}
+
+static ARNR_RADIUS: OnceLock<u32> = OnceLock::new();
+
+/// Temporal radius of the filter, in frames either side of the target.
+#[inline]
+pub fn arnr_radius() -> u32 {
+  *ARNR_RADIUS.get_or_init(|| {
+    std::env::var("RAV1E_ARNR_RADIUS")
+      .ok()
+      .and_then(|v| v.trim().parse().ok())
+      .unwrap_or(2)
+  })
+}

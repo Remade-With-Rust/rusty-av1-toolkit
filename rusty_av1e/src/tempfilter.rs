@@ -34,8 +34,10 @@ use crate::mc::*;
 use crate::util::{CastFromPrimitive, Pixel};
 use std::sync::Arc;
 
-/// How many frames either side of the target are blended in.
-const RADIUS: i64 = 2;
+/// How many frames either side of the target are blended in (see
+/// `harvest::arnr_radius`). More neighbours average MORE noise away without
+/// widening the per-pixel acceptance window the way strength does — a
+/// different lever on the same goal.
 /// Half-extent of the integer-pel block search, in pixels.
 const SEARCH: isize = 4;
 /// Filter block size, in luma pixels. A power of two and even, which is what
@@ -207,7 +209,7 @@ fn search_coarse<T: Pixel>(
 /// deterministic, with no early-exit ordering effects.
 fn search_integer<T: Pixel>(
   tgt: &Plane<T>, nb: &Plane<T>, bx: usize, by: usize, bw: usize, bh: usize,
-) -> (isize, isize) {
+) -> (isize, isize, u64) {
   let range = crate::harvest::arnr_range() as isize;
   let (cx, cy) = if range > SEARCH {
     search_coarse(tgt, nb, bx, by, bw, bh, range)
@@ -228,7 +230,7 @@ fn search_integer<T: Pixel>(
       }
     }
   }
-  (bdx, bdy)
+  (bdx, bdy, best)
 }
 
 /// Refine an integer match to sub-pel by successive halving: half-pel (4/8),
@@ -239,7 +241,7 @@ fn search_integer<T: Pixel>(
 fn refine_subpel<T: Pixel>(
   tgt: &Plane<T>, nb: &Plane<T>, tmp: &mut Plane<T>, bx: usize, by: usize,
   bw: usize, bh: usize, mut mv_row: i32, mut mv_col: i32, bit_depth: usize,
-) -> (i32, i32) {
+) -> (i32, i32, u64) {
   let (int_row, int_col) = (mv_row, mv_col);
   mc_block(tmp, nb, bx, by, bw, bh, mv_row, mv_col, bit_depth);
   let int_sad = sad_mc(tgt, bx, by, bw, bh, tmp);
@@ -290,9 +292,9 @@ fn refine_subpel<T: Pixel>(
   // the trade is real.
   let margin = crate::harvest::arnr_subpel_margin();
   if (best as f64) > (int_sad as f64) * (1.0 - margin) {
-    return (int_row, int_col);
+    return (int_row, int_col, int_sad);
   }
-  (mv_row, mv_col)
+  (mv_row, mv_col, best)
 }
 
 /// Per-pixel blend weight for a neighbour, from how well it matches.
@@ -324,6 +326,7 @@ pub fn filter_frame<T: Pixel>(
   let mut preds: Vec<Plane<T>> =
     (0..nbs.len()).map(|_| Plane::new(BLK, BLK, 0, 0, 0, 0)).collect();
 
+  let (mut stat_sum, mut stat_hi, mut stat_n) = (0u64, 0u64, 0u64);
   let mut by = 0;
   while by < h {
     let bh = BLK.min(h - by);
@@ -334,14 +337,15 @@ pub fn filter_frame<T: Pixel>(
       // The motion is found ONCE on luma and reused by every plane — the planes
       // describe the same moving content, and a per-plane search would let them
       // disagree about where a block came from.
-      let mvs: Vec<(i32, i32)> = nbs
+      let mvs: Vec<(i32, i32, u32)> = nbs
         .iter()
         .map(|f| {
           let nb = &f.planes[0];
-          let (dx, dy) = search_integer(&tgt.planes[0], nb, bx, by, bw, bh);
+          let (dx, dy, mut sad) =
+            search_integer(&tgt.planes[0], nb, bx, by, bw, bh);
           let (mut r, mut c) = (dy as i32 * 8, dx as i32 * 8);
           if subpel {
-            let (rr, cc) = refine_subpel(
+            let (rr, cc, ss) = refine_subpel(
               &tgt.planes[0],
               nb,
               &mut tmp,
@@ -355,8 +359,34 @@ pub fn filter_frame<T: Pixel>(
             );
             r = rr;
             c = cc;
+            sad = ss;
           }
-          (r, c)
+          // PER-BLOCK, PER-NEIGHBOUR STRENGTH DISPATCH (prom_av1e062d).
+          //
+          // Strength decides how much a MISMATCHED neighbour still gets
+          // blended, so the quantity that should set it is how well this
+          // neighbour actually aligned — which the search just measured, for
+          // free. Where the residual is low the two frames genuinely agree and
+          // their remaining difference is noise worth averaging harder; where
+          // it is high the match is the best of a bad set (occlusion, complex
+          // or fast local motion) and blending harder would smear real detail.
+          //
+          // This is why the clip-level sign-flip existed at all: strength 6
+          // won on the well-aligning clips and lost on bus and foreman. The
+          // split is not really between CLIPS, it is between BLOCKS that
+          // aligned and blocks that did not — and clips differ only in their
+          // mixture. Dispatching per block routes both cases correctly inside
+          // a single clip.
+          let mean_resid = (sad / (bw * bh) as u64) as u32;
+          stat_sum += mean_resid as u64;
+          stat_hi += u64::from(mean_resid > 8);
+          stat_n += 1;
+          let s = if mean_resid <= crate::harvest::arnr_resid_t() {
+            crate::harvest::arnr_strength_hi()
+          } else {
+            strength
+          };
+          (r, c, s)
         })
         .collect();
 
@@ -396,9 +426,9 @@ pub fn filter_frame<T: Pixel>(
             let c = px(tgt_p, (pbx + x) as isize, (pby + y) as isize);
             let mut acc = c as u32 * CENTER_W;
             let mut cnt = CENTER_W;
-            for p in preds.iter() {
+            for (p, mv) in preds.iter().zip(mvs.iter()) {
               let v = i32::cast_from(p.data_origin()[y * p.cfg.stride + x]);
-              let wt = weight(c - v, strength);
+              let wt = weight(c - v, mv.2);
               acc += v as u32 * wt;
               cnt += wt;
             }
@@ -412,6 +442,18 @@ pub fn filter_frame<T: Pixel>(
       bx += BLK;
     }
     by += BLK;
+  }
+  if std::env::var("RAV1E_ARNR_STATS").is_ok() {
+    // Harvest the candidate FRAME-level dispatch signal before building a
+    // dispatcher on it: does the post-MC residual actually separate the clips
+    // where flat strength 6 wins from the two where it loses?
+    let n = stat_n.max(1);
+    eprintln!(
+      "ARNR_STAT frame_mean_resid={:.2} frac_blocks_resid_over_8={:.3} blocks={}",
+      stat_sum as f64 / n as f64,
+      stat_hi as f64 / n as f64,
+      stat_n
+    );
   }
   out
 }
@@ -440,7 +482,7 @@ pub fn maybe_filter_altref<T: Pixel>(
   }
   let cur = fi.input_frameno as i64;
   let mut nbs: Vec<Arc<Frame<T>>> = Vec::new();
-  for k in 1..=RADIUS {
+  for k in 1..=(crate::harvest::arnr_radius() as i64) {
     for n in [cur - k, cur + k] {
       if n < 0 {
         continue;
