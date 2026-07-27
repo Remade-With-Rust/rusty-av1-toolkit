@@ -43,7 +43,7 @@ use crate::predict::{
 use crate::rdo_tables::*;
 use crate::tiling::*;
 use crate::transform::{TxSet, TxSize, TxType, RAV1E_TX_TYPES};
-use crate::util::{init_slice_repeat_mut, Aligned, Pixel};
+use crate::util::{init_slice_repeat_mut, Aligned, CastFromPrimitive, Pixel};
 use crate::write_tx_blocks;
 use crate::write_tx_tree;
 use crate::Tune;
@@ -124,6 +124,22 @@ impl Default for PartitionParameters {
   }
 }
 
+/// prom_av1e060: the (ref0, ref1) pair of GLOBAL motion vectors for a candidate.
+/// Used both for GLOBALMV blocks and for MV-stack slots past the real candidate
+/// count, which the decoder fills with the global MV rather than zero.
+fn gmv_pair<T: Pixel>(
+  fi: &FrameInvariants<T>, rf: [RefType; 2],
+) -> [MotionVector; 2] {
+  [
+    fi.global_mv(rf[0].to_index()),
+    if rf[1] != NONE_FRAME {
+      fi.global_mv(rf[1].to_index())
+    } else {
+      MotionVector::default()
+    },
+  ]
+}
+
 pub fn estimate_rate(qindex: u8, ts: TxSize, fast_distortion: u64) -> u64 {
   let bs_index = ts as usize;
   let q_bin_idx = (qindex as usize) / RDO_QUANT_DIV;
@@ -135,7 +151,15 @@ pub fn estimate_rate(qindex: u8, ts: TxSize, fast_distortion: u64) -> u64 {
   let y0 = RDO_RATE_TABLE[q_bin_idx][bs_index][bin_idx_down as usize] as i64;
   let y1 = RDO_RATE_TABLE[q_bin_idx][bs_index][bin_idx_up as usize] as i64;
   let slope = ((y1 - y0) << 8) / (x1 - x0);
-  (y0 + (((fast_distortion as i64 - x0) * slope) >> 8)).max(0) as u64
+  let r = (y0 + (((fast_distortion as i64 - x0) * slope) >> 8)).max(0) as u64;
+  // prom_av1e034: empirical recalibration multiplier (percent) for the
+  // estimate-rate 2-tier funnel — the stock table underestimates coded rate
+  // for our config, so the encoder over-picks high-rate modes. RAV1E_TXRATE_MUL
+  // scales the estimate; 100 = stock.
+  match crate::harvest::txrate_mul() {
+    Some(m) => r * m / 100,
+    None => r,
+  }
 }
 
 #[allow(unused)]
@@ -566,6 +590,7 @@ pub struct RawDistortion(u64);
 pub struct Distortion(pub u64);
 
 #[repr(transparent)]
+#[derive(Copy, Clone)]
 pub struct ScaledDistortion(u64);
 
 impl DistortionScale {
@@ -720,7 +745,9 @@ impl std::ops::AddAssign for ScaledDistortion {
 pub fn compute_rd_cost<T: Pixel>(
   fi: &FrameInvariants<T>, rate: u32, distortion: ScaledDistortion,
 ) -> f64 {
-  let _prof = crate::prof::scope(crate::prof::Stage::ComputeRdCost);
+  // TAP REMOVED: measured at/below the rdtsc-pair floor — the bucket was
+  // the instrument, and the guard's atomic add leaked into the parent.
+  // let _prof = crate::prof::scope(crate::prof::Stage::ComputeRdCost);
   let rate_in_bits = (rate as f64) / ((1 << OD_BITRES) as f64);
   fi.lambda.mul_add(rate_in_bits, distortion.0 as f64)
 }
@@ -731,6 +758,7 @@ pub fn rdo_tx_size_type<T: Pixel>(
   luma_mode: PredictionMode, ref_frames: [RefType; 2], mvs: [MotionVector; 2],
   skip: bool,
 ) -> (TxSize, TxType) {
+  let _prof = crate::prof::scope(crate::prof::Stage::RdoTxSizeType);
   let is_inter = !luma_mode.is_intra();
   let mut tx_size = max_txsize_rect_lookup[bsize as usize];
 
@@ -742,18 +770,27 @@ pub fn rdo_tx_size_type<T: Pixel>(
   let mut best_tx_size = tx_size;
   let mut best_rd = f64::MAX;
 
+  // prom_av1e041: the DEEP dispatch unlocks transform RDO. tx-SIZE RDO stays
+  // intra (inter uses the sub_tx_size default); tx-TYPE RDO (ADST/DCT selection)
+  // is unlocked for INTER too — the SVT busy-content lever we lacked.
+  let deep = crate::encoder::deep::active();
   let do_rdo_tx_size = fi.tx_mode_select
-    && fi.config.speed_settings.transform.rdo_tx_decision
+    && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
     && !is_inter;
   let rdo_tx_depth = if do_rdo_tx_size { 2 } else { 0 };
   let mut cw_checkpoint: Option<ContextWriterCheckpoint> = None;
 
   for _ in 0..=rdo_tx_depth {
+    // prom_av1e043: unlocking the FULL tx set per-SB was REFUTED — use_reduced_
+    // tx_set is a FRAME-LEVEL bitstream flag the decoder reads from the header,
+    // NOT a per-block coded choice. Full-set on some SBs while the header says
+    // reduced => dav1d "Invalid data". A deep-dispatch tool must be per-SB IN
+    // THE BITSTREAM (a per-block coded choice like tx-TYPE), not a frame flag.
     let tx_set = get_tx_set(tx_size, is_inter, fi.use_reduced_tx_set);
 
     let do_rdo_tx_type = tx_set > TxSet::TX_SET_DCTONLY
-      && fi.config.speed_settings.transform.rdo_tx_decision
-      && !is_inter
+      && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
+      && (!is_inter || deep)
       && !skip;
 
     if !do_rdo_tx_size && !do_rdo_tx_type {
@@ -802,6 +839,87 @@ pub fn rdo_tx_size_type<T: Pixel>(
   }
 
   (best_tx_size, best_tx_type)
+}
+
+/// prom_av1e020: pick ONE chroma mode by prediction SATD instead of
+/// full-coding every candidate through the trial encoder — the chroma-mode
+/// loop re-runs the whole block encode per candidate (13-14% of tier RDO)
+/// while the candidates differ only in chroma prediction. Mirrors the real
+/// chroma prediction (per-plane edges, edge-filter params, angle) so the
+/// SATD ranking matches what the trial would code. Decision-space reduction
+/// (the TOPK class) ⇒ BD-gated; rate accounting stays exact.
+fn chroma_mode_presel<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  tile_bo: TileBlockOffset, bsize: BlockSize, modes: &[PredictionMode],
+  angle_delta_uv: i8,
+) -> PredictionMode {
+  let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
+  let uv_tx_size = bsize.largest_chroma_tx_size(xdec, ydec);
+  let tile_rect = ts.tile_rect().decimated(xdec, ydec);
+  let ief_info = if fi.sequence.enable_intra_edge_filter {
+    Some((
+      ts.above_block_info(tile_bo, xdec, ydec),
+      ts.left_block_info(tile_bo, xdec, ydec),
+    ))
+  } else {
+    None
+  };
+
+  let mut best = (u64::MAX, modes[0]);
+  for &m in modes {
+    let mut satd_sum = 0u64;
+    for p in 1..3 {
+      let rec = &mut ts.rec.planes[p];
+      let input = &ts.input_tile.planes[p];
+      let po = tile_bo.plane_offset(rec.plane_cfg);
+      let mut edge_buf = Aligned::uninit_array();
+      let edge_buf = get_intra_edges(
+        &mut edge_buf,
+        &rec.as_const(),
+        tile_bo,
+        0,
+        0,
+        bsize,
+        po,
+        uv_tx_size,
+        fi.sequence.bit_depth,
+        Some(m),
+        fi.sequence.enable_intra_edge_filter,
+        IntraParam::AngleDelta(angle_delta_uv),
+      );
+      let ief_params = if m.is_directional() {
+        ief_info
+          .map(|(above, left)| IntraEdgeFilterParameters::new(p, above, left))
+      } else {
+        None
+      };
+      let mut rec_region =
+        rec.subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+      m.predict_intra(
+        tile_rect,
+        &mut rec_region,
+        uv_tx_size,
+        fi.sequence.bit_depth,
+        &[],
+        IntraParam::AngleDelta(angle_delta_uv),
+        ief_params,
+        &edge_buf,
+        fi.cpu_feature_level,
+      );
+      satd_sum += get_satd(
+        &input.subregion(Area::BlockStartingAt { bo: tile_bo.0 }),
+        &rec_region.as_const(),
+        uv_tx_size.width(),
+        uv_tx_size.height(),
+        fi.sequence.bit_depth,
+        fi.cpu_feature_level,
+      ) as u64;
+    }
+    if satd_sum < best.0 {
+      best = (satd_sum, m);
+    }
+  }
+  best.1
 }
 
 #[inline]
@@ -854,6 +972,28 @@ fn luma_chroma_mode_rdo<T: Pixel>(
     }
   }
 
+  // prom_av1e020: optionally collapse the chroma-mode set to the SATD winner
+  // before the trial loop — one full trial instead of one per candidate.
+  let presel_holder;
+  let mode_set_chroma: &[PredictionMode] = if crate::harvest::chroma_presel()
+    && mode_set_chroma.len() > 1
+    && is_chroma_block
+  {
+    presel_holder = [chroma_mode_presel(
+      fi,
+      ts,
+      tile_bo,
+      bsize,
+      mode_set_chroma,
+      angle_delta.uv,
+    )];
+    &presel_holder
+  } else {
+    mode_set_chroma
+  };
+
+  #[cfg(feature = "profile")]
+  let _fp = crate::encoder::fwd_phase::enter(0);
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
     use crate::segmentation::select_segment;
@@ -866,7 +1006,20 @@ fn luma_chroma_mode_rdo<T: Pixel>(
       let (tx_size, tx_type) = rdo_tx_size_type(
         fi, ts, cw, bsize, tile_bo, luma_mode, ref_frames, mvs, skip,
       );
-      for &chroma_mode in mode_set_chroma.iter() {
+      // prom_av1e017: across chroma-mode iterations only the chroma coding
+      // differs — cache the luma tx section from iteration 1 and skip it on
+      // later ones. Reset per sidx (segment qidx changes luma quant).
+      let mut luma_reuse = (crate::harvest::luma_reuse()
+        && mode_set_chroma.len() > 1)
+        .then(crate::encoder::LumaReuse::new);
+      for (ci, &chroma_mode) in mode_set_chroma.iter().enumerate() {
+        // brick-P prize measure: everything below on the 2nd+ chroma
+        // iteration re-codes the (invariant) luma planes too.
+        let _dup = if ci > 0 {
+          Some(crate::prof::scope(crate::prof::Stage::ChromaDupTrial))
+        } else {
+          None
+        };
         let wr = &mut WriterCounter::new();
         let tell = wr.tell_frac();
 
@@ -905,6 +1058,7 @@ fn luma_chroma_mode_rdo<T: Pixel>(
           rdo_type,
           need_recon_pixel,
           None,
+          luma_reuse.as_mut(),
         );
 
         let rate = wr.tell_frac() - tell;
@@ -1038,6 +1192,8 @@ pub fn rdo_mode_decision<T: Pixel>(
       true,
       rdo_type,
       true,
+    
+      None,
     );
     cw.rollback(&cw_checkpoint);
     if fi.sequence.chroma_sampling != ChromaSampling::Cs400 {
@@ -1075,6 +1231,8 @@ pub fn rdo_mode_decision<T: Pixel>(
           rdo_type,
           true, // For CFL, luma should be always reconstructed.
           None,
+        
+          None,
         );
 
         let rate = wr.tell_frac() - tell;
@@ -1100,6 +1258,87 @@ pub fn rdo_mode_decision<T: Pixel>(
   cw.bc.blocks.set_ref_frames(tile_bo, bsize, best.ref_frames);
   cw.bc.blocks.set_motion_vectors(tile_bo, bsize, best.mvs);
 
+  // prom_av1e050: per-block motion_mode decision — SIMPLE vs OBMC by real
+  // recon-SSE + λ·rate (incl. the motion_mode symbol), NOT a SATD proxy (the
+  // interp lesson). Single-ref eligible inter only; the winner is stored in the
+  // block grid and read by both motion_compensate and the symbol write.
+  // Runs on switchable frames only (the per-clip verdict is latched from the
+  // first inter frame); the committed encode applies OBMC per this decision.
+  if crate::encoder::obmc_frame::on()
+    && !crate::harvest::obmc_force()
+    && !crate::encoder::obmc_frame::force_clip()
+    && !best.pred_mode_luma.is_intra()
+    && !best.pred_mode_luma.is_compound()
+    && cw.obmc_allowed(tile_bo, bsize)
+  {
+    use crate::predict::MotionMode::{OBMC_CAUSAL, SIMPLE_TRANSLATION};
+    // Recompute the mv stack for the consistency asserts inside the inter
+    // encode (NEARESTMV/NEWMV expect mvs relative to it).
+    let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+    let mode_context = cw.find_mvrefs(
+      tile_bo,
+      best.ref_frames,
+      &mut mv_stack,
+      bsize,
+      fi,
+      false,
+    );
+    let (mut best_mm, mut best_mm_rd) = (SIMPLE_TRANSLATION, f64::MAX);
+    for mm in [SIMPLE_TRANSLATION, OBMC_CAUSAL] {
+      cw.bc.blocks.set_motion_mode(tile_bo, bsize, mm);
+      let mut wr = WriterCounter::new();
+      let tell = wr.tell_frac();
+      encode_block_pre_cdef(
+        &fi.sequence,
+        ts,
+        cw,
+        &mut wr,
+        bsize,
+        tile_bo,
+        best.skip,
+      );
+      let _ = encode_block_post_cdef(
+        fi,
+        ts,
+        cw,
+        &mut wr,
+        best.pred_mode_luma,
+        best.pred_mode_chroma,
+        best.angle_delta,
+        best.ref_frames,
+        best.mvs,
+        bsize,
+        tile_bo,
+        best.skip,
+        best.pred_cfl_params,
+        best.tx_size,
+        best.tx_type,
+        mode_context,
+        &mv_stack,
+        rdo_type,
+        true,
+        None,
+        None,
+      );
+      let rate = wr.tell_frac() - tell;
+      let distortion =
+        compute_distortion(fi, ts, bsize, is_chroma_block, tile_bo, false);
+      let rd = compute_rd_cost(fi, rate, distortion);
+      cw.rollback(&cw_checkpoint);
+      if rd < best_mm_rd {
+        best_mm_rd = rd;
+        best_mm = mm;
+      }
+    }
+    cw.bc.blocks.set_motion_mode(tile_bo, bsize, best_mm);
+    // adoption signal for the per-frame temporal dispatch.
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::encoder::obmc_frame::ELIG.fetch_add(1, Relaxed);
+    if best_mm == OBMC_CAUSAL {
+      crate::encoder::obmc_frame::CHOSEN.fetch_add(1, Relaxed);
+    }
+  }
+
   assert!(best.rd_cost >= 0_f64);
 
   PartitionParameters {
@@ -1117,6 +1356,114 @@ pub fn rdo_mode_decision<T: Pixel>(
     tx_size: best.tx_size,
     tx_type: best.tx_type,
     sidx: best.sidx,
+  }
+}
+
+/// prom_av1e010 — PD0-style block proxy cost: ONE NEARESTMV(LAST) prediction
+/// + SATD, scaled like compute_mv_rd's cost units. No transforms, no entropy,
+/// no context writes; scribbles the prediction into ts.rec exactly like the
+/// inter mode screen does (trials/final encode overwrite it).
+/// prom_av1e023: SB-level early skip (the SVT depth-removal analog). When
+/// the 64×64 NEARESTMV(LAST) proxy SATD says the block predicts to (near)
+/// zero at this quantizer, bypass the ENTIRE partition/mode RDO for the
+/// superblock and encode it as one 64×64 NEARESTMV skip block. Ceiling
+/// measured first: all-skip SBs carry 11.8% of SB cycles (pedestrian 1080p).
+/// Fires only when the proxy error per pixel is below k/256 quantizer steps
+/// ⇒ decision-space reduction, BD-gated.
+pub(crate) fn sb_skip_probe<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, tile_bo: TileBlockOffset, k: u64,
+) -> Option<PartitionParameters> {
+  use crate::segmentation::select_segment;
+  let bsize = BlockSize::BLOCK_64X64;
+  let ref_frames = [LAST_FRAME, NONE_FRAME];
+  let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+  let _ = cw.find_mvrefs(tile_bo, ref_frames, &mut mv_stack, bsize, fi, false);
+  // The final-encode arm remaps modes against mv_stack[0]; never force a
+  // NEARESTMV block the remap could not reproduce.
+  if mv_stack.is_empty() {
+    return None;
+  }
+  let satd = pd0_proxy_cost(fi, ts, cw, bsize, tile_bo);
+  let acq =
+    crate::quantize::ac_q(fi.base_q_idx, 0, fi.sequence.bit_depth).get()
+      as u64;
+  if satd.saturating_mul(256) >= k.saturating_mul(acq) * (64 * 64) {
+    return None;
+  }
+  let sidx = select_segment(fi, ts, tile_bo, bsize, true).next().unwrap_or(0);
+  Some(PartitionParameters {
+    rd_cost: 0.0,
+    bo: tile_bo,
+    bsize,
+    pred_mode_luma: PredictionMode::NEARESTMV,
+    pred_mode_chroma: PredictionMode::NEARESTMV,
+    ref_frames,
+    mvs: [mv_stack[0].this_mv, MotionVector::default()],
+    skip: true,
+    has_coeff: false,
+    sidx,
+    ..PartitionParameters::default()
+  })
+}
+
+fn pd0_proxy_cost<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
+) -> u64 {
+  if tile_bo.0.x >= ts.mi_width || tile_bo.0.y >= ts.mi_height {
+    return 0;
+  }
+  let ref_frames = [LAST_FRAME, NONE_FRAME];
+  let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
+  let _ = cw.find_mvrefs(tile_bo, ref_frames, &mut mv_stack, bsize, fi, false);
+  let mv = if mv_stack.is_empty() {
+    MotionVector::default()
+  } else {
+    mv_stack[0].this_mv
+  };
+
+  let tile_rect = ts.tile_rect();
+  let rec = &mut ts.rec.planes[0];
+  let po = tile_bo.plane_offset(rec.plane_cfg);
+  let mut rec_region =
+    rec.subregion_mut(Area::BlockStartingAt { bo: tile_bo.0 });
+  PredictionMode::NEARESTMV.predict_inter(
+    fi,
+    tile_rect,
+    0,
+    po,
+    &mut rec_region,
+    bsize.width(),
+    bsize.height(),
+    ref_frames,
+    [mv, MotionVector::default()],
+    &mut ts.inter_compound_buffers,
+  );
+  let plane_org =
+    ts.input_tile.planes[0].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+  let satd = get_satd(
+    &plane_org,
+    &rec_region.as_const(),
+    bsize.width(),
+    bsize.height(),
+    fi.sequence.bit_depth,
+    fi.cpu_feature_level,
+  );
+  256 * satd as u64
+}
+
+#[cfg(feature = "profile")]
+pub(crate) mod fulltrial_audit {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  // [inter, intra, angle, txtype] full-price mode/tx evaluations
+  pub static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+  pub fn add(kind: usize, n: u64) { N[kind].fetch_add(n, Ordering::Relaxed); }
+  pub fn dump() {
+    eprintln!(
+      "FULLTRIAL inter={} intra={} angle={} txtype={}",
+      N[0].load(Ordering::Relaxed), N[1].load(Ordering::Relaxed),
+      N[2].load(Ordering::Relaxed), N[3].load(Ordering::Relaxed));
   }
 }
 
@@ -1207,7 +1554,16 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     if !mv_stack.is_empty() {
       inter_mode_set.push((PredictionMode::NEAR0MV, i));
     }
-    if mv_stack.len() >= 2 {
+    // prom_av1e060 M2: GLOBALMV is always a legal mode; gating it on a
+    // 2-deep MV stack kept it out of the RD on exactly the blocks a global
+    // model is meant to serve. When a real (non-identity) model exists, always
+    // offer it — measured: enabling global motion previously made GLOBALMV
+    // usage go DOWN (4.11% -> 3.64%), because the model's cost was paid
+    // everywhere while the mode was rarely trialled. The identity path keeps
+    // the old condition, so the default bitstream is unchanged.
+    let has_gm = fi.globalmv_transformation_type[ref_frames_set[i][0].to_index()]
+      != crate::partition::GlobalMVMode::IDENTITY;
+    if mv_stack.len() >= 2 || has_gm {
       inter_mode_set.push((PredictionMode::GLOBALMV, i));
     }
     let include_near_mvs = fi.config.speed_settings.motion.include_near_mvs;
@@ -1281,21 +1637,40 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     9 // This number is determined by AWCY test
   };
 
+  // prom_av1e006/008b: cap full trials at K in TRUE SATD order — per-bsize
+  // (SATD is a better oracle at big blocks). At s6 the stock screen is
+  // dormant (num_modes_rdo >= set len), so the knob also FORCES the SATD
+  // compute + sort. Off unless RAV1E_MODE_TOPK is set.
+  let topk_006 = crate::harvest::mode_topk();
+  let fastrd_028 = crate::harvest::fastrd();
+  let force_screen_006 = topk_006.is_some() || fastrd_028;
+  let num_full_006 = topk_006.map_or(num_modes_rdo, |ks| {
+    let k = match bsize.width().max(bsize.height()) {
+      64.. => ks[0],
+      32.. => ks[1],
+      16.. => ks[2],
+      _ => ks[3],
+    };
+    num_modes_rdo.min(k)
+  });
+
   inter_mode_set.iter().for_each(|&(luma_mode, i)| {
     let mvs = match luma_mode {
       PredictionMode::NEWMV | PredictionMode::NEW_NEWMV => mvs_from_me[i],
+      // prom_av1e060 M1b: slots past the real candidate count are the
+      // decoder's GLOBAL-MV padding (`mvstack[min(cnt,2)..2] = tgmv`), not zero.
       PredictionMode::NEARESTMV | PredictionMode::NEAREST_NEARESTMV => {
         if !mv_stacks[i].is_empty() {
           [mv_stacks[i][0].this_mv, mv_stacks[i][0].comp_mv]
         } else {
-          [MotionVector::default(); 2]
+          gmv_pair(fi, ref_frames_set[i])
         }
       }
       PredictionMode::NEAR0MV | PredictionMode::NEAR_NEAR0MV => {
         if mv_stacks[i].len() > 1 {
           [mv_stacks[i][1].this_mv, mv_stacks[i][1].comp_mv]
         } else {
-          [MotionVector::default(); 2]
+          gmv_pair(fi, ref_frames_set[i])
         }
       }
       PredictionMode::NEAR1MV
@@ -1311,8 +1686,13 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
       PredictionMode::NEW_NEARESTMV => {
         [mvs_from_me[i][0], mv_stacks[i][0].comp_mv]
       }
+      // prom_av1e060 M1b: a GLOBALMV block's motion vector comes from the
+      // GLOBAL MOTION model, not zero. The two coincide only under IDENTITY,
+      // which is why a hardcoded zero worked until a model was signalled — the
+      // decoder derives this with get_gmv_2d and would otherwise predict from
+      // a different reference position than the encoder did.
       PredictionMode::GLOBALMV | PredictionMode::GLOBAL_GLOBALMV => {
-        [MotionVector::default(); 2]
+        gmv_pair(fi, ref_frames_set[i])
       }
       _ => {
         unimplemented!();
@@ -1321,7 +1701,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
     mvs_set.push(mvs);
 
     // Calculate SATD for each mode
-    if num_modes_rdo != inter_mode_set.len() {
+    if force_screen_006 || num_modes_rdo != inter_mode_set.len() {
       let _prof = crate::prof::scope(crate::prof::Stage::InterModeScreen);
       let tile_rect = ts.tile_rect();
       let rec = &mut ts.rec.planes[0];
@@ -1354,7 +1734,45 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         fi.sequence.bit_depth,
         fi.cpu_feature_level,
       );
-      satds.push(satd);
+
+      // prom_av1e028: fold the mv-residual rate into the screen key so the
+      // ranking is RD, not distortion-only. Mirrors write_mv exactly
+      // (ref_mv = mv_stack[0], the components each mode actually codes NEW)
+      // and ME's calibration (satd-domain rate coeff = me_lambda·0.5).
+      let screen_key = if fastrd_028 {
+        let ref_mvs = if !mv_stacks[i].is_empty() {
+          [mv_stacks[i][0].this_mv, mv_stacks[i][0].comp_mv]
+        } else {
+          [MotionVector::default(); 2]
+        };
+        let mut mv_rate = 0u32;
+        if matches!(
+          luma_mode,
+          PredictionMode::NEWMV
+            | PredictionMode::NEW_NEWMV
+            | PredictionMode::NEW_NEARESTMV
+        ) {
+          mv_rate += crate::me::get_mv_rate(
+            mvs[0],
+            ref_mvs[0],
+            fi.allow_high_precision_mv,
+          );
+        }
+        if matches!(
+          luma_mode,
+          PredictionMode::NEW_NEWMV | PredictionMode::NEAREST_NEWMV
+        ) {
+          mv_rate += crate::me::get_mv_rate(
+            mvs[1],
+            ref_mvs[1],
+            fi.allow_high_precision_mv,
+          );
+        }
+        satd.saturating_add((mv_rate as f64 * fi.me_lambda * 0.5) as u32)
+      } else {
+        satd
+      };
+      satds.push(screen_key);
     } else {
       satds.push(0);
     }
@@ -1362,13 +1780,38 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
 
   let mut sorted =
     izip!(inter_mode_set, mvs_set, satds).collect::<ArrayVec<_, 20>>();
-  if num_modes_rdo != sorted.len() {
+  if force_screen_006 || num_modes_rdo != sorted.len() {
     sorted.sort_by_key(|((_mode, _i), _mvs, satd)| *satd);
   }
 
-  sorted.iter().take(num_modes_rdo).for_each(
+  // prom_av1e006 harvest: the improvement sequence in screen order lets the
+  // offline sweep reconstruct the exact top-K regret curve. Observe-only.
+  let harvest_on = crate::harvest::enabled();
+  let n_enum = sorted.len();
+  let mut harvest_idx = 0usize;
+  let mut harvest_imps = String::new();
+
+  // prom_av1e037: adaptive-K — shrink the full-trial count when the screen is
+  // confident (best cost far below the rest), so we don't transform 6 modes
+  // to pick one obvious winner. Screen must be on (sorted by screen key).
+  let num_full = if let (Some(margin), true) =
+    (crate::harvest::adaptk(), force_screen_006)
+  {
+    let best = sorted.first().map(|&(_, _, sk)| sk).unwrap_or(0) as u64;
+    let thresh = best.saturating_mul(100 + margin) / 100;
+    let cnt =
+      sorted.iter().take_while(|&&(_, _, sk)| sk as u64 <= thresh).count();
+    cnt.clamp(1, num_full_006)
+  } else {
+    num_full_006
+  };
+
+  #[cfg(feature = "profile")]
+  fulltrial_audit::add(0, num_full.min(sorted.len()) as u64);
+  sorted.iter().take(num_full).for_each(
     |&((luma_mode, i), mvs, _satd)| {
       let mode_set_chroma = ArrayVec::from([luma_mode]);
+      let prev_rd = best.rd_cost;
 
       luma_chroma_mode_rdo(
         luma_mode,
@@ -1388,8 +1831,29 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         &mv_stacks[i],
         AngleDelta::default(),
       );
+
+      if harvest_on {
+        if best.rd_cost < prev_rd {
+          use std::fmt::Write as _;
+          let _ =
+            write!(harvest_imps, "{}:{:.2}|", harvest_idx, best.rd_cost);
+        }
+        harvest_idx += 1;
+      }
     },
   );
+
+  if harvest_on {
+    crate::harvest::emit(&format!(
+      "MODE,{},{},{},{},{:.4},{}",
+      fi.input_frameno,
+      bsize.width(),
+      n_enum,
+      harvest_idx,
+      fi.lambda,
+      harvest_imps,
+    ));
+  }
 
   best
 }
@@ -1401,6 +1865,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   cw_checkpoint: &ContextWriterCheckpoint, rdo_type: RDOType,
   mut best: PartitionParameters, is_chroma_block: bool,
 ) -> PartitionParameters {
+  let _prof = crate::prof::scope(crate::prof::Stage::IntraModeRdo);
   let mut modes = ArrayVec::<_, INTRA_MODES>::new();
 
   // Reduce number of prediction modes at higher speed levels
@@ -1512,7 +1977,15 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
 
   debug_assert!(num_modes_rdo >= 1);
 
-  modes.iter().take(num_modes_rdo).for_each(|&luma_mode| {
+  // prom_av1e029: cap intra full-trials (the aggressive knob's uncapped 14%).
+  // modes are ranked (CDF-prob first half, SATD-screened second half), so
+  // taking fewer keeps the best-ranked candidates.
+  let num_intra_full = crate::harvest::intra_topk()
+    .map_or(num_modes_rdo, |k| num_modes_rdo.min(k.max(1)));
+
+  #[cfg(feature = "profile")]
+  fulltrial_audit::add(1, num_intra_full.min(modes.len()) as u64);
+  modes.iter().take(num_intra_full).for_each(|&luma_mode| {
     let mvs = [MotionVector::default(); 2];
     let ref_frames = [INTRA_FRAME, NONE_FRAME];
     let mut mode_set_chroma = ArrayVec::<_, 2>::new();
@@ -1543,6 +2016,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   if fi.config.speed_settings.prediction.fine_directional_intra
     && bsize >= BlockSize::BLOCK_8X8
   {
+    let _prof = crate::prof::scope(crate::prof::Stage::AngleRefine);
     // Find the best angle delta for the current best prediction mode
     let luma_deltas = best.pred_mode_luma.angle_delta_count();
     let chroma_deltas = best.pred_mode_chroma.angle_delta_count();
@@ -1554,6 +2028,8 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
     let mut best_angle_delta = best.angle_delta;
     let mut angle_delta_rdo = |y, uv| -> AngleDelta {
       if best.angle_delta.y != y || best.angle_delta.uv != uv {
+        #[cfg(feature = "profile")]
+        fulltrial_audit::add(2, 1);
         luma_chroma_mode_rdo(
           best.pred_mode_luma,
           fi,
@@ -1711,6 +2187,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
   bsize: BlockSize, tile_bo: TileBlockOffset, tx_size: TxSize, tx_set: TxSet,
   tx_types: &[TxType], cur_best_rd: f64,
 ) -> (TxType, f64) {
+  #[cfg(feature = "profile")]
+  let _fp = crate::encoder::fwd_phase::enter(1);
   let mut best_type = TxType::DCT_DCT;
   let mut best_rd = f64::MAX;
 
@@ -1740,6 +2218,8 @@ pub fn rdo_tx_type_decision<T: Pixel>(
     if av1_tx_used[tx_set as usize][tx_type as usize] == 0 {
       continue;
     }
+    #[cfg(feature = "profile")]
+    fulltrial_audit::add(3, 1);
 
     if is_inter {
       motion_compensate(
@@ -1784,6 +2264,7 @@ pub fn rdo_tx_type_decision<T: Pixel>(
         true,
         rdo_type,
         need_recon_pixel,
+        None,
       )
     };
 
@@ -1967,17 +2448,157 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   let w_pre_checkpoint = w_pre_cdef.checkpoint();
   let w_post_checkpoint = w_post_cdef.checkpoint();
 
+  // prom_av1e010: PD0 proxy costs + margin gates. The proxy tree (node vs
+  // 4-children SATD, one NEARESTMV prediction each) yields a dimensionless
+  // margin m = (node − kids)/node: large ⇒ split-confident (skip the fresh
+  // NONE full trial — only fresh at 64), small/negative ⇒ NONE-confident
+  // (skip the split subtree). Inter frames only; off unless harvesting or
+  // RAV1E_PD0_GATE is set.
+  let pd0_gate = crate::harvest::pd0_gate();
+  // Shipped gate form is 64×64-only (the ceiling: below 64 the NONE arm is
+  // cached — skipping saves nothing; and the skip-SPLIT direction is
+  // dominated by the av1e005 none_rd gate). Harvest still taps all levels.
+  let pd0_active = fi.frame_type.has_inter()
+    && bsize.is_sqr()
+    && bsize >= BlockSize::BLOCK_16X16
+    && bsize <= BlockSize::BLOCK_64X64
+    && (crate::harvest::enabled()
+      || (pd0_gate.is_some() && bsize == BlockSize::BLOCK_64X64));
+  let (mut pd0_node, mut pd0_kids) = (0u64, 0u64);
+  if pd0_active {
+    pd0_node = pd0_proxy_cost(fi, ts, cw, bsize, tile_bo);
+    if let Ok(subsize) = bsize.subsize(PARTITION_SPLIT) {
+      let hbsw = subsize.width_mi();
+      let hbsh = subsize.height_mi();
+      for (dx, dy) in [(0, 0), (hbsw, 0), (0, hbsh), (hbsw, hbsh)] {
+        let bo = TileBlockOffset(BlockOffset {
+          x: tile_bo.0.x + dx,
+          y: tile_bo.0.y + dy,
+        });
+        pd0_kids += pd0_proxy_cost(fi, ts, cw, subsize, bo);
+      }
+    }
+  }
+  let pd0_margin = if pd0_active && pd0_node > 0 {
+    (pd0_node as f64 - pd0_kids as f64) / (pd0_node as f64)
+  } else {
+    0.0
+  };
+  let (mut pd0_skip_none, mut pd0_skip_split) = (false, false);
+  if let (true, Some((t_none, t_split))) = (pd0_active, pd0_gate) {
+    pd0_skip_split = pd0_margin < t_none;
+    pd0_skip_none = pd0_margin > t_split;
+  }
+
+  // prom_av1e039: PD0 REAL-cost margin (SVT's PD0 done with a real RD screen).
+  // Computed for every splittable square node so the ceiling instrument can
+  // compare its NONE/SPLIT prediction to the full-RD decision, and so the
+  // shipping gate (pd0_real) can prune the confident arm at all levels.
+  let pd0_real_on =
+    crate::harvest::pd0_ceil() || crate::harvest::pd0_real().is_some();
+  let (mut pd0r_node, mut pd0r_kids, mut pd0r_margin) = (0.0f64, 0.0f64, 0.0f64);
+  let mut pd0r_skip_none = false;
+  let mut pd0r_skip_split = false;
+  if pd0_real_on
+    && bsize.is_sqr()
+    && bsize >= BlockSize::BLOCK_8X8
+    && bsize <= BlockSize::BLOCK_64X64
+    && fi.frame_type.has_inter()
+  {
+    pd0r_node = crate::encoder::pd0_real_cost(fi, ts, cw, bsize, tile_bo);
+    if let Ok(subsize) = bsize.subsize(PARTITION_SPLIT) {
+      let hbsw = subsize.width_mi();
+      let hbsh = subsize.height_mi();
+      for (dx, dy) in [(0, 0), (hbsw, 0), (0, hbsh), (hbsw, hbsh)] {
+        let bo = TileBlockOffset(BlockOffset {
+          x: tile_bo.0.x + dx,
+          y: tile_bo.0.y + dy,
+        });
+        pd0r_kids += crate::encoder::pd0_real_cost(fi, ts, cw, subsize, bo);
+      }
+    }
+    pd0r_margin = if pd0r_node > 0.0 {
+      (pd0r_node - pd0r_kids) / pd0r_node
+    } else {
+      0.0
+    };
+    if let Some((t_none, t_split)) = crate::harvest::pd0_real() {
+      // margin < t_none ⇒ node-confident (kids barely cheaper) ⇒ skip split;
+      // margin > t_split ⇒ split-confident ⇒ skip the fresh NONE full trial.
+      pd0r_skip_split = pd0r_margin < t_none;
+      pd0r_skip_none = pd0r_margin > t_split && bsize == BlockSize::BLOCK_64X64;
+    }
+  }
+
+  // prom_av1e005: the NONE arm's RD cost, for the partition-split gate
+  // (see harvest::part_gate) and the harvest tap. NONE runs first (caller
+  // passes [NONE, SPLIT]), so this is populated before any split trial.
+  let mut none_rd_seen: Option<f64> = None;
+  // prom_av1e008: the SPLIT arm's completed cost (win or lose) — regret
+  // analysis for the split-confidence gate needs the LOSING split cost too
+  // (harvest runs disable early-exit so it completes).
+  let mut split_rd_seen: Option<f64> = None;
+
   for &partition in partition_types {
     // Do not re-encode results we already have
     if partition == cached_block.part_type {
+      // prom_av1e005: at 32×32/16×16 the NONE arm arrives CACHED from the
+      // parent's split trial — it is still the gate's null-arm cost.
+      if partition == PARTITION_NONE {
+        none_rd_seen = Some(cached_block.rd_cost);
+      }
       continue;
+    }
+
+    // prom_av1e010 margin gates: proxy-confident directions skip an arm.
+    // skip_none only saves work where NONE is FRESH (64×64); at 32/16 the
+    // cached NONE costs nothing to keep as the fallback.
+    if pd0_skip_none
+      && partition == PARTITION_NONE
+      && partition != cached_block.part_type
+    {
+      continue;
+    }
+    if pd0_skip_split && partition != PARTITION_NONE {
+      continue;
+    }
+
+    // prom_av1e039: PD0 real-cost margin gate (all levels).
+    if pd0r_skip_none
+      && partition == PARTITION_NONE
+      && partition != cached_block.part_type
+    {
+      continue;
+    }
+    if pd0r_skip_split && partition != PARTITION_NONE {
+      continue;
+    }
+
+    // prom_av1e005 gate: when the whole-block (NONE) cost is already below
+    // the per-bsize threshold (rate-normalized by λ), skip trialing the
+    // split/rect candidates — their subtrees are the expensive arm. Off
+    // unless RAV1E_PART_GATE is set; the VP9 G1 pattern.
+    if partition != PARTITION_NONE {
+      if let (Some(none_rd), Some(ts_gate)) =
+        (none_rd_seen, crate::harvest::part_gate())
+      {
+        let t = match bsize {
+          BlockSize::BLOCK_64X64 => ts_gate.0,
+          BlockSize::BLOCK_32X32 => ts_gate.1,
+          BlockSize::BLOCK_16X16 => ts_gate.2,
+          _ => f64::NEG_INFINITY,
+        };
+        if none_rd / fi.lambda < t {
+          continue;
+        }
+      }
     }
 
     let mut child_modes = ArrayVec::<_, 4>::new();
 
     let cost = match partition {
       PARTITION_NONE if bsize <= BlockSize::BLOCK_64X64 => {
-        Some(rdo_partition_none(
+        let rd = rdo_partition_none(
           fi,
           ts,
           cw,
@@ -1985,7 +2606,9 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
           tile_bo,
           inter_cfg,
           &mut child_modes,
-        ))
+        );
+        none_rd_seen = Some(rd);
+        Some(rd)
       }
       PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
         rdo_partition_simple(
@@ -2009,6 +2632,9 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
     };
 
     if let Some(rd) = cost {
+      if partition == PARTITION_SPLIT {
+        split_rd_seen = Some(rd);
+      }
       if rd < best_rd {
         best_rd = rd;
         best_partition = partition;
@@ -2021,6 +2647,69 @@ pub fn rdo_partition_decision<T: Pixel, W: Writer>(
   }
 
   assert!(best_rd >= 0_f64);
+
+  // prom_av1e005/008 harvest: one row per partition decision (observe-only).
+  // 008 adds pre-trial source features: the four quadrant variances of the
+  // block's luma source — the split-confidence signal candidates.
+  if crate::harvest::enabled() {
+    if let Some(none_rd) = none_rd_seen {
+      let mut qvars = [0f64; 4];
+      {
+        let bw = bsize.width();
+        let half = bw / 2;
+        let src = ts.input_tile.planes[0]
+          .subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+        for (qi, (qy, qx)) in
+          [(0, 0), (0, half), (half, 0), (half, half)].iter().enumerate()
+        {
+          let (mut s, mut s2, mut n) = (0u64, 0u64, 0u64);
+          for y in *qy..(qy + half).min(src.rect().height) {
+            let row = &src[y];
+            for x in *qx..(qx + half).min(row.len()) {
+              let v = u64::from(u32::cast_from(row[x]));
+              s += v;
+              s2 += v * v;
+              n += 1;
+            }
+          }
+          if n > 0 {
+            let m = s as f64 / n as f64;
+            qvars[qi] = s2 as f64 / n as f64 - m * m;
+          }
+        }
+      }
+      crate::harvest::emit(&format!(
+        "PART,{},{},{:.4},{:.4},{},{:.4},{:.1},{:.1},{:.1},{:.1},{:.4},{},{}",
+        fi.input_frameno,
+        bsize.width(),
+        none_rd,
+        best_rd,
+        best_partition as usize,
+        fi.lambda,
+        qvars[0],
+        qvars[1],
+        qvars[2],
+        qvars[3],
+        split_rd_seen.unwrap_or(-1.0),
+        pd0_node,
+        pd0_kids,
+      ));
+    }
+  }
+
+  // prom_av1e039 ceiling: PD0 real-cost prediction vs the actual full-RD
+  // decision. margin>0 ⇒ PD0 predicts SPLIT (kids cheaper), ≤0 ⇒ NONE. Emit
+  // one row per splittable node for offline agreement (within-±1 accuracy).
+  if crate::harvest::pd0_ceil() && pd0_real_on && pd0r_node > 0.0 {
+    crate::harvest::emit(&format!(
+      "PD0CEIL,{},{:.6},{:.6},{:.6},{}",
+      bsize.width(),
+      pd0r_node,
+      pd0r_kids,
+      pd0r_margin,
+      best_partition as usize,
+    ));
+  }
 
   PartitionGroupParameters {
     rd_cost: best_rd,
@@ -2622,6 +3311,9 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
               let mut best_new_lrf = best_lrf[lru_y * lru_w[pli] + lru_x][pli];
               let mut best_cost =
                 best_lrf_cost[lru_y * lru_w[pli] + lru_x][pli];
+              // Prometheus harvest: the None-arm RD cost, captured for the
+              // per-LRU skip-gate dataset (prom_av1e001). Observe-only.
+              let mut harvest_none_cost = f64::NAN;
 
               // Check the no filter option
               {
@@ -2645,6 +3337,7 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                 );
 
                 let cost = compute_rd_cost(fi, rate, err);
+                harvest_none_cost = cost;
                 // Was this choice actually an improvement?
                 if best_cost < 0. || cost < best_cost {
                   best_cost = cost;
@@ -2664,6 +3357,21 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                   - loop_sbo.plane_offset(&lrf_ref.planes[pli].cfg).y as usize,
               );
 
+              // prom_av1e001 — LRF solve gate. Harvested over 4 Derf clips ×
+              // q60..200 (23 779 LRU decisions): 83.8% of sgrproj solves end
+              // in None, and none_cost/λ below a per-plane threshold marks
+              // them. Skipping the solve keeps the running best (usually
+              // None) — the integral image + per-set solve/filter/SSE are
+              // never computed. Off unless RAV1E_LRF_GATE is set.
+              let gate_skip = match crate::harvest::lrf_gate() {
+                Some((t_y, t_uv)) => {
+                  harvest_none_cost / fi.lambda
+                    < if pli == 0 { t_y } else { t_uv }
+                }
+                None => false,
+              };
+
+              if !gate_skip {
               // todo: experiment with borrowing border pixels
               // rather than edge-extending. Right now this is
               // hard-clipping to the superblock boundary.
@@ -2732,6 +3440,46 @@ pub fn rdo_loop_decision<T: Pixel, W: Writer>(
                   best_lrf_cost[lru_y * lru_w[pli] + lru_x][pli] = cost;
                   best_new_lrf = current_lrf;
                 }
+              }
+              } // !gate_skip (prom_av1e001)
+
+              // Prometheus harvest (prom_av1e001): one row per LRU decision.
+              // Features are all PRE-solve quantities (what a skip gate could
+              // see); outcome is what the solve actually bought over None.
+              if crate::harvest::enabled() {
+                let s = lrf_in_plane.slice(lrf_po);
+                let (mut sum, mut sum2, mut n) = (0u64, 0u64, 0u64);
+                for row in s.rows_iter().take(vis_height) {
+                  for &px in &row[..vis_width] {
+                    let v = u64::from(u32::cast_from(px));
+                    sum += v;
+                    sum2 += v * v;
+                    n += 1;
+                  }
+                }
+                let mean = sum as f64 / n as f64;
+                let var = sum2 as f64 / n as f64 - mean * mean;
+                let chosen = match best_new_lrf {
+                  RestorationFilter::None => -1i32,
+                  RestorationFilter::Sgrproj { set, .. } => set as i32,
+                  RestorationFilter::Wiener { .. } => -2,
+                };
+                crate::harvest::emit(&format!(
+                  "LRF,{},{},{},{},{},{},{},{:.2},{:.2},{:.4},{:.4},{},{:.4}",
+                  fi.input_frameno,
+                  fi.base_q_idx,
+                  u8::from(!fi.intra_only),
+                  fi.pyramid_level,
+                  pli,
+                  vis_width,
+                  vis_height,
+                  mean,
+                  var,
+                  harvest_none_cost,
+                  best_cost,
+                  chosen,
+                  fi.lambda,
+                ));
               }
 
               if best_lrf[lru_y * lru_w[pli] + lru_x][pli]

@@ -317,6 +317,10 @@ impl QuantizationContext {
     // To that end, we want to bias more toward rounding to zero for
     // that tail of zeroes and ones than we do for the larger coefficients.
     let _q2 = crate::prof::scope(crate::prof::Stage::QuantMainLoop);
+    // prom_av1e014 tried a two-pass split here (precompute both rounding
+    // candidates, resolve the level_mode recurrence separately): REFUTED,
+    // +39% slower — OoO already hides the 1-bit carried chain, and the
+    // doubled rounding-compare muls + scratch traffic are pure cost.
     if crate::racecar::on() {
       // Brick Q2 (docs/entropy-bricks.md): the loop is inherently serial
       // (`level_mode` is loop-carried) so it can't vectorize, but the two

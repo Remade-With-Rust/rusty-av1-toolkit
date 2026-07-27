@@ -30,6 +30,8 @@ pub struct CDFContext {
   pub eob_extra_cdf:
     [[[[u16; 2]; EOB_COEF_CONTEXTS]; PLANE_TYPES]; TxSize::TX_SIZES],
   pub filter_intra_cdfs: [[u16; 2]; BlockSize::BLOCK_SIZES_ALL],
+  // prom_av1e050: OBMC on/off per eligible inter block. [u16;2] ⇒ small region.
+  pub obmc_cdf: [[u16; 2]; BlockSize::BLOCK_SIZES_ALL],
   pub intra_inter_cdfs: [[u16; 2]; INTRA_INTER_CONTEXTS],
   pub lrf_sgrproj_cdf: [u16; 2],
   pub lrf_wiener_cdf: [u16; 2],
@@ -49,6 +51,21 @@ pub struct CDFContext {
   pub coeff_base_eob_cdf:
     [[[[u16; 3]; SIG_COEF_CONTEXTS_EOB]; PLANE_TYPES]; TxSize::TX_SIZES],
   pub lrf_switchable_cdf: [u16; 3],
+  // prom_av1e048c: MUST live in the small-partition (CDF_LEN<=4) region — the
+  // undo log copies a fixed 4-wide slot, so this [u16;3] cdf overshoots by 1
+  // into the next field; that is only rollback-safe when the neighbor is also a
+  // small-partition cdf (here another [u16;3]). Placing it among the large
+  // [u16;8] cdfs crossed the small/large log-partition boundary and corrupted
+  // the neighbor cdf on RDO rollback → subtle desync (the av1e048b bug).
+  pub switchable_interp_cdf:
+    [[u16; SWITCHABLE_FILTERS]; SWITCHABLE_FILTER_CONTEXTS],
+  // prom_av1e052: WARP — 3-way motion_mode (SIMPLE/OBMC/LOCALWARP) coded when
+  // the block is warp-eligible (allow_warped_motion + a non-empty matching-ref
+  // mask). [u16;3] ⇒ MUST sit among the small-partition (CDF_LEN<=4) cdfs, next
+  // to another [u16;3] (switchable_interp / tx_size), same reason as the interp
+  // cdf above: the undo log's fixed 4-wide copy overshoots 1 into tx_size_cdf,
+  // safe only because it too is small.
+  pub motion_mode_cdf: [[u16; 3]; BlockSize::BLOCK_SIZES_ALL],
   pub tx_size_cdf: [[[u16; MAX_TX_DEPTH + 1]; TX_SIZE_CONTEXTS]; BIG_TX_CATS],
 
   pub coeff_base_cdf:
@@ -133,6 +150,7 @@ impl CDFContext {
       intra_inter_cdfs: default_intra_inter_cdf,
       angle_delta_cdf: default_angle_delta_cdf,
       filter_intra_cdfs: default_filter_intra_cdfs,
+      obmc_cdf: default_obmc_cdf,
       palette_y_mode_cdfs: default_palette_y_mode_cdfs,
       palette_uv_mode_cdfs: default_palette_uv_mode_cdfs,
       comp_mode_cdf: default_comp_mode_cdf,
@@ -142,6 +160,8 @@ impl CDFContext {
       single_ref_cdfs: default_single_ref_cdf,
       drl_cdfs: default_drl_cdf,
       compound_mode_cdf: default_compound_mode_cdf,
+      switchable_interp_cdf: default_switchable_interp_cdf,
+      motion_mode_cdf: default_motion_mode_cdf,
       nmv_context: default_nmv_context,
       deblock_delta_multi_cdf: default_delta_lf_multi_cdf,
       deblock_delta_cdf: default_delta_lf_cdf,
@@ -229,6 +249,7 @@ impl CDFContext {
     reset_2d!(self.intra_inter_cdfs);
     reset_2d!(self.angle_delta_cdf);
     reset_2d!(self.filter_intra_cdfs);
+    reset_2d!(self.obmc_cdf);
     reset_3d!(self.palette_y_mode_cdfs);
     reset_2d!(self.palette_uv_mode_cdfs);
     reset_2d!(self.comp_mode_cdf);
@@ -238,6 +259,8 @@ impl CDFContext {
     reset_3d!(self.single_ref_cdfs);
     reset_2d!(self.drl_cdfs);
     reset_2d!(self.compound_mode_cdf);
+    reset_2d!(self.switchable_interp_cdf);
+    reset_2d!(self.motion_mode_cdf);
     reset_2d!(self.deblock_delta_multi_cdf);
     reset_1d!(self.deblock_delta_cdf);
     reset_2d!(self.spatial_segmentation_cdfs);
@@ -397,6 +420,10 @@ impl CDFContext {
       self.compound_mode_cdf.first().unwrap().as_ptr() as usize;
     let compound_mode_cdf_end =
       compound_mode_cdf_start + size_of_val(&self.compound_mode_cdf);
+    let switchable_interp_cdf_start =
+      self.switchable_interp_cdf.first().unwrap().as_ptr() as usize;
+    let switchable_interp_cdf_end =
+      switchable_interp_cdf_start + size_of_val(&self.switchable_interp_cdf);
     let nmv_context_start = &self.nmv_context as *const NMVContext as usize;
     let nmv_context_end = nmv_context_start + size_of_val(&self.nmv_context);
     let deblock_delta_multi_cdf_start =
@@ -514,6 +541,11 @@ impl CDFContext {
       ("single_ref_cdfs", single_ref_cdfs_start, single_ref_cdfs_end),
       ("drl_cdfs", drl_cdfs_start, drl_cdfs_end),
       ("compound_mode_cdf", compound_mode_cdf_start, compound_mode_cdf_end),
+      (
+        "switchable_interp_cdf",
+        switchable_interp_cdf_start,
+        switchable_interp_cdf_end,
+      ),
       ("nmv_context", nmv_context_start, nmv_context_end),
       (
         "deblock_delta_multi_cdf",
@@ -551,6 +583,21 @@ impl CDFContext {
     CDFOffset {
       offset: cdf as usize - self as *const _ as usize,
       phantom: PhantomData,
+    }
+  }
+
+  /// Resolve an offset to a read-only CDF reference WITHOUT touching the
+  /// undo log — the frozen-trial costing path (prom_av1e016). Mirrors the
+  /// pointer math in `CDFContextLogPartition::push`.
+  #[inline(always)]
+  pub fn read<const CDF_LEN: usize>(
+    &self, cdf: CDFOffset<CDF_LEN>,
+  ) -> &[u16; CDF_LEN] {
+    // SAFETY: `cdf.offset` was produced by `Self::offset` from a valid
+    // in-bounds field pointer of this struct.
+    unsafe {
+      let base = self as *const _ as *const u8;
+      &*(base.add(cdf.offset) as *const [u16; CDF_LEN])
     }
   }
 }
@@ -669,6 +716,16 @@ impl CDFContextLog {
   pub fn push<const CDF_LEN: usize>(
     &mut self, fc: &mut CDFContext, cdf: CDFOffset<CDF_LEN>,
   ) -> &mut [u16; CDF_LEN] {
+    // brick-D2 prize measure: under the frozen tier, counters never push,
+    // so this call count = the recorder-path undo-log volume.
+    // TAP REMOVED (2026-07-26): this fires ~30.6M times on a 10-frame CIF encode
+    // and measured 13.9 ns/call — at or below the cost of the rdtsc pair itself,
+    // i.e. the bucket was the instrument measuring itself. Worse, the guard's
+    // atomic add lands AFTER its closing timestamp, so ~1.5 s of probe overhead
+    // leaked into the PARENT scope and showed up as a fake 28% of encode in
+    // `partition+mode RDO(self)`. Profile-ON wall was 3.45x profile-OFF.
+    // Re-enable only with a sampling guard (e.g. 1-in-1024).
+    // let _prof = crate::prof::scope(crate::prof::Stage::RecLogPush);
     if CDF_LEN <= CDF_LEN_SMALL {
       self.small.push(fc, cdf)
     } else {

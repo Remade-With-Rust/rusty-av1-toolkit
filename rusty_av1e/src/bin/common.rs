@@ -473,7 +473,157 @@ pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
     None => None,
   };
 
+
+/// prom_av1e058: choose the re-ordering pyramid depth from a SOURCE probe.
+///
+/// A deeper pyramid is a large per-clip sign-flip (measured −5.16%..+7.43% BD
+/// over 18 clips), so it must be dispatched rather than defaulted. Four
+/// candidate signals were tried; the one that survived held-out validation is
+/// MOTION-COMPENSATED decay — how much worse block-ME prediction gets when the
+/// anchor distance goes from 1 to 8 frames, which is exactly what a deeper
+/// group stresses. Raw frame difference does NOT work: a pan has an enormous
+/// raw difference that motion compensation cancels entirely, and a rule built
+/// on it scored 8/8 on its fitting corpus and 2/6 held out.
+///
+/// The threshold is deliberately conservative (see `harvest::pyramid_ratio_t`):
+/// it routes only clips well inside the winning region, so the dispatch cannot
+/// make any clip worse — a false negative simply keeps the shipped depth.
+#[allow(clippy::needless_range_loop)]
+fn probe_pyramid_depth(path: &std::path::Path) -> Option<u64> {
+  const NF: usize = 9;
+  const BS: usize = 16;
+  const RANGE: isize = 12;
+  const STEP: isize = 2;
+
+  let f = File::open(path).ok()?;
+  let mut dec = y4m::Decoder::new(f).ok()?;
+  let (w, h) = (dec.get_width(), dec.get_height());
+  if w < 64 || h < 64 {
+    return None;
+  }
+  let mut fr: Vec<Vec<u8>> = Vec::with_capacity(NF);
+  for _ in 0..NF {
+    match dec.read_frame() {
+      Ok(fm) => fr.push(fm.get_y_plane().to_vec()),
+      Err(_) => break,
+    }
+  }
+  if fr.len() < NF {
+    return None;
+  }
+
+  // Mean per-pixel SAD after coarse translational block matching. Blocks are
+  // sampled on a 2x-coarse grid: this is a frame-level classifier, not a model.
+  let sad = |cur: &[u8], rf: &[u8]| -> f64 {
+    let (mut tot, mut n) = (0f64, 0usize);
+    let mut by = RANGE as usize;
+    while by + BS + RANGE as usize <= h {
+      let mut bx = RANGE as usize;
+      while bx + BS + RANGE as usize <= w {
+        let mut best = f64::MAX;
+        let mut dy = -RANGE;
+        while dy <= RANGE {
+          let mut dx = -RANGE;
+          while dx <= RANGE {
+            let mut acc = 0u32;
+            for y in 0..BS {
+              let cr = (by + y) * w + bx;
+              let rr = ((by as isize + dy) as usize + y) * w
+                + (bx as isize + dx) as usize;
+              for x in 0..BS {
+                acc += (cur[cr + x] as i32 - rf[rr + x] as i32).unsigned_abs();
+              }
+            }
+            let v = acc as f64 / (BS * BS) as f64;
+            if v < best {
+              best = v;
+            }
+            dx += STEP;
+          }
+          dy += STEP;
+        }
+        tot += best;
+        n += 1;
+        bx += BS * 2;
+      }
+      by += BS * 2;
+    }
+    if n == 0 { 0.0 } else { tot / n as f64 }
+  };
+
+  let mc1: f64 =
+    (0..NF - 1).map(|i| sad(&fr[i + 1], &fr[i])).sum::<f64>() / (NF - 1) as f64;
+  let mc8 = sad(&fr[NF - 1], &fr[0]);
+  if mc1 <= 1e-6 {
+    return None;
+  }
+  let ratio = mc8 / mc1;
+  let depth = if ratio < rav1e::harvest::pyramid_ratio_t() { 3 } else { 2 };
+  if std::env::var("RAV1E_PYRAMID_DBG").is_ok() {
+    eprintln!("PYRAMID_PROBE mc1={mc1:.2} mc8={mc8:.2} ratio={ratio:.3} depth={depth}");
+  }
+  Some(depth)
+}
+
+/// prom_av1e065: mean |horizontal luma gradient| over the first frames -- the
+/// SPATIAL DETAIL classifier for the minpart dispatch. Cheap (O(pixels), no
+/// motion search) and computed on the source before any encode.
+fn probe_detail(path: &std::path::Path) -> Option<f64> {
+  const NF: usize = 9;
+  let f = File::open(path).ok()?;
+  let mut dec = y4m::Decoder::new(f).ok()?;
+  let (w, h) = (dec.get_width(), dec.get_height());
+  if w < 16 || h < 16 {
+    return None;
+  }
+  let (mut tot, mut n) = (0f64, 0usize);
+  for _ in 0..NF {
+    let fm = match dec.read_frame() {
+      Ok(fm) => fm,
+      Err(_) => break,
+    };
+    let y = fm.get_y_plane();
+    for row in 0..h {
+      let r = &y[row * w..row * w + w];
+      for x in 1..w {
+        tot += (r[x] as i32 - r[x - 1] as i32).unsigned_abs() as f64;
+        n += 1;
+      }
+    }
+  }
+  if n == 0 {
+    return None;
+  }
+  let detail = tot / n as f64;
+  if std::env::var("RAV1E_MINPART_DBG").is_ok() {
+    eprintln!(
+      "MINPART_PROBE detail={detail:.3} t={:.3} engage={}",
+      rav1e::harvest::minpart_detail_t(),
+      detail > rav1e::harvest::minpart_detail_t()
+    );
+  }
+  Some(detail)
+}
+
   let os_input = &matches.input;
+  // Pick the pyramid depth from the source before the Config (and with it
+  // InterConfig) is constructed — `harvest::pyramid_depth()` caches its first
+  // read, so the override has to be set here. Stdin cannot be probed without
+  // buffering the stream, so it keeps the shipped depth.
+  if rav1e::harvest::pyramid_auto() && os_input.to_str() != Some("-") {
+    if let Some(d) = probe_pyramid_depth(os_input) {
+      rav1e::harvest::set_pyramid_override(d);
+    }
+  }
+  // prom_av1e065: the minpart dispatch reads the same source before the Config
+  // is built (SpeedSettings::from_preset consults it).
+  if rav1e::harvest::minpart_auto() && os_input.to_str() != Some("-") {
+    if let Some(d) = probe_detail(os_input) {
+      rav1e::harvest::set_minpart_dispatch(
+        d > rav1e::harvest::minpart_detail_t(),
+      );
+    }
+  }
   let io = EncoderIO {
     input: match os_input.to_str() {
       Some("-") => Box::new(io::stdin()) as Box<dyn Read + Send>,

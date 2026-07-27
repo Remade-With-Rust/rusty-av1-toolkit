@@ -276,6 +276,23 @@ impl TileBlocksMut<'_> {
     self.for_each(bo, bsize, |block| block.mv = mvs);
   }
 
+  // prom_av1e048c: stamp the block's chosen interp filter into the grid so later
+  // blocks' switchable-interp context can read it as an above/left neighbor.
+  #[inline(always)]
+  pub fn set_interp_filters(
+    &mut self, bo: TileBlockOffset, bsize: BlockSize,
+    filter: crate::mc::FilterMode,
+  ) {
+    self.for_each(bo, bsize, |block| block.interp_filter = filter);
+  }
+
+  pub fn set_motion_mode(
+    &mut self, bo: TileBlockOffset, bsize: BlockSize,
+    motion_mode: crate::predict::MotionMode,
+  ) {
+    self.for_each(bo, bsize, |block| block.motion_mode = motion_mode);
+  }
+
   #[inline(always)]
   pub fn set_cdef(&mut self, sbo: TileSuperBlockOffset, cdef_index: u8) {
     let bo = sbo.block_offset(0, 0).0;

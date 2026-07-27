@@ -86,6 +86,8 @@ mod activity;
 pub(crate) mod asm;
 mod dist;
 #[doc(hidden)]
+pub mod harvest;
+#[doc(hidden)]
 pub mod prof;
 #[doc(hidden)]
 pub mod racecar;
@@ -97,6 +99,7 @@ mod rdo;
 mod rdo_tables;
 #[macro_use]
 mod util;
+mod varpart;
 mod cdef;
 #[doc(hidden)]
 pub mod context;
@@ -110,8 +113,11 @@ mod me;
 mod rate;
 mod recon_intra;
 mod scan_order;
+mod warp;
+mod warp_tables;
 mod segmentation;
 mod stats;
+mod tempfilter;
 #[doc(hidden)]
 pub mod tiling;
 mod token_cdfs;

@@ -240,6 +240,9 @@ fn do_encode<T: Pixel, D: Decoder>(
       .map_err(|e| e.context("Unable to write to two-pass data file."))?;
   }
 
+  if std::env::var("RAV1E_PROF").is_ok() {
+    rav1e::prof::reset();
+  }
   while let Some(frame_info) = process_frame(
     &mut ctx,
     &mut *output,
@@ -263,6 +266,12 @@ fn do_encode<T: Pixel, D: Decoder>(
       output.flush().unwrap();
     }
   }
+  if std::env::var("RAV1E_PROF").is_ok() {
+    rav1e::prof::dump("encode");
+  }
+  // Independent of RAV1E_PROF — the accountant answers a different question
+  // (where the BITS go, not the time) and gates itself on RAV1E_BITACCT.
+  rav1e::prof::bitacct::dump("encode");
   if verbose != Verboseness::Quiet {
     if verbose == Verboseness::Verbose {
       // Clear out the temporary progress indicator

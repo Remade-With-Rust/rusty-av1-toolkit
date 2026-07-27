@@ -310,7 +310,9 @@ impl PredictionMode {
     assert!(!self.is_intra());
     let frame_po = tile_rect.to_frame_plane_offset(po);
 
-    let mode = fi.default_filter;
+    // prom_av1e045: the adaptively-chosen per-frame filter overrides the
+    // default (both this prediction and the header signal read it).
+    let mode = crate::encoder::frame_filter::get().unwrap_or(fi.default_filter);
 
     if let Some(ref rec) =
       fi.rec_buffer.frames[fi.ref_frames[ref_frame.to_index()] as usize]
@@ -346,7 +348,9 @@ impl PredictionMode {
     assert!(!self.is_intra());
     let frame_po = tile_rect.to_frame_plane_offset(po);
 
-    let mode = fi.default_filter;
+    // prom_av1e045: the adaptively-chosen per-frame filter overrides the
+    // default (both this prediction and the header signal read it).
+    let mode = crate::encoder::frame_filter::get().unwrap_or(fi.default_filter);
 
     for i in 0..2 {
       if let Some(ref rec) =

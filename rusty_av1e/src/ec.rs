@@ -35,6 +35,11 @@ type ec_window = u32;
 /// (using a new `WriterEncoder` as a `Writer`).  A `WriterRecorder`'s
 /// contents can be replayed into a `WriterEncoder`.
 pub trait Writer {
+  /// See `StorageBackend::COUNTS_ONLY` — true only for counting writers.
+  const COUNTS_ONLY: bool = false;
+  /// True only for the writer that emits the FINAL bitstream (see
+  /// `CountsOnly::EMITS`) — the gate bit accounting must use.
+  const EMITS: bool = false;
   /// Write a symbol `s`, using the passed in cdf reference; leaves `cdf` unchanged
   fn symbol<const CDF_LEN: usize>(&mut self, s: u32, cdf: &[u16; CDF_LEN]);
   /// return approximate number of fractional bits in `OD_BITRES`
@@ -101,6 +106,28 @@ pub trait Writer {
 /// implementation's storage to the generic `Writer`.  It would be
 /// private, but Rust is deprecating 'private trait in a public
 /// interface' support.
+/// Compile-time marker for counting-only writers (prom_av1e011 B8 fast
+/// path). Kept OFF `StorageBackend` so that trait stays dyn-compatible for
+/// the Recorder's `replay(&mut dyn StorageBackend)`. True only where the
+/// backend never materializes bits (WriterCounter); false wherever bit
+/// VALUES matter (Encoder writes them, Recorder replays them).
+pub trait CountsOnly {
+  const COUNTS_ONLY: bool = false;
+  /// prom_av1e054: true ONLY for the writer that emits the final bitstream.
+  /// `COUNTS_ONLY` cannot serve this purpose — it is false for the Recorder
+  /// too, and the partition search drives Recorders for its trial candidates,
+  /// so bit accounting keyed on `!COUNTS_ONLY` sums every rolled-back trial
+  /// along with the real emit (measured 4x the actual file size).
+  const EMITS: bool = false;
+}
+impl CountsOnly for WriterBase<WriterCounter> {
+  const COUNTS_ONLY: bool = true;
+}
+impl CountsOnly for WriterBase<WriterRecorder> {}
+impl CountsOnly for WriterBase<WriterEncoder> {
+  const EMITS: bool = true;
+}
+
 pub trait StorageBackend {
   /// Store partially-computed range code into given storage backend
   fn store(&mut self, fl: u16, fh: u16, nms: u16);
@@ -152,6 +179,12 @@ pub struct WriterEncoder {
 
 #[derive(Clone)]
 pub struct WriterCheckpoint {
+  /// prom_av1e054: per-syntax bit counters at checkpoint time. The partition
+  /// search writes trial candidates into a Recorder and rolls back the losers,
+  /// so accounting must unwind with them or it sums every abandoned trial
+  /// (measured 4x the real stream).
+  #[cfg(feature = "bitacct")]
+  pub ba: [u64; 10],
   /// Stream length coded/recorded to date, in the unit used by the Writer,
   /// which may be bytes or bits. This depends on the assumption
   /// that a Writer will only ever restore its own Checkpoint.
@@ -193,6 +226,14 @@ impl WriterEncoder {
 impl StorageBackend for WriterBase<WriterCounter> {
   #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
+    // prom_av1e015: cost by prob→bits table instead of simulating the range
+    // coder (the libaom av1_prob_cost structure). See harvest::fastsym().
+    if crate::harvest::fastsym() {
+      let w =
+        usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
+      self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
+      return;
+    }
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -206,6 +247,8 @@ impl StorageBackend for WriterBase<WriterCounter> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.bits,
       backend_var: 0,
       rng: self.rng,
@@ -216,6 +259,8 @@ impl StorageBackend for WriterBase<WriterCounter> {
   }
   #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.s.bits = checkpoint.stream_size;
   }
@@ -228,6 +273,17 @@ impl StorageBackend for WriterBase<WriterCounter> {
 impl StorageBackend for WriterBase<WriterRecorder> {
   #[inline]
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
+    // prom_av1e015: the recorder's range tracking exists only to report rate
+    // (replay re-runs the real coding from the stored tokens), so under
+    // fastsym the cost comes from the prob→bits table instead. The token
+    // push is untouched — replay integrity does not depend on rng/bits.
+    if crate::harvest::fastsym() {
+      let w =
+        usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
+      self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
+      self.s.storage.push((fl, fh, nms));
+      return;
+    }
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -242,6 +298,8 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.bits,
       backend_var: self.s.storage.len(),
       rng: self.rng,
@@ -250,6 +308,8 @@ impl StorageBackend for WriterBase<WriterRecorder> {
   }
   #[inline]
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
     self.s.bits = checkpoint.stream_size;
@@ -293,6 +353,8 @@ impl StorageBackend for WriterBase<WriterEncoder> {
   #[inline]
   fn checkpoint(&mut self) -> WriterCheckpoint {
     WriterCheckpoint {
+      #[cfg(feature = "bitacct")]
+      ba: crate::prof::bitacct::snapshot(),
       stream_size: self.s.precarry.len(),
       backend_var: self.s.low as usize,
       rng: self.rng,
@@ -300,6 +362,8 @@ impl StorageBackend for WriterBase<WriterEncoder> {
     }
   }
   fn rollback(&mut self, checkpoint: &WriterCheckpoint) {
+    #[cfg(feature = "bitacct")]
+    crate::prof::bitacct::restore(&checkpoint.ba);
     self.rng = checkpoint.rng;
     self.cnt = checkpoint.cnt;
     self.s.low = checkpoint.backend_var as ec_window;
@@ -477,8 +541,10 @@ impl WriterBase<WriterEncoder> {
 /// (ie, `Encoder`s and `Recorder`s)
 impl<S> Writer for WriterBase<S>
 where
-  WriterBase<S>: StorageBackend,
+  WriterBase<S>: StorageBackend + CountsOnly,
 {
+  const COUNTS_ONLY: bool = <WriterBase<S> as CountsOnly>::COUNTS_ONLY;
+  const EMITS: bool = <WriterBase<S> as CountsOnly>::EMITS;
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
   /// `f`: The probability that the val is one, scaled by 32768.
@@ -492,6 +558,14 @@ where
   /// - `val`: The value to encode (`false` or `true`).
   /// - `f`: The probability that the `val` is `true`, scaled by `32768`.
   fn bit(&mut self, bit: u16) {
+    // prom_av1e012: on counting writers a flat bit costs exactly 1 bit by
+    // construction — account it instead of running the EC store. Covers every
+    // flat-bit site in the rate path (signs, eob extras, golomb/quniform via
+    // literal, MV bits). BD-gated via RAV1E_FASTRATE (rng drift epsilons).
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+      self.add_bits_frac(8);
+      return;
+    }
     self.bool(bit == 1, 16384);
   }
   // fake add bits
@@ -504,6 +578,12 @@ where
   /// - 'bits': Length of bitstring
   /// - 's': Bit string to encode
   fn literal(&mut self, bits: u8, s: u32) {
+    // prom_av1e012: see bit() — one accounting add replaces `bits` EC stores
+    // on counting writers.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+      self.add_bits_frac(8 * u32::from(bits));
+      return;
+    }
     for bit in (0..bits).rev() {
       self.bit((1 & (s >> bit)) as u16);
     }
@@ -558,6 +638,18 @@ where
       if self.debug {
         self.print_backtrace(s);
       }
+    }
+    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
+    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
+    // counter neither snapshots the undo log nor adapts the CDF — the cost
+    // reads the current (final-encode-evolved) distribution. Counter-only:
+    // recorder tokens are replayed into the real bitstream and must carry
+    // spec-adaptive brackets.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::frozen()
+    {
+      let cdf = fc.read(cdf);
+      self.symbol(s, cdf);
+      return;
     }
     let cdf = log.push(fc, cdf);
     self.symbol(s, cdf);

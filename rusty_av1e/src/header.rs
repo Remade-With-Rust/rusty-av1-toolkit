@@ -364,7 +364,7 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
     } else {
       self.write_bit(seq.enable_interintra_compound)?;
       self.write_bit(seq.enable_masked_compound)?;
-      self.write_bit(seq.enable_warped_motion)?;
+      self.write_bit(seq.warp_seq_flag())?;
       self.write_bit(seq.enable_dual_filter)?;
       self.write_bit(seq.enable_order_hint)?;
 
@@ -642,11 +642,20 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         self.write_bit(fi.allow_high_precision_mv);
       }
 
-      self.write_bit(fi.is_filter_switchable)?;
-      if !fi.is_filter_switchable {
-        self.write::<2, u8>(fi.default_filter as u8)?;
+      // prom_av1e048c: per-FRAME dispatch decides SWITCHABLE (each inter block
+      // codes its own filter) vs a fixed frame filter. frame_dispatch is set by
+      // pick_frame_dispatch before the tile pass, so header + blocks agree.
+      let switchable = crate::encoder::frame_dispatch::switchable();
+      self.write_bit(switchable)?;
+      if !switchable {
+        // prom_av1e045: signal the adaptively-chosen frame filter (matches what
+        // prediction used); falls back to fi.default_filter when off.
+        let filt = crate::encoder::frame_filter::get()
+          .unwrap_or(fi.default_filter);
+        self.write::<2, u8>(filt as u8)?;
       }
-      self.write_bit(fi.is_motion_mode_switchable)?;
+      // prom_av1e050: OBMC — frame-level motion_mode switchable flag.
+      self.write_bit(crate::encoder::obmc_frame::on())?;
 
       if (!fi.error_resilient && fi.sequence.enable_ref_frame_mvs) {
         self.write_bit(fi.use_ref_frame_mvs)?;
@@ -787,10 +796,10 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
       self.write_bit(false)?; // skip_mode_present
     }
 
-    if fi.intra_only || fi.error_resilient || !fi.sequence.enable_warped_motion
+    if fi.intra_only || fi.error_resilient || !fi.sequence.warp_seq_flag()
     {
     } else {
-      self.write_bit(fi.allow_warped_motion)?; // allow_warped_motion
+      self.write_bit(fi.warp_header_flag())?; // allow_warped_motion
     }
 
     self.write_bit(fi.use_reduced_tx_set)?; // reduced tx
@@ -809,26 +818,28 @@ impl<W: io::Write> UncompressedHeader for BitWriter<W, BigEndian> {
         match mode {
           GlobalMVMode::IDENTITY => { /* Nothing to do */ }
           GlobalMVMode::TRANSLATION => {
-            let mv_x = 0;
-            let mv_x_ref = 0;
-            let mv_y = 0;
-            let mv_y_ref = 0;
-            let bits = 12 - 6 + 3 - !fi.allow_high_precision_mv as u8;
-            let bits_diff = 12 - 3 + fi.allow_high_precision_mv as u8;
-            BCodeWriter::write_s_refsubexpfin(
-              self,
-              (1 << bits) + 1,
-              3,
-              mv_x_ref >> bits_diff,
-              mv_x >> bits_diff,
-            )?;
-            BCodeWriter::write_s_refsubexpfin(
-              self,
-              (1 << bits) + 1,
-              3,
-              mv_y_ref >> bits_diff,
-              mv_y >> bits_diff,
-            )?;
+            // prom_av1e060 M1: the exact inverse of the decoder's `parse_gmv`
+            // (rusty_av1d_stock obu.rs), which for TRANSLATION reads
+            //   bits  = 9 - !hp
+            //   shift = 13 + !hp
+            //   mat[k] = get_bits_subexp(ref_mat[k] >> shift, bits) << shift
+            // for k = 0 then 1. NOTE mat[0] is the ROW (y) translation and is
+            // coded FIRST — the previous placeholder wrote "mv_x" first and
+            // used a shift of 9 + hp, which is simply wrong; it went unnoticed
+            // only because the values were hardcoded to zero and 0 >> n == 0.
+            let hp = fi.allow_high_precision_mv;
+            let bits: u8 = 9 - !hp as u8;
+            let shift: u8 = 13 + !hp as u8;
+            let refm = fi.gm_ref_params(i);
+            for k in 0..2 {
+              BCodeWriter::write_s_refsubexpfin(
+                self,
+                (1u16 << bits) + 1,
+                3,
+                (refm[k] >> shift) as i16,
+                (fi.gm_params[i][k] >> shift) as i16,
+              )?;
+            }
           }
           GlobalMVMode::ROTZOOM => unimplemented!(),
           GlobalMVMode::AFFINE => unimplemented!(),

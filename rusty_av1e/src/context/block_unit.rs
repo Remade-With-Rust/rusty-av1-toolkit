@@ -180,6 +180,11 @@ pub struct Block {
   // deltas
   pub deblock_deltas: [i8; FRAME_LF_COUNT],
   pub segmentation_idx: u8,
+  // prom_av1e048c: per-block switchable interpolation filter.
+  pub interp_filter: crate::mc::FilterMode,
+  // prom_av1e050: per-block motion mode (OBMC). SIMPLE_TRANSLATION unless the
+  // block signals OBMC_CAUSAL; neighbours read this + mv/ref for their blend.
+  pub motion_mode: crate::predict::MotionMode,
 }
 
 impl Block {
@@ -207,8 +212,40 @@ impl Default for Block {
       txsize: TX_64X64,
       deblock_deltas: [0, 0, 0, 0],
       segmentation_idx: 0,
+      interp_filter: crate::mc::FilterMode::REGULAR,
+      motion_mode: crate::predict::MotionMode::SIMPLE_TRANSLATION,
     }
   }
+}
+
+// AV1 needs_interp_filter(), reduced to this fork's feature set (no skip_mode,
+// no LOCALWARP here). A LARGE GLOBALMV/GLOBAL_GLOBALMV block codes a filter
+// symbol only when its reference's GLOBAL MOTION type is TRANSLATION; every
+// other inter block codes one.
+//
+// prom_av1e060 M1b: the GM type is now a parameter. This used to assume
+// IDENTITY and return `!(large && is_global)`, which is the right answer ONLY
+// while global motion is identity — the decoder sets `has_subpel_filter` for a
+// GLOBALMV block exactly when the model is TRANSLATION (rusty_av1d_stock
+// decode.rs), so signalling a translation model made the decoder read a filter
+// symbol the encoder never wrote. That was the first-inter-frame desync.
+// Note the spec's asymmetry: ROTZOOM/AFFINE code NO filter (warp handles the
+// subpel), so this is specifically `== TRANSLATION`, not `>= TRANSLATION`.
+#[inline]
+pub fn needs_interp_filter(
+  bsize: BlockSize, mode: PredictionMode, gm_types: [GlobalMVMode; 2],
+) -> bool {
+  let large = bsize.width().min(bsize.height()) >= 8;
+  if large {
+    if mode == PredictionMode::GLOBALMV {
+      return gm_types[0] == GlobalMVMode::TRANSLATION;
+    }
+    if mode == PredictionMode::GLOBAL_GLOBALMV {
+      return gm_types[0] == GlobalMVMode::TRANSLATION
+        || gm_types[1] == GlobalMVMode::TRANSLATION;
+    }
+  }
+  true
 }
 
 #[derive(Clone)]
@@ -1330,7 +1367,21 @@ impl ContextWriter<'_> {
       }
 
       if is_compound {
-        let mut combined_mvs = [[MotionVector::default(); 2]; 2];
+        // prom_av1e060 M1d: slots this extra search cannot fill are the
+        // decoder's GLOBAL-MV padding (`same[m..2] = tgmv[n]`), NOT zero.
+        // Seeding with zero was invisible while global motion was identity and
+        // is the last of the "assumed IDENTITY" desyncs: on a frame's very
+        // FIRST block there are no spatial neighbours at all, so both slots are
+        // padding, and the compound NEW_NEWMV predictor came out short by
+        // exactly the global MV.
+        let mut combined_mvs = [[
+          fi.global_mv(ref_frames[0].to_index()),
+          if ref_frames[1] != NONE_FRAME {
+            fi.global_mv(ref_frames[1].to_index())
+          } else {
+            MotionVector::default()
+          },
+        ]; 2];
 
         for list in 0..2 {
           let mut comp_count = 0;
@@ -1720,6 +1771,292 @@ impl ContextWriter<'_> {
     symbol_with_update!(self, w, drl_mode as u32, cdf);
   }
 
+  // prom_av1e048c: AV1 switchable-interp coding context (dav1d get_filter_ctx,
+  // single filter ⇒ dir=0). ctx = comp*4 + combo, combo∈0..3 from above/left
+  // neighbor filters, each counted only when that neighbor references ref0.
+  pub(crate) fn get_switchable_interp_ctx(
+    &self, bo: TileBlockOffset, ref0: RefType, comp: bool,
+  ) -> usize {
+    let n_switch = crate::entropymode::SWITCHABLE_FILTERS as u8;
+    let neigh = |b: &Block| -> u8 {
+      if b.ref_frames[0] == ref0 || b.ref_frames[1] == ref0 {
+        b.interp_filter as u8
+      } else {
+        n_switch
+      }
+    };
+    let above =
+      if bo.0.y > 0 { neigh(self.bc.blocks.above_of(bo)) } else { n_switch };
+    let left =
+      if bo.0.x > 0 { neigh(self.bc.blocks.left_of(bo)) } else { n_switch };
+    let combo = if above == left {
+      above
+    } else if above == n_switch {
+      left
+    } else if left == n_switch {
+      above
+    } else {
+      n_switch
+    };
+    (comp as usize) * 4 + combo as usize
+  }
+
+  // prom_av1e048c: code this inter block's interpolation filter (single filter;
+  // dual_filter off). Caller guards on needs_interp_filter.
+  pub fn write_interp_filter<W: Writer>(
+    &mut self, w: &mut W, bo: TileBlockOffset,
+    filter: crate::mc::FilterMode, ref0: RefType, comp: bool,
+  ) {
+    let ctx = self.get_switchable_interp_ctx(bo, ref0, comp);
+    symbol_with_update!(
+      self,
+      w,
+      filter as u32,
+      &self.fc.switchable_interp_cdf[ctx]
+    );
+  }
+
+  // prom_av1e050: OBMC eligibility — mirrors the decoder's motion_mode gate with
+  // interintra absent and warp off (decode.rs ~2768): the block is >= 8px in both
+  // dims AND has an overlappable (inter, odd-4x4-position) neighbour on the top
+  // row or left column (dav1d `findoddzero`). Read from the block grid, which
+  // matches the decoder's above/left intra caches by construction.
+  pub(crate) fn obmc_allowed(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> bool {
+    let bw4 = bsize.width_mi();
+    let bh4 = bsize.height_mi();
+    if bw4.min(bh4) < 2 {
+      return false;
+    }
+    // Clip the neighbour scan to the frame edge, matching the decoder's
+    // w4 = min(bw4, bw - bx) / h4 = min(bh4, bh - by) — an unclipped scan reads
+    // blocks past the right/bottom edge and mis-computes eligibility (desync).
+    let (cols, rows) = (self.bc.blocks.cols(), self.bc.blocks.rows());
+    let w4 = bw4.min(cols - bo.0.x);
+    let h4 = bh4.min(rows - bo.0.y);
+    let top = bo.0.y > 0
+      && (1..w4).step_by(2).any(|x| {
+        self.bc.blocks[bo.with_offset(x as isize, -1)].is_inter()
+      });
+    let left = bo.0.x > 0
+      && (1..h4).step_by(2).any(|y| {
+        self.bc.blocks[bo.with_offset(-1, y as isize)].is_inter()
+      });
+    top || left
+  }
+
+
+  /// prom_av1e052: WARP M1 — the decoder's `find_matching_ref` BOOLEAN. Returns
+  /// whether any single-ref neighbour on the top row / left column shares this
+  /// block's reference (the `mask != 0` that makes the 3-way motion_mode CDF
+  /// active instead of the 2-way obmc CDF). Mirrors dav1d decode.rs
+  /// find_matching_ref's walk EXACTLY — the block-size stepping and the
+  /// `aw4 >= bw4` first-neighbour-only branch — since any divergence flips the
+  /// CDF choice and desyncs. Caller guards obmc_allowed + fi.allow_warped_motion.
+  pub(crate) fn warp_allowed(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> bool {
+    let m = self.warp_masks(bo, bsize);
+    m[0] != 0 || m[1] != 0
+  }
+
+  /// prom_av1e052: WARP — the decoder's `find_matching_ref`, filling the top
+  /// (masks[0]) and left (masks[1]) neighbour bitmasks EXACTLY as dav1d does
+  /// (block-size stepping; corner bits at position 32). `mask != 0` drives the
+  /// M1 CDF selection; the bit pattern drives M2's warp-sample collection.
+  pub(crate) fn warp_masks(
+    &self, bo: TileBlockOffset, bsize: BlockSize,
+  ) -> [u64; 2] {
+    let bw4 = bsize.width_mi() as isize;
+    let bh4 = bsize.height_mi() as isize;
+    let (cols, rows) =
+      (self.bc.blocks.cols() as isize, self.bc.blocks.rows() as isize);
+    let w4 = bw4.min(cols - bo.0.x as isize);
+    let h4 = bh4.min(rows - bo.0.y as isize);
+    let our_ref = self.bc.blocks[bo].ref_frames[0];
+    let matches = |b: &Block| {
+      b.ref_frames[0] == our_ref
+        && b.ref_frames[1] == crate::partition::RefType::NONE_FRAME
+    };
+    let mut masks = [0u64; 2];
+    let mut count = 0u32;
+    let mut have_topleft = bo.0.y > 0 && bo.0.x > 0;
+    let mut have_topright = bw4.max(bh4) < 32
+      && bo.0.y > 0
+      && (bo.0.x as isize + bw4) < cols
+      && crate::partition::has_tr(bo, bsize);
+    if bo.0.y > 0 {
+      let n0 = &self.bc.blocks[bo.with_offset(0, -1)];
+      if matches(n0) {
+        masks[0] |= 1;
+        count = 1;
+      }
+      let aw4 = n0.n4_w as isize;
+      if aw4 >= bw4 {
+        let off = bo.0.x as isize & (aw4 - 1);
+        if off != 0 {
+          have_topleft = false;
+        }
+        if aw4 - off > bw4 {
+          have_topright = false;
+        }
+      } else {
+        let mut mask = 1u64 << aw4;
+        let mut x = aw4;
+        while x < w4 {
+          let n = &self.bc.blocks[bo.with_offset(x, -1)];
+          if matches(n) {
+            masks[0] |= mask;
+            count += 1;
+            if count >= 8 {
+              return masks;
+            }
+          }
+          let aw = n.n4_w as isize;
+          mask <<= aw;
+          x += aw;
+        }
+      }
+    }
+    if bo.0.x > 0 {
+      let n0 = &self.bc.blocks[bo.with_offset(-1, 0)];
+      if matches(n0) {
+        masks[1] |= 1;
+        count += 1;
+        if count >= 8 {
+          return masks;
+        }
+      }
+      let lh4 = n0.n4_h as isize;
+      if lh4 >= bh4 {
+        if bo.0.y as isize & (lh4 - 1) != 0 {
+          have_topleft = false;
+        }
+      } else {
+        let mut mask = 1u64 << lh4;
+        let mut y = lh4;
+        while y < h4 {
+          let n = &self.bc.blocks[bo.with_offset(-1, y)];
+          if matches(n) {
+            masks[1] |= mask;
+            count += 1;
+            if count >= 8 {
+              return masks;
+            }
+          }
+          let lh = n.n4_h as isize;
+          mask <<= lh;
+          y += lh;
+        }
+      }
+    }
+    if have_topleft && matches(&self.bc.blocks[bo.with_offset(-1, -1)]) {
+      masks[1] |= 1 << 32;
+      count += 1;
+      if count >= 8 {
+        return masks;
+      }
+    }
+    if have_topright && matches(&self.bc.blocks[bo.with_offset(bw4, -1)]) {
+      masks[0] |= 1 << 32;
+    }
+    masks
+  }
+
+  /// prom_av1e052: WARP M2 — derive the affine warp model for a block from its
+  /// neighbour MV correspondences (dav1d derive_warpmv). Reads the same mask as
+  /// warp_masks, collects samples (neighbour position → neighbour-MV-projected
+  /// point), filters + solves. `mv` is the block's own MV.
+  pub(crate) fn derive_warpmv(
+    &self, bo: TileBlockOffset, bsize: BlockSize, mv: MotionVector,
+  ) -> crate::warp::WarpedMotionParams {
+    let bw4 = bsize.width_mi() as i32;
+    let bh4 = bsize.height_mi() as i32;
+    let bx = bo.0.x as i32;
+    let by = bo.0.y as i32;
+    let masks = self.warp_masks(bo, bsize);
+    let nb = |dc: i32, dr: i32| -> &Block {
+      &self.bc.blocks[bo.with_offset(dc as isize, dr as isize)]
+    };
+    let mut pts: Vec<[[i32; 2]; 2]> = Vec::with_capacity(8);
+    let add = |pts: &mut Vec<[[i32; 2]; 2]>,
+               dx: i32,
+               dy: i32,
+               sx: i32,
+               sy: i32,
+               b: &Block| {
+      if pts.len() >= 8 {
+        return;
+      }
+      let ix = 16 * (2 * dx + sx * b.n4_w as i32) - 8;
+      let iy = 16 * (2 * dy + sy * b.n4_h as i32) - 8;
+      pts.push([[ix, iy], [ix + b.mv[0].col as i32, iy + b.mv[0].row as i32]]);
+    };
+    // top row
+    if masks[0] as u32 == 1 && masks[1] >> 32 == 0 {
+      let off = bx & (nb(0, -1).n4_w as i32 - 1);
+      add(&mut pts, -off, 0, 1, -1, nb(0, -1));
+    } else {
+      let mut off = 0i32;
+      let mut xmask = masks[0] as u32;
+      while pts.len() < 8 && xmask != 0 {
+        let tz = xmask.trailing_zeros() as i32;
+        off += tz;
+        xmask >>= tz;
+        add(&mut pts, off, 0, 1, -1, nb(off, -1));
+        xmask &= !1;
+      }
+    }
+    // left column
+    if pts.len() < 8 && masks[1] as u32 == 1 {
+      let off = by & (nb(-1, 0).n4_h as i32 - 1);
+      add(&mut pts, 0, -off, -1, 1, nb(-1, -off));
+    } else {
+      let mut off = 0i32;
+      let mut ymask = masks[1] as u32;
+      while pts.len() < 8 && ymask != 0 {
+        let tz = ymask.trailing_zeros() as i32;
+        off += tz;
+        ymask >>= tz;
+        add(&mut pts, 0, off, -1, 1, nb(-1, off));
+        ymask &= !1;
+      }
+    }
+    // top-left corner
+    if pts.len() < 8 && masks[1] >> 32 != 0 {
+      add(&mut pts, 0, 0, -1, -1, nb(-1, -1));
+    }
+    // top-right corner
+    if pts.len() < 8 && masks[0] >> 32 != 0 {
+      add(&mut pts, bw4, 0, 1, -1, nb(bw4, -1));
+    }
+    crate::warp::solve_warp(&pts, bw4, bh4, mv, bx, by)
+  }
+
+  // prom_av1e050/052: code the motion_mode symbol. When the block is
+  // warp-eligible (allow_warp) the decoder reads the 3-way motion_mode_cdf
+  // (SIMPLE/OBMC/LOCALWARP); otherwise the 2-way obmc_cdf. M1 never emits
+  // LOCALWARP (no warp prediction yet), so motion_mode ∈ {SIMPLE, OBMC}.
+  pub fn write_motion_mode<W: Writer>(
+    &mut self, w: &mut W, _bo: TileBlockOffset, bsize: BlockSize,
+    motion_mode: crate::predict::MotionMode, allow_warp: bool,
+  ) {
+    if allow_warp {
+      let sym = motion_mode as u32; // SIMPLE=0, OBMC=1, WARP=2
+      symbol_with_update!(
+        self,
+        w,
+        sym,
+        &self.fc.motion_mode_cdf[bsize as usize]
+      );
+    } else {
+      let is_obmc =
+        (motion_mode == crate::predict::MotionMode::OBMC_CAUSAL) as u32;
+      symbol_with_update!(self, w, is_obmc, &self.fc.obmc_cdf[bsize as usize]);
+    }
+  }
+
   /// # Panics
   ///
   /// - If the MV is invalid
@@ -1734,6 +2071,14 @@ impl ContextWriter<'_> {
       MotionVector { row: mv.row - ref_mv.row, col: mv.col - ref_mv.col };
     let j: MvJointType = av1_get_mv_joint(diff);
 
+    // Prometheus harvest (prom_av1e004): true adaptive-entropy MV cost, to
+    // calibrate me.rs::get_mv_rate's 2·ilog model. Observe-only.
+    let harvest_t0 = if crate::harvest::enabled() {
+      Some(w.tell_frac())
+    } else {
+      None
+    };
+
     let cdf = &self.fc.nmv_context.joints_cdf;
     symbol_with_update!(self, w, j as u32, cdf);
 
@@ -1742,6 +2087,16 @@ impl ContextWriter<'_> {
     }
     if mv_joint_horizontal(j) {
       self.encode_mv_component(w, diff.col as i32, 1, mv_precision);
+    }
+
+    if let Some(t0) = harvest_t0 {
+      // frac bits are in 1/8-bit units (OD_BITRES).
+      crate::harvest::emit(&format!(
+        "MV,{},{},{}",
+        diff.row,
+        diff.col,
+        w.tell_frac() - t0
+      ));
     }
   }
 
@@ -1870,6 +2225,221 @@ impl ContextWriter<'_> {
     true
   }
 
+  /// prom_av1e047: coefficient-level TRELLIS (RDOQ). Backward pass over the
+  /// interior coefficients (skip DC and the eob coefficient); lower a level by
+  /// 1 when the RD improves — EXACT rate via `symbol_bits` at the coefficient's
+  /// context, tx-domain distortion via the decoder's dequant `(q·quant + (q<0?
+  /// off:0))>>log_tx_scale`. Contexts are static (v1): conformance is safe
+  /// because the real coder re-codes with real contexts, so only BD is at
+  /// stake. `rd_scale` = raw-SSE→ScaledDistortion factor (matches compute_rd_
+  /// cost). Modifies qcoeffs in place; eob unchanged (interior only).
+  pub fn trellis_optimize<T: Coefficient, W: Writer>(
+    &self, w: &W, coeffs_orig: &[T], qcoeffs: &mut [T], eob: u16,
+    tx_size: TxSize, tx_type: TxType, plane_type: usize, ac_quant: i32,
+    log_tx_scale: i32, lambda: f64, rd_scale: f64,
+  ) -> u16 {
+    if eob < 3 {
+      return eob;
+    }
+    let scan = &av1_scan_orders[tx_size as usize][tx_type as usize].scan
+      [..eob as usize];
+    let height = av1_get_coded_tx_size(tx_size).height();
+    let txs_ctx = Self::get_txsize_entropy_ctx(tx_size);
+    let tx_class = tx_type_to_class[tx_type as usize];
+    let bhl = Self::get_txb_bhl(tx_size);
+    let off = (1i32 << log_tx_scale) - 1;
+    let dequant = |q: i32| -> i32 { (q * ac_quant + ((q >> 31) & off)) >> log_tx_scale };
+    let rbits = (1i64 << OD_BITRES) as f64;
+
+    let mut levels_buf = [0u8; TX_PAD_2D];
+    let levels: &mut [u8] =
+      &mut levels_buf[TX_PAD_TOP * (height + TX_PAD_HOR)..];
+    self.txb_init_levels(qcoeffs, height, levels, height + TX_PAD_HOR);
+    let mut cc = Aligned::<[MaybeUninit<i8>; MAX_CODED_TX_SQUARE]>::uninit_array();
+    let coeff_contexts = self.get_nz_map_contexts(
+      levels, scan, eob, tx_size, tx_class, &mut cc.data,
+    );
+
+    // base+br rate (frac bits) of an interior coefficient at `level`.
+    let base_rate = |level: u32, coeff_ctx: usize, br_ctx: usize| -> i64 {
+      let mut bits = i64::from(w.symbol_bits(
+        level.min(3),
+        &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx],
+      ));
+      if level as usize > NUM_BASE_LEVELS {
+        let base_range = level - (1 + NUM_BASE_LEVELS as u32);
+        let brc = &self.fc.coeff_br_cdf
+          [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
+        let mut idx = 0u32;
+        loop {
+          if idx as usize >= COEFF_BASE_RANGE {
+            break;
+          }
+          let k = (base_range - idx).min(BR_CDF_SIZE as u32 - 1);
+          bits += i64::from(w.symbol_bits(k, brc));
+          if (k as usize) < BR_CDF_SIZE - 1 {
+            break;
+          }
+          idx += BR_CDF_SIZE as u32 - 1;
+        }
+      }
+      bits
+    };
+
+    // interior positions: 1..eob-1 (skip DC at 0 and the eob coefficient).
+    // DC lowering was measured (av1e047c): +0.06% mean but a foreman sign-flip
+    // (-0.846%->-0.374%) with no cheap dispatch signal — reverted. Multi-step
+    // lowering (av1e047d) was a NO-OP (byte-identical): single-step level->
+    // level-1 is already the per-coeff optimum (distortion ~quadratic per step,
+    // rate-saving ~linear ⇒ step 2 unbeneficial once step 1 is marginal).
+    for c in (1..(eob as usize - 1)).rev() {
+      let pos = scan[c] as usize;
+      let q = i32::cast_from(qcoeffs[pos]);
+      let level = q.unsigned_abs();
+      if level == 0 || level > COEFF_BASE_RANGE as u32 + NUM_BASE_LEVELS as u32 {
+        continue; // skip zero + golomb-tail coeffs (rare; keep v1 simple)
+      }
+      let coeff_ctx = coeff_contexts[c] as usize;
+      let br_ctx = Self::get_br_ctx(levels, pos, bhl, tx_class);
+      let sgn = if q < 0 { -1 } else { 1 };
+      let q_new = sgn * (level as i32 - 1);
+      let orig = i32::cast_from(coeffs_orig[pos]);
+      let d_old = (orig - dequant(q)) as i64;
+      let d_new = (orig - dequant(q_new)) as i64;
+      let dd = d_new * d_new - d_old * d_old; // tx-SSE delta (can be < 0)
+      let r_old = base_rate(level, coeff_ctx, br_ctx) + (1i64 << OD_BITRES);
+      let r_new = if q_new == 0 {
+        i64::from(w.symbol_bits(
+          0,
+          &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx],
+        ))
+      } else {
+        base_rate(level - 1, coeff_ctx, br_ctx) + (1i64 << OD_BITRES)
+      };
+      let rd_delta =
+        dd as f64 * rd_scale + lambda * (r_new - r_old) as f64 / rbits;
+      if rd_delta < 0.0 {
+        qcoeffs[pos] = T::cast_from(q_new);
+        // keep levels/coeff_ctx static (v1): the real coder re-derives them.
+        let lvl_idx = pos + (pos >> bhl) * TX_PAD_HOR;
+        levels[lvl_idx] = q_new.unsigned_abs().min(127) as u8;
+      }
+    }
+
+    // prom_av1e047b: EOB reduction — collapse the eob past trailing coefficients
+    // when the rate saved (the dropped coeff's base_eob + br + sign, the removed
+    // interior zeros' base-0 costs, and the shorter eob code, minus the new eob
+    // position's base→base_eob increase) beats the distortion added. Static
+    // contexts; conformance-safe (the real coder re-derives everything).
+    let eob_area_log = (tx_size.area_log2() as i32 - 4).max(0) as usize;
+    let eob_ctx = usize::from(tx_class != TX_CLASS_2D);
+    let eob_cost = |e: u16| -> i64 {
+      let (pt, extra) = Self::get_eob_pos_token(e);
+      let flag = match eob_area_log {
+        0 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf16[plane_type][eob_ctx]),
+        1 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf32[plane_type][eob_ctx]),
+        2 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf64[plane_type][eob_ctx]),
+        3 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf128[plane_type][eob_ctx]),
+        4 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf256[plane_type][eob_ctx]),
+        5 => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf512[plane_type][eob_ctx]),
+        _ => w.symbol_bits(pt - 1, &self.fc.eob_flag_cdf1024[plane_type][eob_ctx]),
+      };
+      let mut bits = i64::from(flag);
+      let ob = k_eob_offset_bits[pt as usize];
+      if ob > 0 {
+        let first = ((extra >> (ob - 1)) & 1) as u32;
+        bits += i64::from(w.symbol_bits(
+          first,
+          &self.fc.eob_extra_cdf[txs_ctx][plane_type][(pt - 3) as usize],
+        ));
+        bits += (i64::from(ob) - 1) * (1i64 << OD_BITRES);
+      }
+      bits
+    };
+    let base_c = |level: u32, cctx: usize, brctx: usize, is_eob: bool| -> i64 {
+      let sym = if is_eob { level.min(3) - 1 } else { level.min(3) };
+      let cdf: &[u16] = if is_eob {
+        &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][cctx]
+      } else {
+        &self.fc.coeff_base_cdf[txs_ctx][plane_type][cctx]
+      };
+      let mut bits = i64::from(w.symbol_bits(sym, cdf));
+      if level as usize > NUM_BASE_LEVELS {
+        let base_range = level - (1 + NUM_BASE_LEVELS as u32);
+        let brc = &self.fc.coeff_br_cdf
+          [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][brctx];
+        let mut idx = 0u32;
+        loop {
+          if idx as usize >= COEFF_BASE_RANGE {
+            break;
+          }
+          let k = (base_range - idx).min(BR_CDF_SIZE as u32 - 1);
+          bits += i64::from(w.symbol_bits(k, brc));
+          if (k as usize) < BR_CDF_SIZE - 1 {
+            break;
+          }
+          idx += BR_CDF_SIZE as u32 - 1;
+        }
+      }
+      bits
+    };
+
+    let mut cur_eob = eob;
+    while cur_eob >= 2 {
+      let c = cur_eob as usize - 1;
+      let pos = scan[c] as usize;
+      let level = i32::cast_from(qcoeffs[pos]).unsigned_abs();
+      if level == 0 || level > COEFF_BASE_RANGE as u32 + NUM_BASE_LEVELS as u32 {
+        break;
+      }
+      // next nonzero below c
+      let mut nz = c;
+      while nz > 0 {
+        nz -= 1;
+        if i32::cast_from(qcoeffs[scan[nz] as usize]) != 0 {
+          break;
+        }
+      }
+      let has_lower = i32::cast_from(qcoeffs[scan[nz] as usize]) != 0;
+      if !has_lower {
+        break; // don't collapse the block to all-zero (keep ≥1 nonzero)
+      }
+      let new_eob = (nz + 1) as u16;
+      if new_eob >= cur_eob {
+        break;
+      }
+      let br_c = Self::get_br_ctx(levels, pos, bhl, tx_class);
+      // rate saved (frac bits) — the dropped eob coeff's base cost approximated
+      // by the interior CDF (its 0..3 eob context is a valid index; avoids the
+      // 4-context base_eob CDF OOB as the eob position walks down).
+      let mut saved =
+        base_c(level, coeff_contexts[c] as usize, br_c, false) + (1i64 << OD_BITRES);
+      for i in (new_eob as usize)..c {
+        saved += base_c(0, coeff_contexts[i] as usize, 0, false);
+      }
+      saved += eob_cost(cur_eob) - eob_cost(new_eob);
+      // NOTE: the new eob position's base→base_eob change is dropped (its eob
+      // context 0..3 differs from its stored interior context 0..42); it is a
+      // small second-order term. Its omission slightly over-counts the saving,
+      // partly offset by omitting the removed zeros above the DC — net near-zero
+      // and BD-gated.
+      // distortion added (drop the eob coeff to 0):
+      let orig = i32::cast_from(coeffs_orig[pos]) as i64;
+      let d_old = orig - dequant(i32::cast_from(qcoeffs[pos])) as i64;
+      let dd = orig * orig - d_old * d_old; // > 0
+      let rd_delta = dd as f64 * rd_scale - lambda * saved as f64 / rbits;
+      if rd_delta < 0.0 {
+        qcoeffs[pos] = T::cast_from(0);
+        let lvl_idx = pos + (pos >> bhl) * TX_PAD_HOR;
+        levels[lvl_idx] = 0;
+        cur_eob = new_eob;
+      } else {
+        break;
+      }
+    }
+    cur_eob
+  }
+
   fn encode_eob<W: Writer>(
     &mut self, eob: u16, tx_size: TxSize, tx_class: TxClass, txs_ctx: usize,
     plane_type: usize, w: &mut W,
@@ -1945,11 +2515,28 @@ impl ContextWriter<'_> {
 
     let bhl = Self::get_txb_bhl(tx_size);
 
+    // prom_av1e035: SVT-style subsampled coefficient cost for counter trials.
+    // Cost DC (c==0), last-eob (c==eob-1), and the first eob/N low-frequency
+    // coefficients in full; skip the base/range symbols of the high-frequency
+    // middle. Real coding (non-COUNTS_ONLY) always codes every coefficient.
+    let fast_hi = if W::COUNTS_ONLY {
+      crate::harvest::fastcoeff()
+        .map(|n| (usize::from(eob) / n).max(1))
+        .unwrap_or(usize::MAX)
+    } else {
+      usize::MAX
+    };
+
     let scan_with_ctx =
       scan.iter().copied().zip(coeff_contexts.iter().copied());
     for (c, ((pos, coeff_ctx), v)) in
       scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev()
     {
+      // Skip the base/range cost of the high-frequency middle coefficients
+      // (kept: DC, last-eob, and the low-frequency head up to eob/N).
+      if c != 0 && c + 1 != usize::from(eob) && c > fast_hi {
+        continue;
+      }
       let pos = pos as usize;
       let coeff_ctx = coeff_ctx as usize;
       let level = v.abs();
@@ -1996,6 +2583,11 @@ impl ContextWriter<'_> {
     &mut self, coeffs: &[T], w: &mut W, plane_type: usize, txb_ctx: TXB_CTX,
     orig_cul_level: u32,
   ) -> u32 {
+    // prom_av1e011/012: on counting writers under RAV1E_FASTRATE the
+    // w.bit()/write_golomb calls below hit ec.rs's central flat-bit
+    // accounting fast path (one add per call instead of per-bit EC stores);
+    // the DC sign's CDF symbol stays exact either way.
+
     // Loop to code all signs in the transform block,
     // starting with the sign of DC (if applicable)
     for (c, &v) in coeffs.iter().enumerate() {

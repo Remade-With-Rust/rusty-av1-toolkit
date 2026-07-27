@@ -1181,14 +1181,15 @@ impl ContextWriter<'_> {
   ) {
     #[cfg(target_arch = "x86_64")]
     {
-      use crate::cpu_features::CpuFeatureLevel;
       static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
       // The hard length check makes the unsafe contract caller-proof in
       // release builds too (a short `levels` slice falls back to the scalar
       // kernel, which bounds-checks): one predictable branch per tx block.
+      // Runtime AVX2 detection via `std` (not the `CpuFeatureLevel` enum), so this
+      // fast path also compiles + runs in a `default-features = false` / no-asm
+      // build, where the asm-only `CpuFeatureLevel` has no `AVX2` variant.
       if (width + 3) * (height + TX_PAD_HOR) + 32 <= levels.len()
-        && *HAS_AVX2
-          .get_or_init(|| CpuFeatureLevel::default() >= CpuFeatureLevel::AVX2)
+        && *HAS_AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2"))
       {
         // SAFETY: AVX2 presence and the in-bounds supremum are both checked
         // above; the full bounds derivation is on the kernel's # Safety doc.

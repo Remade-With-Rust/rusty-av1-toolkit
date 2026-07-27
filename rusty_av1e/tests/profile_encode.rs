@@ -60,6 +60,15 @@ struct Clip {
 
 impl Clip {
   fn new(width: usize, height: usize, frames: usize) -> Self {
+    // prom_av1e020 LAW: the synth content's intra share is INFLATED vs real
+    // video — per-stage shares from it misled brick sizing (chroma-dup was
+    // "13%" on synth, worth 3.6% wall on Derf CIF). `RAW=path` loads a real
+    // planar I420 8-bit clip (ffmpeg -pix_fmt yuv420p -f rawvideo) at W×H so
+    // prize measures run on real content. FNV proofs may use either (the
+    // gate is same-input identity, not content realism).
+    if let Ok(path) = std::env::var("RAW") {
+      return Self::from_raw(&path, width, height, frames);
+    }
     // 4:2:0 => luma full, two chroma at half res each dimension.
     let plane_dims =
       vec![(width, height), (width.div_ceil(2), height.div_ceil(2)), (width.div_ceil(2), height.div_ceil(2))];
@@ -73,6 +82,31 @@ impl Clip {
       })
       .collect();
     Clip { frames, raw, plane_dims }
+  }
+
+  fn from_raw(path: &str, width: usize, height: usize, frames: usize) -> Self {
+    let plane_dims =
+      vec![(width, height), (width.div_ceil(2), height.div_ceil(2)), (width.div_ceil(2), height.div_ceil(2))];
+    let frame_bytes: usize = plane_dims.iter().map(|&(w, h)| w * h).sum();
+    let data = std::fs::read(path).expect("RAW clip unreadable");
+    let avail = data.len() / frame_bytes;
+    let n = frames.min(avail);
+    assert!(n > 0, "RAW file smaller than one {}x{} I420 frame", width, height);
+    let raw = (0..n)
+      .map(|fidx| {
+        let mut off = fidx * frame_bytes;
+        plane_dims
+          .iter()
+          .map(|&(pw, ph)| {
+            let sz = pw * ph;
+            let p = data[off..off + sz].to_vec();
+            off += sz;
+            p
+          })
+          .collect()
+      })
+      .collect();
+    Clip { frames: n, raw, plane_dims }
   }
 }
 

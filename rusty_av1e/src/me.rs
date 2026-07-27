@@ -1455,6 +1455,30 @@ fn compute_mv_rd<T: Pixel>(
     get_sad(plane_org, plane_ref, w, h, bit_depth, fi.cpu_feature_level)
   };
 
+  // prom_av1e004: calibrated MV-cost model (env RAV1E_MVCOST; unset = the
+  // stock 2·ilog model, byte-identical). Eighth-bit precision, same
+  // min-over-predictors semantics (+1 bit tiebreak = +8 eighth-bits).
+  if let Some((c0, cnz, cil)) = crate::harvest::mvcost() {
+    let rate8 = |a: MotionVector, b: MotionVector| -> u32 {
+      let axis = |diff: i16| -> i32 {
+        let d = if fi.allow_high_precision_mv { diff } else { diff >> 1 };
+        if d == 0 {
+          0
+        } else {
+          cnz + cil * ILog::ilog(d.abs()) as i32
+        }
+      };
+      (c0 + axis(a.row - b.row) + axis(a.col - b.col)).max(0) as u32
+    };
+    let r1 = rate8(cand_mv, pmv[0]);
+    let r2 = rate8(cand_mv, pmv[1]);
+    let rate = r1.min(r2 + 8);
+    return MVCandidateRD {
+      cost: 256 * sad as u64 + (rate as u64 * lambda as u64) / 8,
+      sad,
+    };
+  }
+
   let rate1 = get_mv_rate(cand_mv, pmv[0], fi.allow_high_precision_mv);
   let rate2 = get_mv_rate(cand_mv, pmv[1], fi.allow_high_precision_mv);
   let rate = rate1.min(rate2 + 1);
@@ -1511,7 +1535,7 @@ fn full_search<T: Pixel>(
 }
 
 #[inline(always)]
-fn get_mv_rate(
+pub(crate) fn get_mv_rate(
   a: MotionVector, b: MotionVector, allow_high_precision_mv: bool,
 ) -> u32 {
   #[inline(always)]

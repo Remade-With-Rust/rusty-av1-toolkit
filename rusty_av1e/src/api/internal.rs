@@ -37,6 +37,30 @@ use std::sync::Arc;
 /// The set of options that controls frame re-ordering and reference picture
 ///  selection.
 /// The options stored here are invariant over the whole encode.
+/// prom_av1e056: one output slot of a re-ordering group.
+///
+/// The group used to be described by closed-form arithmetic that only worked
+/// for `pyramid_depth <= 2`. From depth 3 on, hidden frames must appear in the
+/// MIDDLE of the group (for a GOP of 8, frame 6 has to be coded after frame 4
+/// is shown but before 5 and 7), which `show_frame = idx >= pyramid_depth`
+/// cannot express — and the old `group_output_len = N + depth` is simply wrong
+/// there (8+3=11 against the 12 slots the schedule actually needs).
+/// The schedule is now built explicitly instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GroupEntry {
+  /// Input frame offset within the group, 1..=group_input_len.
+  pub offset: u32,
+  /// Pyramid level of the frame occupying this slot.
+  pub level: u64,
+  /// Coded and displayed immediately.
+  pub shown: bool,
+  /// A show-existing-frame slot for a frame coded earlier as hidden.
+  pub sef: bool,
+}
+
+/// Depth 4 (GOP 16) needs 16 + 8 = 24 slots; 32 leaves headroom.
+const MAX_GROUP_SLOTS: usize = 32;
+
 #[derive(Debug, Clone, Copy)]
 pub struct InterConfig {
   /// Whether frame re-ordering is enabled.
@@ -44,7 +68,6 @@ pub struct InterConfig {
   /// Whether P-frames can use multiple references.
   pub(crate) multiref: bool,
   /// The depth of the re-ordering pyramid.
-  /// The current code cannot support values larger than 2.
   pub(crate) pyramid_depth: u64,
   /// Number of input frames in group.
   pub(crate) group_input_len: u64,
@@ -55,6 +78,67 @@ pub struct InterConfig {
   /// Keyframes reset this interval.
   /// This MUST be a multiple of `group_input_len`.
   pub(crate) switch_frame_interval: u64,
+  /// The explicit per-slot schedule (see `GroupEntry`).
+  sched: [GroupEntry; MAX_GROUP_SLOTS],
+}
+
+/// Coding order for a binary pyramid over `(lo, hi)`: the midpoint must be
+/// coded before anything strictly between lo and hi can reference it.
+fn subdivide(lo: u64, hi: u64, out: &mut Vec<u64>) {
+  if hi - lo <= 1 {
+    return;
+  }
+  let mid = (lo + hi) / 2;
+  out.push(mid);
+  subdivide(lo, mid, out);
+  subdivide(mid, hi, out);
+}
+
+/// Build the output schedule for one re-ordering group.
+///
+/// Coding order is the level-0 anchor followed by recursive midpoint
+/// subdivision. A frame is SHOWN at coding time when it happens to be the next
+/// frame in display order; otherwise it is hidden and a show-existing slot is
+/// emitted later, at the point display catches up with it.
+fn build_schedule(pyramid_depth: u64) -> ([GroupEntry; MAX_GROUP_SLOTS], u64) {
+  let mut sched = [GroupEntry::default(); MAX_GROUP_SLOTS];
+  if pyramid_depth == 0 {
+    sched[0] = GroupEntry { offset: 1, level: 0, shown: true, sef: false };
+    return (sched, 1);
+  }
+  let n = 1u64 << pyramid_depth;
+  let mut order = vec![n];
+  subdivide(0, n, &mut order);
+
+  let mut coded = vec![false; (n + 1) as usize];
+  let mut cnt = 0usize;
+  let mut disp = 1u64;
+  for &off in &order {
+    coded[off as usize] = true;
+    let shown = off == disp;
+    sched[cnt] = GroupEntry {
+      offset: off as u32,
+      level: crate::encoder::pos_to_lvl(off, pyramid_depth),
+      shown,
+      sef: false,
+    };
+    cnt += 1;
+    if shown {
+      disp += 1;
+      while disp <= n && coded[disp as usize] {
+        sched[cnt] = GroupEntry {
+          offset: disp as u32,
+          level: crate::encoder::pos_to_lvl(disp, pyramid_depth),
+          shown: true,
+          sef: true,
+        };
+        cnt += 1;
+        disp += 1;
+      }
+    }
+  }
+  debug_assert_eq!(disp, n + 1, "schedule must display every input frame");
+  (sched, cnt as u64)
 }
 
 impl InterConfig {
@@ -73,11 +157,16 @@ impl InterConfig {
     // level:                 0   1   2   1   2   0
     //                        ^^^^^   ^^^^^^^^^^^^^
     //                        hidden      shown
-    // TODO: This only works for pyramid_depth <= 2 --- after that we need
-    //  more hidden frames in the middle of the group.
-    let pyramid_depth = if reorder { 2 } else { 0 };
+    let pyramid_depth = if reorder {
+      // prom_av1e056: the depth is now a knob. RAV1E_PYRAMID=3 gives a GOP of
+      // 8, =4 a GOP of 16 (libaom's default shape). Default stays 2 so the
+      // shipped bitstream is unchanged until the deeper rungs are gated.
+      crate::harvest::pyramid_depth()
+    } else {
+      0
+    };
     let group_input_len = 1 << pyramid_depth;
-    let group_output_len = group_input_len + pyramid_depth;
+    let (sched, group_output_len) = build_schedule(pyramid_depth);
     let switch_frame_interval = enc_config.switch_frame_interval;
     assert!(switch_frame_interval % group_input_len == 0);
     InterConfig {
@@ -87,6 +176,7 @@ impl InterConfig {
       group_input_len,
       group_output_len,
       switch_frame_interval,
+      sched,
     }
   }
 
@@ -116,12 +206,7 @@ impl InterConfig {
     // Subtract 1 because the first frame in the gop is always a keyframe.
     let group_idx = (output_frameno_in_gop - 1) / self.group_output_len;
     // Get the offset to the corresponding input frame.
-    // TODO: This only works with pyramid_depth <= 2.
-    let offset = if idx_in_group_output < self.pyramid_depth {
-      self.group_input_len >> idx_in_group_output
-    } else {
-      idx_in_group_output - self.pyramid_depth + 1
-    };
+    let offset = self.sched[idx_in_group_output as usize].offset as u64;
     // Construct the final order hint relative to the start of the group.
     (self.group_input_len * group_idx + offset) as u32
   }
@@ -130,16 +215,8 @@ impl InterConfig {
   pub(crate) const fn get_level(&self, idx_in_group_output: u64) -> u64 {
     if !self.reorder {
       0
-    } else if idx_in_group_output < self.pyramid_depth {
-      // Hidden frames are output first (to be shown in the future).
-      idx_in_group_output
     } else {
-      // Shown frames
-      // TODO: This only works with pyramid_depth <= 2.
-      pos_to_lvl(
-        idx_in_group_output - self.pyramid_depth + 1,
-        self.pyramid_depth,
-      )
+      self.sched[idx_in_group_output as usize].level
     }
   }
 
@@ -155,7 +232,8 @@ impl InterConfig {
   }
 
   pub(crate) const fn get_show_frame(&self, idx_in_group_output: u64) -> bool {
-    idx_in_group_output >= self.pyramid_depth
+    let e = &self.sched[idx_in_group_output as usize];
+    e.shown || e.sef
   }
 
   pub(crate) const fn get_show_existing_frame(
@@ -163,10 +241,7 @@ impl InterConfig {
   ) -> bool {
     // The self.reorder test here is redundant, but short-circuits the rest,
     //  avoiding a bunch of work when it's false.
-    self.reorder
-      && self.get_show_frame(idx_in_group_output)
-      && (idx_in_group_output - self.pyramid_depth + 1).count_ones() == 1
-      && idx_in_group_output != self.pyramid_depth
+    self.reorder && self.sched[idx_in_group_output as usize].sef
   }
 
   pub(crate) fn get_input_frameno(
@@ -477,19 +552,24 @@ impl<T: Pixel> ContextInner<T> {
   ) -> Result<(), EncoderStatus> {
     let fi = self.build_frame_properties(output_frameno)?;
 
-    self.frame_data.insert(
-      output_frameno,
-      fi.map(|fi| {
-        let frame = self
-          .frame_q
-          .get(&fi.input_frameno)
-          .as_ref()
-          .unwrap()
-          .as_ref()
-          .unwrap();
-        FrameData::new(fi, frame.clone())
-      }),
-    );
+    let fd = fi.map(|fi| {
+      let frame = self
+        .frame_q
+        .get(&fi.input_frameno)
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+      // prom_av1e062: the alt-ref temporal filter substitutes a denoised SOURCE
+      // here, before FrameData::new derives the half/quarter-res ME pyramids
+      // from it — so the motion search and the encode see the same frame.
+      // `frame_q` itself is left pristine: the neighbours this frame is
+      // filtered against must stay unfiltered, and later frames re-read them.
+      let frame = crate::tempfilter::maybe_filter_altref(&fi, frame, &self.frame_q);
+      FrameData::new(fi, frame)
+    });
+    self.frame_data.insert(output_frameno, fd);
 
     Ok(())
   }
@@ -742,6 +822,7 @@ impl<T: Pixel> ContextInner<T> {
         frame_me_stats: fs.frame_me_stats.clone(),
         output_frameno,
         segmentation: fs.segmentation,
+        gm_params: fi.gm_params,
       });
       for i in 0..REF_FRAMES {
         if (fi.refresh_frame_flags & (1 << i)) != 0 {
@@ -768,6 +849,14 @@ impl<T: Pixel> ContextInner<T> {
     //
     // Compute the motion vectors.
     compute_motion_vectors(fi, fs, &self.inter_cfg);
+
+    // prom_av1e053 T3b: PRE-PASS WARP probe. These MVs are a SOURCE-domain
+    // field (rec_buffer above was filled from lookahead_rec_buffer, which holds
+    // original frame contents), and the lookahead runs ahead of the encode — so
+    // fitting a global affine here decides allow_warped_motion for the clip
+    // BEFORE frame 0 writes its header. Costs one least-squares solve over an
+    // already-computed field; no-op unless RAV1E_WARP_PRE=1.
+    crate::encoder::warp_prepass::probe(fi, fs);
 
     let coded_data = fi.coded_frame_data.as_mut().unwrap();
 
@@ -824,6 +913,7 @@ impl<T: Pixel> ContextInner<T> {
       frame_me_stats: fs.frame_me_stats.clone(),
       output_frameno,
       segmentation: fs.segmentation,
+      gm_params: fi.gm_params,
     });
     for i in 0..REF_FRAMES {
       if (fi.refresh_frame_flags & (1 << i)) != 0 {
@@ -1341,7 +1431,8 @@ impl<T: Pixel> ContextInner<T> {
     let mut log_isqrt_mean_scale = 0i64;
 
     if let Some(coded_data) = frame_data.fi.coded_frame_data.as_mut() {
-      if self.config.tune == Tune::Psychovisual {
+      if self.config.tune == Tune::Psychovisual && crate::harvest::activity_mask()
+      {
         let frame =
           self.frame_q[&frame_data.fi.input_frameno].as_ref().unwrap();
         coded_data.activity_mask = ActivityMask::from_plane(&frame.planes[0]);
@@ -1387,6 +1478,11 @@ impl<T: Pixel> ContextInner<T> {
       log_isqrt_mean_scale,
     );
     frame_data.fi.set_quantizers(&qps);
+
+    // prom_av1e060 M1: the global-motion model must be fixed BEFORE the frame
+    // is encoded — encode_tile_group runs first and write_frame_header_obu
+    // takes `fi` immutably, so this is the last point where it can be set.
+    crate::encoder::estimate_global_motion(&mut frame_data.fi, &frame_data.fs);
 
     if self.rc_state.needs_trial_encode(fti) {
       let mut trial_fs = frame_data.fs.clone();

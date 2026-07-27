@@ -113,6 +113,15 @@ impl Default for SpeedSettings {
 impl SpeedSettings {
   /// Set the speed setting according to a numeric speed preset.
   pub fn from_preset(speed: u8) -> Self {
+    // prom_av1e065: MINPART content dispatch. On high spatial-detail content
+    // the measured-better configuration for the speed-4 operating point is
+    // `speed 6 + include_near_mvs + 4x4 partitions` (bus -2.01%, tempete
+    // -2.22%, mobile -2.86% BD, none slower). Only speed 4 is dispatched --
+    // that is the only rung the substitution was measured against. Declining
+    // reproduces the s4 preset byte-for-byte.
+    let dispatch = speed == 4 && crate::harvest::minpart_dispatch();
+    let speed = if dispatch { 6 } else { speed };
+
     // The default settings are equivalent to speed 0
     let mut settings = SpeedSettings::default();
 
@@ -190,7 +199,74 @@ impl SpeedSettings {
       settings.motion.use_satd_subpel = false;
     }
 
+    if dispatch {
+      // the two knobs the substitution adds on top of the speed-6 base
+      settings.motion.include_near_mvs = true;
+      let max = settings.partition.partition_range.max;
+      settings.partition.partition_range =
+        PartitionRange::new(BlockSize::BLOCK_4X4, max);
+    }
+
+    settings.apply_env_overrides();
     settings
+  }
+
+  /// D5b probe: override individual speed knobs ON TOP OF a preset, so the
+  /// s6->s2 delta can be priced one knob at a time (BD-rate per millisecond)
+  /// instead of only as the 8-knob bundle the presets ship.
+  ///
+  /// The measured s6 -> s2 delta is exactly these eight:
+  ///   minpart 8->4 | bottomup 0->1 | sgr reduced->full | nearmvs 0->1
+  ///   rdotx 0->1   | redtx 1->0    | fullsearch 0->1   | lookahead 20->40
+  ///
+  /// `RAV1E_SS=key=val:key=val`. UNSET => the preset, byte-identical.
+  fn apply_env_overrides(&mut self) {
+    let spec = match std::env::var("RAV1E_SS") {
+      Ok(s) => s,
+      Err(_) => return,
+    };
+    for kv in spec.split(':') {
+      let mut it = kv.splitn(2, '=');
+      let (k, v) = match (it.next(), it.next()) {
+        (Some(k), Some(v)) => (k.trim(), v.trim()),
+        _ => continue,
+      };
+      let on = v != "0";
+      match k {
+        "minpart" => {
+          let min = match v {
+            "4" => BlockSize::BLOCK_4X4,
+            "8" => BlockSize::BLOCK_8X8,
+            "16" => BlockSize::BLOCK_16X16,
+            _ => continue,
+          };
+          let max = self.partition.partition_range.max;
+          if min <= max {
+            self.partition.partition_range = PartitionRange::new(min, max);
+          }
+        }
+        "bottomup" => self.partition.encode_bottomup = on,
+        "sgr" => {
+          self.sgr_complexity = if v == "full" {
+            SGRComplexityLevel::Full
+          } else {
+            SGRComplexityLevel::Reduced
+          }
+        }
+        "nearmvs" => self.motion.include_near_mvs = on,
+        "rdotx" => self.transform.rdo_tx_decision = on,
+        "redtx" => self.transform.reduced_tx_set = on,
+        "fullsearch" => self.motion.me_allow_full_search = on,
+        "lookahead" => {
+          if let Ok(n) = v.parse::<u32>() {
+            if n > 0 {
+              self.rdo_lookahead_frames = n as usize;
+            }
+          }
+        }
+        _ => {}
+      }
+    }
   }
 }
 
