@@ -14,10 +14,10 @@ use clap::builder::styling::AnsiColor;
 use clap::builder::Styles;
 use clap::{CommandFactory, Parser as Clap, Subcommand};
 use clap_complete::{generate, Shell};
-use rav1e::prelude::*;
+use rusty_av1e::prelude::*;
 use scan_fmt::scan_fmt;
 
-use rav1e::config::CpuFeatureLevel;
+use rusty_av1e::config::CpuFeatureLevel;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -290,7 +290,7 @@ fn get_version() -> &'static str {
   VERSION_STR.get_or_init(|| {
     format!(
       "{} ({})",
-      rav1e::version::full(),
+      rusty_av1e::version::full(),
       // We cannot use `built_info::DEBUG` because that tells us if there are debug symbols,
       // not if there are optimizations.
       if cfg!(debug_assertions) { "debug" } else { "release" }
@@ -423,7 +423,7 @@ pub fn parse_cli() -> Result<ParsedCliOptions, CliError> {
   // (racecar); only "stock" — the measurement baseline — disables them.
   // "on" additionally flips the tx-domain-rate speed settings in the
   // encoder config below.
-  rav1e::racecar::set(matches.racecar != "stock");
+  rusty_av1e::racecar::set(matches.racecar != "stock");
 
   #[cfg(feature = "serialize")]
   let mut save_config_path = None;
@@ -558,7 +558,7 @@ fn probe_pyramid_depth(path: &std::path::Path) -> Option<u64> {
     return None;
   }
   let ratio = mc8 / mc1;
-  let depth = if ratio < rav1e::harvest::pyramid_ratio_t() { 3 } else { 2 };
+  let depth = if ratio < rusty_av1e::harvest::pyramid_ratio_t() { 3 } else { 2 };
   if std::env::var("RAV1E_PYRAMID_DBG").is_ok() {
     eprintln!("PYRAMID_PROBE mc1={mc1:.2} mc8={mc8:.2} ratio={ratio:.3} depth={depth}");
   }
@@ -598,8 +598,8 @@ fn probe_detail(path: &std::path::Path) -> Option<f64> {
   if std::env::var("RAV1E_MINPART_DBG").is_ok() {
     eprintln!(
       "MINPART_PROBE detail={detail:.3} t={:.3} engage={}",
-      rav1e::harvest::minpart_detail_t(),
-      detail > rav1e::harvest::minpart_detail_t()
+      rusty_av1e::harvest::minpart_detail_t(),
+      detail > rusty_av1e::harvest::minpart_detail_t()
     );
   }
   Some(detail)
@@ -610,17 +610,17 @@ fn probe_detail(path: &std::path::Path) -> Option<f64> {
   // InterConfig) is constructed — `harvest::pyramid_depth()` caches its first
   // read, so the override has to be set here. Stdin cannot be probed without
   // buffering the stream, so it keeps the shipped depth.
-  if rav1e::harvest::pyramid_auto() && os_input.to_str() != Some("-") {
+  if rusty_av1e::harvest::pyramid_auto() && os_input.to_str() != Some("-") {
     if let Some(d) = probe_pyramid_depth(os_input) {
-      rav1e::harvest::set_pyramid_override(d);
+      rusty_av1e::harvest::set_pyramid_override(d);
     }
   }
   // prom_av1e065: the minpart dispatch reads the same source before the Config
   // is built (SpeedSettings::from_preset consults it).
-  if rav1e::harvest::minpart_auto() && os_input.to_str() != Some("-") {
+  if rusty_av1e::harvest::minpart_auto() && os_input.to_str() != Some("-") {
     if let Some(d) = probe_detail(os_input) {
-      rav1e::harvest::set_minpart_dispatch(
-        d > rav1e::harvest::minpart_detail_t(),
+      rusty_av1e::harvest::set_minpart_dispatch(
+        d > rusty_av1e::harvest::minpart_detail_t(),
       );
     }
   }

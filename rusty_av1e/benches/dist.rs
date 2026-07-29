@@ -12,15 +12,15 @@
 use criterion::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
-use rav1e::bench::cpu_features::*;
-use rav1e::bench::dist;
-use rav1e::bench::frame::*;
-use rav1e::bench::partition::BlockSize::*;
-use rav1e::bench::partition::*;
-use rav1e::bench::rdo::DistortionScale;
-use rav1e::bench::tiling::*;
-use rav1e::bench::util::Aligned;
-use rav1e::Pixel;
+use rusty_av1e::bench::cpu_features::*;
+use rusty_av1e::bench::dist;
+use rusty_av1e::bench::frame::*;
+use rusty_av1e::bench::partition::BlockSize::*;
+use rusty_av1e::bench::partition::*;
+use rusty_av1e::bench::rdo::DistortionScale;
+use rusty_av1e::bench::tiling::*;
+use rusty_av1e::bench::util::Aligned;
+use rusty_av1e::Pixel;
 use std::hint::black_box;
 
 const DIST_BENCH_SET: &[(BlockSize, usize)] = &[

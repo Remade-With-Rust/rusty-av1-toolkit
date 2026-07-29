@@ -12,7 +12,7 @@ use std::io::Read;
 
 use crate::color::ChromaSampling::Cs400;
 use crate::decoder::{DecodeError, Decoder, FrameBuilder, VideoDetails};
-use rav1e::prelude::*;
+use rusty_av1e::prelude::*;
 
 impl Decoder for y4m::Decoder<Box<dyn Read + Send>> {
   fn get_video_details(&self) -> VideoDetails {

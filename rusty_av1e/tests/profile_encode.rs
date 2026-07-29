@@ -20,8 +20,8 @@
 //
 // Knobs via env vars (with defaults): W, H, FRAMES, SPEED, THREADS, RUNS, QP.
 
-use rav1e::color::ChromaSampling;
-use rav1e::{Config, Context, EncoderConfig, EncoderStatus};
+use rusty_av1e::color::ChromaSampling;
+use rusty_av1e::{Config, Context, EncoderConfig, EncoderStatus};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ fn stage_breakdown() {
 
   // Warm up, then reset the buckets so only the measured pass counts.
   let _ = encode_once(&clip, &cfg);
-  rav1e::prof::reset();
+  rusty_av1e::prof::reset();
   let (bytes, dur, hash) = encode_once(&clip, &cfg);
 
   eprintln!(
@@ -308,7 +308,7 @@ fn stage_breakdown() {
     bytes / 1024,
     mpx_per_s(w, h, frames, dur),
   );
-  rav1e::prof::dump("encode");
+  rusty_av1e::prof::dump("encode");
 }
 
 // ---------------------------------------------------------------------------

@@ -21,8 +21,8 @@ mod stats;
 use crate::common::*;
 use crate::error::*;
 use crate::stats::*;
-use rav1e::config::CpuFeatureLevel;
-use rav1e::prelude::*;
+use rusty_av1e::config::CpuFeatureLevel;
+use rusty_av1e::prelude::*;
 
 use crate::decoder::{Decoder, FrameBuilder, VideoDetails};
 use crate::muxer::*;

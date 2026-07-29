@@ -21,8 +21,8 @@ mod stats;
 use crate::common::*;
 use crate::error::*;
 use crate::stats::*;
-use rav1e::config::CpuFeatureLevel;
-use rav1e::prelude::*;
+use rusty_av1e::config::CpuFeatureLevel;
+use rusty_av1e::prelude::*;
 
 use crate::decoder::{Decoder, FrameBuilder, VideoDetails};
 use crate::muxer::*;
@@ -241,7 +241,7 @@ fn do_encode<T: Pixel, D: Decoder>(
   }
 
   if std::env::var("RAV1E_PROF").is_ok() {
-    rav1e::prof::reset();
+    rusty_av1e::prof::reset();
   }
   while let Some(frame_info) = process_frame(
     &mut ctx,
@@ -267,11 +267,11 @@ fn do_encode<T: Pixel, D: Decoder>(
     }
   }
   if std::env::var("RAV1E_PROF").is_ok() {
-    rav1e::prof::dump("encode");
+    rusty_av1e::prof::dump("encode");
   }
   // Independent of RAV1E_PROF — the accountant answers a different question
   // (where the BITS go, not the time) and gates itself on RAV1E_BITACCT.
-  rav1e::prof::bitacct::dump("encode");
+  rusty_av1e::prof::bitacct::dump("encode");
   if verbose != Verboseness::Quiet {
     if verbose == Verboseness::Verbose {
       // Clear out the temporary progress indicator

@@ -13,7 +13,7 @@ use self::ivf::IvfMuxer;
 mod y4m;
 pub use self::y4m::write_y4m_frame;
 
-use rav1e::prelude::*;
+use rusty_av1e::prelude::*;
 
 use std::ffi::OsStr;
 use std::io;

@@ -14,15 +14,15 @@ mod predict;
 mod rdo;
 mod transform;
 
-use rav1e::bench::api::*;
-use rav1e::bench::cdef::*;
-use rav1e::bench::context::*;
-use rav1e::bench::ec::*;
-use rav1e::bench::encoder::*;
-use rav1e::bench::partition::*;
-use rav1e::bench::predict::*;
-use rav1e::bench::rdo::*;
-use rav1e::bench::transform::*;
+use rusty_av1e::bench::api::*;
+use rusty_av1e::bench::cdef::*;
+use rusty_av1e::bench::context::*;
+use rusty_av1e::bench::ec::*;
+use rusty_av1e::bench::encoder::*;
+use rusty_av1e::bench::partition::*;
+use rusty_av1e::bench::predict::*;
+use rusty_av1e::bench::rdo::*;
+use rusty_av1e::bench::transform::*;
 
 use crate::plane::plane;
 use crate::rdo::rdo;

@@ -41,43 +41,43 @@ use scan_fmt::scan_fmt;
 use crate::api::SceneDetectionSpeed;
 use crate::prelude as rav1e;
 
-type PixelRange = rav1e::PixelRange;
-type ChromaSamplePosition = rav1e::ChromaSamplePosition;
-type ChromaSampling = rav1e::ChromaSampling;
-type MatrixCoefficients = rav1e::MatrixCoefficients;
-type ColorPrimaries = rav1e::ColorPrimaries;
-type TransferCharacteristics = rav1e::TransferCharacteristics;
-type Rational = rav1e::Rational;
-type FrameTypeOverride = rav1e::FrameTypeOverride;
+type PixelRange = rusty_av1e::PixelRange;
+type ChromaSamplePosition = rusty_av1e::ChromaSamplePosition;
+type ChromaSampling = rusty_av1e::ChromaSampling;
+type MatrixCoefficients = rusty_av1e::MatrixCoefficients;
+type ColorPrimaries = rusty_av1e::ColorPrimaries;
+type TransferCharacteristics = rusty_av1e::TransferCharacteristics;
+type Rational = rusty_av1e::Rational;
+type FrameTypeOverride = rusty_av1e::FrameTypeOverride;
 type FrameOpaqueCb = Option<extern fn(*mut c_void)>;
-type T35 = rav1e::T35;
+type T35 = rusty_av1e::T35;
 
 #[derive(Clone)]
 enum FrameInternal {
-  U8(Arc<rav1e::Frame<u8>>),
-  U16(Arc<rav1e::Frame<u16>>),
+  U8(Arc<rusty_av1e::Frame<u8>>),
+  U16(Arc<rusty_av1e::Frame<u16>>),
 }
 
-impl From<rav1e::Frame<u8>> for FrameInternal {
-  fn from(f: rav1e::Frame<u8>) -> FrameInternal {
+impl From<rusty_av1e::Frame<u8>> for FrameInternal {
+  fn from(f: rusty_av1e::Frame<u8>) -> FrameInternal {
     FrameInternal::U8(Arc::new(f))
   }
 }
 
-impl From<rav1e::Frame<u16>> for FrameInternal {
-  fn from(f: rav1e::Frame<u16>) -> FrameInternal {
+impl From<rusty_av1e::Frame<u16>> for FrameInternal {
+  fn from(f: rusty_av1e::Frame<u16>) -> FrameInternal {
     FrameInternal::U16(Arc::new(f))
   }
 }
 
-impl From<Arc<rav1e::Frame<u8>>> for FrameInternal {
-  fn from(f: Arc<rav1e::Frame<u8>>) -> FrameInternal {
+impl From<Arc<rusty_av1e::Frame<u8>>> for FrameInternal {
+  fn from(f: Arc<rusty_av1e::Frame<u8>>) -> FrameInternal {
     FrameInternal::U8(f)
   }
 }
 
-impl From<Arc<rav1e::Frame<u16>>> for FrameInternal {
-  fn from(f: Arc<rav1e::Frame<u16>>) -> FrameInternal {
+impl From<Arc<rusty_av1e::Frame<u16>>> for FrameInternal {
+  fn from(f: Arc<rusty_av1e::Frame<u16>>) -> FrameInternal {
     FrameInternal::U16(f)
   }
 }
@@ -164,17 +164,17 @@ impl EncoderStatus {
   }
 }
 
-impl From<Option<rav1e::EncoderStatus>> for EncoderStatus {
-  fn from(status: Option<rav1e::EncoderStatus>) -> Self {
+impl From<Option<rusty_av1e::EncoderStatus>> for EncoderStatus {
+  fn from(status: Option<rusty_av1e::EncoderStatus>) -> Self {
     match status {
       None => EncoderStatus::Success,
       Some(s) => match s {
-        rav1e::EncoderStatus::NeedMoreData => EncoderStatus::NeedMoreData,
-        rav1e::EncoderStatus::EnoughData => EncoderStatus::EnoughData,
-        rav1e::EncoderStatus::LimitReached => EncoderStatus::LimitReached,
-        rav1e::EncoderStatus::Encoded => EncoderStatus::Encoded,
-        rav1e::EncoderStatus::Failure => EncoderStatus::Failure,
-        rav1e::EncoderStatus::NotReady => EncoderStatus::NotReady,
+        rusty_av1e::EncoderStatus::NeedMoreData => EncoderStatus::NeedMoreData,
+        rusty_av1e::EncoderStatus::EnoughData => EncoderStatus::EnoughData,
+        rusty_av1e::EncoderStatus::LimitReached => EncoderStatus::LimitReached,
+        rusty_av1e::EncoderStatus::Encoded => EncoderStatus::Encoded,
+        rusty_av1e::EncoderStatus::Failure => EncoderStatus::Failure,
+        rusty_av1e::EncoderStatus::NotReady => EncoderStatus::NotReady,
       },
     }
   }
@@ -187,12 +187,12 @@ impl From<Option<rav1e::EncoderStatus>> for EncoderStatus {
 ///
 /// Use `rav1e_config_unref()` to free its memory.
 pub struct Config {
-  cfg: rav1e::Config,
+  cfg: rusty_av1e::Config,
 }
 
 enum EncContext {
-  U8(rav1e::Context<u8>),
-  U16(rav1e::Context<u16>),
+  U8(rusty_av1e::Context<u8>),
+  U16(rusty_av1e::Context<u16>),
 }
 
 impl EncContext {
@@ -204,9 +204,9 @@ impl EncContext {
   }
   fn send_frame(
     &mut self, frame: Option<FrameInternal>, frame_type: FrameTypeOverride,
-    opaque: Option<rav1e::Opaque>, t35_metadata: Box<[T35]>,
-  ) -> Result<(), rav1e::EncoderStatus> {
-    let info = rav1e::FrameParameters {
+    opaque: Option<rusty_av1e::Opaque>, t35_metadata: Box<[T35]>,
+  ) -> Result<(), rusty_av1e::EncoderStatus> {
+    let info = rusty_av1e::FrameParameters {
       frame_type_override: frame_type,
       opaque,
       t35_metadata,
@@ -219,7 +219,7 @@ impl EncContext {
         (EncContext::U16(ctx), FrameInternal::U16(ref f)) => {
           ctx.send_frame((f.clone(), info))
         }
-        _ => Err(rav1e::EncoderStatus::Failure),
+        _ => Err(rusty_av1e::EncoderStatus::Failure),
       }
     } else {
       match self {
@@ -229,10 +229,10 @@ impl EncContext {
     }
   }
 
-  fn receive_packet(&mut self) -> Result<Packet, rav1e::EncoderStatus> {
-    fn receive_packet<T: rav1e::Pixel>(
-      ctx: &mut rav1e::Context<T>,
-    ) -> Result<Packet, rav1e::EncoderStatus>
+  fn receive_packet(&mut self) -> Result<Packet, rusty_av1e::EncoderStatus> {
+    fn receive_packet<T: rusty_av1e::Pixel>(
+      ctx: &mut rusty_av1e::Context<T>,
+    ) -> Result<Packet, rusty_av1e::EncoderStatus>
     where
       FrameInternal: From<Arc<v_frame::frame::Frame<T>>>,
     {
@@ -244,7 +244,7 @@ impl EncContext {
           opaque.opaque
         });
         let p = std::mem::ManuallyDrop::into_inner(p);
-        let rav1e::Packet {
+        let rusty_av1e::Packet {
           data, rec, source, input_frameno, frame_type, ..
         } = p;
         let len = data.len();
@@ -294,7 +294,7 @@ impl EncContext {
     }
   }
 
-  fn twopass_in(&mut self, buf: &[u8]) -> Result<usize, rav1e::EncoderStatus> {
+  fn twopass_in(&mut self, buf: &[u8]) -> Result<usize, rusty_av1e::EncoderStatus> {
     match self {
       EncContext::U8(ctx) => ctx.twopass_in(buf),
       EncContext::U16(ctx) => ctx.twopass_in(buf),
@@ -315,7 +315,7 @@ impl EncContext {
     }
   }
 
-  fn rc_receive_pass_data(&mut self) -> Option<rav1e::RcData> {
+  fn rc_receive_pass_data(&mut self) -> Option<rusty_av1e::RcData> {
     match self {
       EncContext::U8(ctx) => ctx.rc_receive_pass_data(),
       EncContext::U16(ctx) => ctx.rc_receive_pass_data(),
@@ -331,14 +331,14 @@ impl EncContext {
 
   fn rc_send_pass_data(
     &mut self, data: &[u8],
-  ) -> Result<(), rav1e::EncoderStatus> {
+  ) -> Result<(), rusty_av1e::EncoderStatus> {
     match self {
       EncContext::U8(ctx) => ctx.rc_send_pass_data(data),
       EncContext::U16(ctx) => ctx.rc_send_pass_data(data),
     }
   }
 
-  fn config(&self) -> rav1e::EncoderConfig {
+  fn config(&self) -> rusty_av1e::EncoderConfig {
     // Ideally this would return a reference instead of cloning,
     // but that would require a breaking change in the CAPI.
     match self {
@@ -356,10 +356,10 @@ impl EncContext {
 /// Use `rav1e_context_unref()` to free its memory.
 pub struct Context {
   ctx: EncContext,
-  last_err: Option<rav1e::EncoderStatus>,
+  last_err: Option<rusty_av1e::EncoderStatus>,
 }
 
-type FrameType = rav1e::FrameType;
+type FrameType = rusty_av1e::FrameType;
 
 /// Encoded Packet
 ///
@@ -444,7 +444,7 @@ pub unsafe extern fn rav1e_data_unref(data: *mut Data) {
 /// Create a `RaConfig` filled with default parameters.
 #[no_mangle]
 pub unsafe extern fn rav1e_config_default() -> *mut Config {
-  let cfg = rav1e::Config::default();
+  let cfg = rusty_av1e::Config::default();
 
   let c = Box::new(Config { cfg });
 
@@ -501,7 +501,7 @@ pub unsafe extern fn rav1e_config_set_rc_summary(
     return needed;
   }
 
-  let summary = rav1e::RateControlSummary::from_slice(maybe_buf.unwrap()).ok();
+  let summary = rusty_av1e::RateControlSummary::from_slice(maybe_buf.unwrap()).ok();
   if summary.is_none() {
     -1
   } else {
@@ -594,7 +594,7 @@ pub unsafe extern fn rav1e_config_set_color_description(
   cfg: *mut Config, matrix: MatrixCoefficients, primaries: ColorPrimaries,
   transfer: TransferCharacteristics,
 ) -> c_int {
-  (*cfg).cfg.enc.color_description = Some(rav1e::ColorDescription {
+  (*cfg).cfg.enc.color_description = Some(rusty_av1e::ColorDescription {
     matrix_coefficients: matrix,
     color_primaries: primaries,
     transfer_characteristics: transfer,
@@ -615,7 +615,7 @@ pub unsafe extern fn rav1e_config_set_content_light(
   cfg: *mut Config, max_content_light_level: u16,
   max_frame_average_light_level: u16,
 ) -> c_int {
-  (*cfg).cfg.enc.content_light = Some(rav1e::ContentLight {
+  (*cfg).cfg.enc.content_light = Some(rusty_av1e::ContentLight {
     max_content_light_level,
     max_frame_average_light_level,
   });
@@ -638,13 +638,13 @@ pub unsafe extern fn rav1e_config_set_content_light(
 /// cbindgen:ptrs-as-arrays=[[primaries;3]]
 #[no_mangle]
 pub unsafe extern fn rav1e_config_set_mastering_display(
-  cfg: *mut Config, primaries: *const rav1e::ChromaticityPoint,
-  white_point: rav1e::ChromaticityPoint, max_luminance: u32,
+  cfg: *mut Config, primaries: *const rusty_av1e::ChromaticityPoint,
+  white_point: rusty_av1e::ChromaticityPoint, max_luminance: u32,
   min_luminance: u32,
 ) -> c_int {
-  let primaries = *(primaries as *const [rav1e::ChromaticityPoint; 3]);
+  let primaries = *(primaries as *const [rusty_av1e::ChromaticityPoint; 3]);
 
-  (*cfg).cfg.enc.mastering_display = Some(rav1e::MasteringDisplay {
+  (*cfg).cfg.enc.mastering_display = Some(rusty_av1e::MasteringDisplay {
     primaries,
     white_point,
     max_luminance,
@@ -678,7 +678,7 @@ unsafe fn option_match(
     "height" => enc.height = value.parse().map_err(|_| ())?,
     "speed" => {
       enc.speed_settings =
-        rav1e::SpeedSettings::from_preset(value.parse().map_err(|_| ())?)
+        rusty_av1e::SpeedSettings::from_preset(value.parse().map_err(|_| ())?)
     }
 
     "threads" => (*cfg).cfg.threads = value.parse().map_err(|_| ())?,
@@ -851,7 +851,7 @@ pub unsafe extern fn rav1e_context_unref(ctx: *mut Context) {
 #[no_mangle]
 pub unsafe extern fn rav1e_frame_new(ctx: *const Context) -> *mut Frame {
   let fi = (*ctx).ctx.new_frame();
-  let frame_type = rav1e::FrameTypeOverride::No;
+  let frame_type = rusty_av1e::FrameTypeOverride::No;
   let f = Frame { fi, frame_type, opaque: None, t35_metadata: Vec::new() };
   let frame = Box::new(f);
 
@@ -1137,7 +1137,7 @@ pub unsafe extern fn rav1e_send_frame(
   ctx: *mut Context, frame: *mut Frame,
 ) -> EncoderStatus {
   if !frame.is_null() {
-    let rav1e::EncoderConfig { width, height, chroma_sampling, .. } =
+    let rusty_av1e::EncoderConfig { width, height, chroma_sampling, .. } =
       (*ctx).ctx.config();
     let planes = if chroma_sampling == ChromaSampling::Cs400 { 1 } else { 3 };
     match (*frame).fi {
@@ -1153,7 +1153,7 @@ pub unsafe extern fn rav1e_send_frame(
   let frame_internal =
     if frame.is_null() { None } else { Some((*frame).fi.clone()) };
   let frame_type = if frame.is_null() {
-    rav1e::FrameTypeOverride::No
+    rusty_av1e::FrameTypeOverride::No
   } else {
     (*frame).frame_type
   };
@@ -1161,7 +1161,7 @@ pub unsafe extern fn rav1e_send_frame(
   let maybe_opaque = if frame.is_null() {
     None
   } else {
-    (*frame).opaque.take().map(rav1e::Opaque::new)
+    (*frame).opaque.take().map(rusty_av1e::Opaque::new)
   };
 
   let t35_metadata = if frame.is_null() {
@@ -1256,8 +1256,8 @@ pub unsafe extern fn rav1e_container_sequence_header(
   }))
 }
 
-fn rav1e_frame_fill_plane_internal<T: rav1e::Pixel>(
-  f: &mut Arc<rav1e::Frame<T>>, plane: c_int, data_slice: &[u8],
+fn rav1e_frame_fill_plane_internal<T: rusty_av1e::Pixel>(
+  f: &mut Arc<rusty_av1e::Frame<T>>, plane: c_int, data_slice: &[u8],
   stride: ptrdiff_t, bytewidth: c_int,
 ) {
   let input = Arc::get_mut(f).unwrap();
@@ -1268,8 +1268,8 @@ fn rav1e_frame_fill_plane_internal<T: rav1e::Pixel>(
   );
 }
 
-fn rav1e_frame_pad_internal<T: rav1e::Pixel>(
-  f: &mut Arc<rav1e::Frame<T>>, planes: usize, width: usize, height: usize,
+fn rav1e_frame_pad_internal<T: rusty_av1e::Pixel>(
+  f: &mut Arc<rusty_av1e::Frame<T>>, planes: usize, width: usize, height: usize,
 ) {
   if let Some(ref mut input) = Arc::get_mut(f) {
     for plane in input.planes[..planes].iter_mut() {
@@ -1278,8 +1278,8 @@ fn rav1e_frame_pad_internal<T: rav1e::Pixel>(
   }
 }
 
-fn rav1e_frame_extract_plane_internal<T: rav1e::Pixel>(
-  f: &Arc<rav1e::Frame<T>>, plane: c_int, data_slice: &mut [u8],
+fn rav1e_frame_extract_plane_internal<T: rusty_av1e::Pixel>(
+  f: &Arc<rusty_av1e::Frame<T>>, plane: c_int, data_slice: &mut [u8],
   stride: ptrdiff_t, bytewidth: c_int,
 ) {
   f.planes[plane as usize].copy_to_raw_u8(

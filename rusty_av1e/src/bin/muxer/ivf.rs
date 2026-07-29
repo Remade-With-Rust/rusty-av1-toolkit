@@ -11,7 +11,7 @@
 use super::Muxer;
 use crate::error::*;
 use ivf::*;
-use rav1e::prelude::*;
+use rusty_av1e::prelude::*;
 use std::fs;
 use std::fs::File;
 use std::io;

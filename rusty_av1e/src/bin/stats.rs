@@ -8,8 +8,8 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 use av_metrics::video::*;
-use rav1e::data::EncoderStats;
-use rav1e::prelude::*;
+use rusty_av1e::data::EncoderStats;
+use rusty_av1e::prelude::*;
 use std::fmt;
 use std::time::Instant;
 

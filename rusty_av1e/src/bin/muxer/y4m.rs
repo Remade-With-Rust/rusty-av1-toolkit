@@ -8,7 +8,7 @@
 // PATENTS file, you can obtain it at www.aomedia.org/license/patent.
 
 use crate::decoder::VideoDetails;
-use rav1e::prelude::*;
+use rusty_av1e::prelude::*;
 use std::io::Write;
 use std::slice;
 

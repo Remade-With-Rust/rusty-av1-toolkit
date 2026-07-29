@@ -10,12 +10,12 @@
 use criterion::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
-use rav1e::bench::cpu_features::CpuFeatureLevel;
-use rav1e::bench::frame::*;
-use rav1e::bench::partition::{BlockSize, IntraEdge};
-use rav1e::bench::predict::*;
-use rav1e::bench::transform::TxSize;
-use rav1e::bench::util::*;
+use rusty_av1e::bench::cpu_features::CpuFeatureLevel;
+use rusty_av1e::bench::frame::*;
+use rusty_av1e::bench::partition::{BlockSize, IntraEdge};
+use rusty_av1e::bench::predict::*;
+use rusty_av1e::bench::transform::TxSize;
+use rusty_av1e::bench::util::*;
 
 pub const BLOCK_SIZE: BlockSize = BlockSize::BLOCK_32X32;
 

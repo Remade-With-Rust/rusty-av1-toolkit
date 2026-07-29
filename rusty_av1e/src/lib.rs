@@ -167,7 +167,7 @@ pub mod config {
 /// The information is recovered from `Cargo.toml` and `git describe`, when available.
 ///
 /// ```
-/// use rav1e::version;
+/// use rusty_av1e::version;
 /// use semver::Version;
 ///
 /// let major = version::major();

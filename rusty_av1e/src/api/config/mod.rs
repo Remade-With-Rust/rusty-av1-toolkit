@@ -279,7 +279,7 @@ impl Config {
   /// # Examples
   ///
   /// ```
-  /// use rav1e::prelude::*;
+  /// use rusty_av1e::prelude::*;
   ///
   /// # fn main() -> Result<(), InvalidConfig> {
   /// let cfg = Config::default();

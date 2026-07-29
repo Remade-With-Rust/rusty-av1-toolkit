@@ -1,5 +1,5 @@
 [package]
-name = "rav1e"
+name = "rusty_av1e"
 version = "0.8.0"
 authors = ["Thomas Daede <tdaede@xiph.org>"]
 edition = "2021"
@@ -15,9 +15,11 @@ include = [
   "/src/**",
 ]
 license = "BSD-2-Clause"
-description = "The fastest and safest AV1 encoder"
+description = "Remade With Rust performance fork of rav1e — pure-Rust AV1 encoder with a no-asm build path (~1.10x faster than stock at byte-identical output)"
 readme = "README.md"
-repository = "https://github.com/xiph/rav1e/"
+repository = "https://github.com/Remade-With-Rust/rusty-av1-toolkit"
+keywords = ["av1", "video", "encoder", "codec"]
+categories = ["multimedia::video", "multimedia::encoding"]
 autobenches = false
 autobins = false
 default-run = "rav1e"
@@ -40,7 +42,7 @@ binaries = [
 ]
 default = ["binaries", "asm", "threading", "signal_support", "git_version"]
 git_version = ["built/git2"]
-asm = ["nasm-rs", "cc"]
+asm = ["nasm-rs", "cc", "av-scenechange/asm"]
 threading = ["rayon/threads"]
 signal_support = ["signal-hook"]
 dump_ivf = ["ivf"]
@@ -84,9 +86,10 @@ dump_lookahead_data = ["byteorder", "image"]
 
 [dependencies]
 arg_enum_proc_macro = "0.3.4"
-av-scenechange = { version = "0.14.1", default-features = false, features = [
-  "asm",
-] }
+# NOTE: av-scenechange's `asm` feature invokes the external `nasm` assembler;
+# it is forwarded from our own `asm` feature (below) so that a
+# `default-features = false` consumer never needs nasm installed.
+av-scenechange = { version = "0.14.1", default-features = false }
 bitstream-io = "4.1.0"
 cfg-if = "1.0"
 clap = { version = "4.5", optional = true, default-features = false, features = [
@@ -107,7 +110,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 dav1d-sys = { version = "0.7.0", package = "libdav1d-sys", optional = true }
 aom-sys = { version = "0.3.3", optional = true }
 scan_fmt = { version = "0.2.6", optional = true, default-features = false }
-ivf = { version = "0.1", path = "ivf/", optional = true }
+ivf = { version = "0.1.4", path = "ivf/", optional = true }
 v_frame = "0.3.7"
 av-metrics = { version = "0.9.1", optional = true, default-features = false }
 rayon = { package = "maybe-rayon", version = "0.1", default-features = false }
