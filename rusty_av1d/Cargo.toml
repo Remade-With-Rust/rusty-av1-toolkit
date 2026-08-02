@@ -5,7 +5,7 @@ default-members = [".", "tools"]
 [package]
 name = "rusty_av1d"
 authors = ["Rav1d Developers", "Prossimo"]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.79"
 description = "Remade With Rust fork of rav1d (Rust port of the dav1d AV1 decoder) with a pure-Rust no-asm build path"
