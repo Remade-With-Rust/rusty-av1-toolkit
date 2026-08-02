@@ -1782,8 +1782,8 @@ pub struct Dav1dFilmGrainData {
     /// Previously, and still in `dav1d`, [`Self::ar_coeff_shift`]
     /// is only 8-byte aligned, as is [`Self`]/[`Dav1dFilmGrainData`].
     /// However, in `dav1d`, [`Dav1dFilmGrainData`] is part of
-    /// [`Dav1dFrameHeader`], which is allocated with [`malloc`].
-    /// [`malloc`] happens to return 16-byte aligned pointers usually,
+    /// [`Dav1dFrameHeader`], which is allocated with `malloc`.
+    /// `malloc` happens to return 16-byte aligned pointers usually,
     /// but is not required to, so this is UB and will segfault if not aligned.
     ///
     /// Due to the [`Rav1dFilmGrainData`] to [`Dav1dFilmGrainData`]
@@ -1804,8 +1804,7 @@ pub struct Dav1dFilmGrainData {
     /// as [`Self::ar_coeff_shift`] being the last field would
     /// read 8 bytes out of bounds and be UB.
     ///
-    /// [`malloc`]: libc::malloc
-    pub ar_coeff_shift: u64,
+        pub ar_coeff_shift: u64,
     pub grain_scale_shift: c_int,
     pub uv_mult: [c_int; 2],
     pub uv_luma_mult: [c_int; 2],

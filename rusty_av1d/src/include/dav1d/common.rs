@@ -35,7 +35,7 @@ impl From<Rav1dUserData> for Dav1dUserData {
 pub struct Dav1dDataProps {
     pub timestamp: i64,
     pub duration: i64,
-    pub offset: libc::off_t,
+    pub offset: crate::ctypes::off_t,
     pub size: usize,
     pub user_data: Dav1dUserData,
 }

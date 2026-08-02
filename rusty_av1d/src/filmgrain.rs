@@ -5,7 +5,7 @@ use std::hint::assert_unchecked;
 use std::ops::{Add, Shl, Shr};
 use std::{cmp, mem, ptr};
 
-use libc::{intptr_t, ptrdiff_t};
+use crate::ctypes::{intptr_t, ptrdiff_t};
 use to_method::To;
 
 use crate::cpu::CpuFlags;

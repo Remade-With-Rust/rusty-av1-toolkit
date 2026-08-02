@@ -6,7 +6,7 @@ use std::ops::BitOr;
 use std::{array, cmp, ptr};
 
 use assert_matches::debug_assert_matches;
-use libc::intptr_t;
+use crate::ctypes::intptr_t;
 use to_method::To as _;
 
 use crate::cdef_apply::rav1d_cdef_brow;

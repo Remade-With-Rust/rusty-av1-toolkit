@@ -25,7 +25,6 @@ atomig = { version = "0.4.0", features = ["derive"] }
 av-data = "0.4.2"
 bitflags = "2.4.0"
 cfg-if = "1.0.0"
-libc = "0.2"
 parking_lot = "0.12.2"
 paste = "1.0.14"
 raw-cpuid = "11.0.1"
@@ -73,3 +72,6 @@ debug = "line-tables-only"
 inherits = "dev"
 opt-level = 2
 codegen-units = 16
+
+[dev-dependencies]
+libc = "0.2"

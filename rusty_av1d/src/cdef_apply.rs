@@ -4,7 +4,7 @@ use std::cmp;
 use std::ffi::{c_int, c_uint};
 
 use bitflags::bitflags;
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 
 use crate::align::{Align16, AlignedVec64};
 use crate::cdef::CdefEdgeFlags;

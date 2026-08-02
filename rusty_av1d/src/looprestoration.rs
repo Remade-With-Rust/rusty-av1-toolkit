@@ -5,7 +5,7 @@ use std::ops::Add;
 use std::{cmp, iter, mem, slice};
 
 use bitflags::bitflags;
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 use to_method::To;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -954,7 +954,7 @@ fn sgr_mix_rust<BD: BitDepth>(
 mod neon {
     use std::ptr;
 
-    use libc::intptr_t;
+    use crate::ctypes::intptr_t;
 
     use super::*;
     use crate::align::Align16;

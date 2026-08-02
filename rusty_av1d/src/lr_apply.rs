@@ -5,7 +5,7 @@ use std::ffi::c_int;
 
 use assert_matches::assert_matches;
 use bitflags::bitflags;
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 
 use crate::align::Align16;
 use crate::include::common::bitdepth::BitDepth;

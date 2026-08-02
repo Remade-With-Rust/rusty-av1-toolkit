@@ -85,6 +85,7 @@ pub mod include {
     } // mod dav1d
 } // mod include
 
+pub mod ctypes;
 pub mod align;
 pub(crate) mod c_arc;
 pub(crate) mod c_box;

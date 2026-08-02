@@ -2,7 +2,7 @@ use std::ffi::{c_int, c_uint};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::{array, cmp, iter, mem};
 
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 use strum::EnumCount;
 
 use crate::align::{Align16, AlignedVec64};

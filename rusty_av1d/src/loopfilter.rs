@@ -3,7 +3,7 @@
 use std::cmp;
 use std::ffi::c_int;
 
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 use strum::FromRepr;
 
 use crate::align::{Align16, AlignedVec2};

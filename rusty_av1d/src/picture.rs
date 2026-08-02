@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::{mem, ptr};
 
 use bitflags::bitflags;
-use libc::ptrdiff_t;
+use crate::ctypes::ptrdiff_t;
 use to_method::To as _;
 
 use crate::error::{Dav1dResult, Rav1dError, Rav1dResult};
