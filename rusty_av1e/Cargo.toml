@@ -122,7 +122,7 @@ av-metrics = { version = "0.9.1", optional = true, default-features = false }
 rayon = { package = "maybe-rayon", version = "0.1", default-features = false }
 # Optional pure-Rust global allocator for the CLI binaries; see the
 # `rusty_alloc` feature above.
-rusty_alloc-api = { version = "0.3", optional = true }
+rusty_alloc-api = { version = "0.4", optional = true }
 crossbeam = { version = "0.8", optional = true }
 toml = { version = "0.8", optional = true }
 arrayvec = "0.7"
