@@ -10,6 +10,12 @@
 #[macro_use]
 extern crate log;
 
+/// See the note in `rav1e.rs`; the channel-API binary gets the same treatment
+/// so both encoder front-ends allocate the same way.
+#[cfg(feature = "rusty_alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
 mod common;
 mod decoder;
 mod error;
