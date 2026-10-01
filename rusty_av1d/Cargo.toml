@@ -19,8 +19,11 @@ categories = ["multimedia::video", "multimedia::encoding"]
 # ARM targets for anyone building from crates.io.
 exclude = ["*.c", "*.h", "!src/arm/asm-offsets.h", "*.in", "meson*", "tests/", "doc/", "docs/", "package/"]
 
+# The rlib only. Cargo builds every crate type listed here for every dependent, so a
+# `staticlib` entry cost each Rust user a ~65 MB static library per build. The C
+# library is asked for explicitly: `cargo rustc --lib --crate-type staticlib`.
 [lib]
-crate-type = ["staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 assert_matches = "1.5.0"
