@@ -3,6 +3,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::{stderr, stdout, Write as _};
 use std::ptr::fn_addr_eq;
+use std::sync::Arc;
 
 use crate::send_sync_non_null::SendSyncNonNull;
 
@@ -79,6 +80,8 @@ pub(crate) enum Rav1dLogger {
     Stdout,
     #[default]
     Stderr,
+    /// The safe Rust API's callback ([`crate::rust_api::Logger::Callback`]).
+    Rust(Arc<dyn Fn(&str) + Send + Sync>),
 }
 
 /// Any type implementing [`Rav1dLog`] can be used with [`write!`].
@@ -111,6 +114,7 @@ impl Rav1dLog for Rav1dLogger {
             Self::Dav1d(dav1d) => dav1d.clone().write_fmt(args).unwrap(),
             Self::Stdout => stdout().write_fmt(args).unwrap(),
             Self::Stderr => stderr().write_fmt(args).unwrap(),
+            Self::Rust(callback) => callback(&fmt::format(args)),
         }
     }
 }
@@ -182,6 +186,8 @@ impl From<Option<Rav1dLogger>> for Dav1dLogger {
             Rav1dLogger::Dav1d(dav1d) => dav1d.callback,
             Rav1dLogger::Stdout => Some(marker::STDOUT),
             Rav1dLogger::Stderr => Some(marker::STDERR),
+            // A Rust closure can't be handed to a C caller: it reads back as no logger.
+            Rav1dLogger::Rust(_) => None,
         });
         Self { cookie, callback }
     }
