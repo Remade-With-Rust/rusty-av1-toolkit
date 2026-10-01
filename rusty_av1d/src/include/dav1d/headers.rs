@@ -577,7 +577,7 @@ impl From<Rav1dColorPrimaries> for pixel::ColorPrimaries {
             Unspecified => Self::Unspecified,
             BT470M => Self::BT470M,
             BT470BG => Self::BT470BG,
-            BT601 => Self::BT470BG,
+            BT601 => Self::ST170M,
             SMPTE240 => Self::ST240M,
             Film => Self::Film,
             BT2020 => Self::BT2020,
@@ -684,8 +684,8 @@ impl From<Rav1dTransferCharacteristics> for pixel::TransferCharacteristic {
             Linear => Self::Linear,
             Log100 => Self::Logarithmic100,
             Log100Sqrt10 => Self::Logarithmic316,
-            IEC61966 => Self::SRGB,
-            BT1361 => Self::BT1886,
+            IEC61966 => Self::XVYCC,
+            BT1361 => Self::BT1361E,
             SRGB => Self::SRGB,
             BT2020_10Bit => Self::BT2020Ten,
             BT2020_12Bit => Self::BT2020Twelve,
@@ -771,7 +771,7 @@ impl From<Rav1dMatrixCoefficients> for pixel::MatrixCoefficients {
             Unspecified => Self::Unspecified,
             FCC => Self::BT470M,
             BT470BG => Self::BT470BG,
-            BT601 => Self::BT470BG,
+            BT601 => Self::ST170M,
             SMPTE240 => Self::ST240M,
             SMPTE_YCgCo => Self::YCgCo,
             BT2020NCL => Self::BT2020NonConstantLuminance,
@@ -2914,6 +2914,38 @@ impl From<Rav1dFrameHeader> for Dav1dFrameHeader {
             warp_motion,
             reduced_txtp_set,
             gmv: gmv.map(|rust| rust.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The safe API reports colour signalling through `av_data`'s enums, which cover every
+    /// code point H.273 defines. Each conversion must keep the code point: a mapping to a
+    /// neighbouring variant reports different primaries or transfer to the caller.
+    #[test]
+    fn colour_conversions_keep_the_code_point() {
+        for code in 0..=255u8 {
+            if let Some(pri) = Rav1dColorPrimaries::from_repr(code as _) {
+                assert_eq!(
+                    pixel::ColorPrimaries::from(pri) as u8,
+                    code,
+                    "colour primaries"
+                );
+            }
+            if let Some(trc) = Rav1dTransferCharacteristics::from_repr(code as _) {
+                // Code 1 (BT.709 transfer) is named BT1886 in av_data: same code point.
+                assert_eq!(
+                    pixel::TransferCharacteristic::from(trc) as u8,
+                    code,
+                    "transfer"
+                );
+            }
+            if let Some(mtrx) = Rav1dMatrixCoefficients::from_repr(code as _) {
+                assert_eq!(pixel::MatrixCoefficients::from(mtrx) as u8, code, "matrix");
+            }
         }
     }
 }
