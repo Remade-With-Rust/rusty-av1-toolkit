@@ -26,7 +26,7 @@ rav1d = { package = "rusty_av1d", path = "../", version = "1.2.0", default-featu
 # Optional pure-Rust global allocator, wired into the CLI binaries only: a
 # library must never pick a global allocator on behalf of its consumers, so
 # this dependency lives here and not in the `rusty_av1d` lib crate.
-rusty_alloc-api = { version = "0.4", optional = true }
+rusty_alloc-api = { version = "2.2", optional = true }
 
 [build-dependencies]
 cc = "1.0.79"
