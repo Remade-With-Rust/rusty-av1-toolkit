@@ -23,12 +23,16 @@ libc = "0.2"
 # The lib package is published as `rusty_av1d`; keep the in-crate extern name
 # `rav1d` so the CLI sources and `rav1d/<feature>` forwards stay unchanged.
 rav1d = { package = "rusty_av1d", path = "../", version = "1.2.0", default-features = false }
+# Optional pure-Rust global allocator, wired into the CLI binaries only: a
+# library must never pick a global allocator on behalf of its consumers, so
+# this dependency lives here and not in the `rusty_av1d` lib crate.
+rusty_alloc-api = { version = "2.2", optional = true }
 
 [build-dependencies]
 cc = "1.0.79"
 
 [features]
-default = ["asm", "asm_arm64_dotprod", "asm_arm64_i8mm", "bitdepth_8", "bitdepth_16"]
+default = ["asm", "asm_arm64_dotprod", "asm_arm64_i8mm", "bitdepth_8", "bitdepth_16", "rusty_alloc"]
 asm = ["rav1d/asm"]
 asm_arm64_dotprod = ["rav1d/asm_arm64_dotprod"]
 asm_arm64_i8mm = ["rav1d/asm_arm64_i8mm"]
@@ -36,6 +40,10 @@ bitdepth_8 = ["rav1d/bitdepth_8"]
 bitdepth_16 = ["rav1d/bitdepth_16"]
 # analyzer spine: forwards to the lib profiler; the CLI resets/dumps around decode.
 profile = ["rav1d/profile"]
+# Route the CLI binaries' allocations through rusty_alloc rather than the system
+# allocator. Decoded output is identical either way, so the md5 gate holds on
+# both arms. rusty_alloc is edition 2024, so this needs rustc >= 1.85.
+rusty_alloc = ["dep:rusty_alloc-api"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

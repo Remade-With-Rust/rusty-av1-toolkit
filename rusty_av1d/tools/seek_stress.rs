@@ -1,5 +1,11 @@
 #![allow(clippy::all)]
 
+/// See the note in `dav1d.rs`. Seek-stress churns decoder state repeatedly, so
+/// running it under `--features rusty_alloc` doubles as an allocator soak test.
+#[cfg(feature = "rusty_alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
 mod compat; // mod compat
 mod input {
     mod annexb;

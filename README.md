@@ -167,6 +167,47 @@ cd rusty_av1d && cargo build --release
 **Requirements:** Rust (each crate pins its own toolchain where needed) and `nasm`
 on `PATH` for the SIMD kernels.
 
+### Optional: the pure-Rust allocator (`--features rusty_alloc`)
+
+Both CLIs can route their allocations through
+[rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the sibling
+pure-Rust mimalloc remake, instead of the platform allocator:
+
+```sh
+cd rusty_av1e && cargo build --release --features rusty_alloc
+cd rusty_av1d && cargo build --release -p rav1d-cli --features rusty_alloc
+```
+
+The `#[global_allocator]` is declared **in the binaries only**. Neither library
+crate — nor the encoder's `capi` cdylib — picks an allocator on behalf of its
+consumers, which is what lets an embedder keep its own. Output is unaffected on
+either allocator, so the conformance gates hold on both arms. Requires a
+toolchain new enough for edition 2024 (rustc ≥ 1.85); the default build keeps the
+crates' declared MSRVs.
+
+**Measured** — foreman_cif 300f, `--tiles 8 --threads 16`, ABBA-interleaved,
+High priority, N=31 pairs, against a null arm (the same binary vs itself):
+
+| arm | median wall ratio | paired | median CPU ratio | cores-busy |
+|---|---:|---:|---:|---:|
+| null (stock vs itself) | 1.0013 | z=0.54 | 1.0152 | 3.95 → 3.91 |
+| **stock vs rusty_alloc** | **1.0619** | **31/31, z=5.57** | 1.0296 (z=2.69) | 3.97 → **4.07** |
+
+**~6% faster wall on a threaded encode**, winning every pair, against a 0.13%
+null floor. The mechanism is allocator lock contention, not allocation speed:
+cores-busy *rises* (3.97 → 4.07), so the threads are blocking less. It follows
+that the win needs real parallelism — on the default single-tile config, which
+runs at cores-busy 0.85, the same comparison reads 1.0070 (z=0.22), i.e. nothing.
+
+The **decoder is at parity** and does not benefit: CPU 1.0000 (z=−0.90), wall
+0.9971 over N=31 — a ~0.3% wall cost sitting on the instrument's own floor. That
+is expected rather than disappointing, because `MemPool` already recycles the
+frame buffers, so steady-state decoding barely calls the allocator at all. It is
+wired up for symmetry and for the `seek_stress` soak, not for speed.
+
+Both features are **opt-in**, deliberately: turning them on raises the MSRV to
+1.85, and the encoder win is real only in threaded configurations.
+
 ## Roadmap
 
 - [x] Fork rav1e → `rusty_av1e`; rework hot kernels; **byte-identical ~1.10× fast path**.

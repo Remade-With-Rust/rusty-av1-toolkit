@@ -40,7 +40,7 @@ binaries = [
   "av-metrics",
   "nom",
 ]
-default = ["binaries", "asm", "threading", "signal_support", "git_version"]
+default = ["binaries", "asm", "threading", "signal_support", "git_version", "rusty_alloc"]
 git_version = ["built/git2"]
 asm = ["nasm-rs", "cc", "av-scenechange/asm"]
 threading = ["rayon/threads"]
@@ -58,6 +58,12 @@ profile = []
 # hot checkpoint/rollback path.
 bitacct = []
 capi = ["scan_fmt"]
+# Route the CLI binaries' allocations through rusty_alloc rather than the system
+# allocator. The `#[global_allocator]` lives in the binaries only, never in the
+# library or the `capi` cdylib, which must leave that choice to their host.
+# Encoded output is identical either way, so the FNV bitstream gate holds on
+# both arms. rusty_alloc is edition 2024, so this needs rustc >= 1.85.
+rusty_alloc = ["dep:rusty_alloc-api"]
 tracing = [
   "profiling/profile-with-tracing",
   "tracing-subscriber",
@@ -114,6 +120,9 @@ ivf = { version = "0.1.4", path = "ivf/", optional = true }
 v_frame = "0.3.7"
 av-metrics = { version = "0.9.1", optional = true, default-features = false }
 rayon = { package = "maybe-rayon", version = "0.1", default-features = false }
+# Optional pure-Rust global allocator for the CLI binaries; see the
+# `rusty_alloc` feature above.
+rusty_alloc-api = { version = "2.2", optional = true }
 crossbeam = { version = "0.8", optional = true }
 toml = { version = "0.8", optional = true }
 arrayvec = "0.7"

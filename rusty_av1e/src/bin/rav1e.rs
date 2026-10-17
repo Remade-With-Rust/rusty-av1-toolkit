@@ -10,6 +10,15 @@
 #[macro_use]
 extern crate log;
 
+/// With `--features rusty_alloc`, every allocation this binary makes is served
+/// by rusty_alloc instead of the platform allocator. This is the arm worth
+/// measuring: encoding is rayon-threaded and allocates per frame, so allocator
+/// behaviour under thread contention is visible here in a way it is not in the
+/// decoder. Encoded output is bit-identical on either allocator.
+#[cfg(feature = "rusty_alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
 mod common;
 mod decoder;
 mod error;

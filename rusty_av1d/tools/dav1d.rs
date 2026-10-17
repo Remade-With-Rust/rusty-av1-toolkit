@@ -1,5 +1,13 @@
 #![allow(clippy::all)]
 
+/// With `--features rusty_alloc`, every allocation this binary makes is served
+/// by rusty_alloc instead of the platform allocator. The decoder library is
+/// untouched — it keeps recycling frame buffers through its own `MemPool` — and
+/// decoded output is bit-identical on either allocator.
+#[cfg(feature = "rusty_alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
 mod compat;
 mod input {
     mod annexb;
