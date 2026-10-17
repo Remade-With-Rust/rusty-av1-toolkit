@@ -5,7 +5,7 @@ default-members = [".", "tools"]
 [package]
 name = "rusty_av1d"
 authors = ["Rav1d Developers", "Prossimo"]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 rust-version = "1.79"
 description = "Remade With Rust fork of rav1d (Rust port of the dav1d AV1 decoder) with a pure-Rust no-asm build path"
@@ -14,7 +14,10 @@ readme = "README.md"
 repository = "https://github.com/Remade-With-Rust/rusty-av1-toolkit"
 keywords = ["av1", "video", "decoder", "codec", "dav1d"]
 categories = ["multimedia::video", "multimedia::encoding"]
-exclude = ["*.c", "*.h", "*.in", "meson*", "tests/", "doc/", "docs/", "package/"]
+# `src/arm/asm-offsets.h` is re-included: the aarch64/arm `.S` sources (refmvs,
+# filmgrain) `#include` it, so excluding every `*.h` broke the `asm` build on all
+# ARM targets for anyone building from crates.io.
+exclude = ["*.c", "*.h", "!src/arm/asm-offsets.h", "*.in", "meson*", "tests/", "doc/", "docs/", "package/"]
 
 [lib]
 crate-type = ["staticlib", "rlib"]
