@@ -334,7 +334,10 @@ impl BitsPerComponent {
 }
 
 impl Picture {
-    /// Stride in pixels of the `component` for the decoded frame.
+    /// Stride in bytes of the `component` for the decoded frame: the distance from one
+    /// row to the next in the bytes [`Picture::plane`] returns. Above 8 bits per component
+    /// the samples are 16-bit ([`Picture::bit_depth`] is 16), so a row then holds
+    /// `stride / 2` samples.
     pub fn stride(&self, component: PlanarImageComponent) -> u32 {
         let s = match component {
             PlanarImageComponent::Y => 0,
