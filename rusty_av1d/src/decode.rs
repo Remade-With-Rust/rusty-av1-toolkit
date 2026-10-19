@@ -4905,7 +4905,13 @@ pub fn rav1d_submit_frame(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResu
     ) {
         fc.task_thread.error.store(1, Ordering::Relaxed);
         let _ = mem::take(&mut *fc.in_cdf.try_write().unwrap());
-        if f.frame_hdr.as_ref().unwrap().refresh_context != 0 {
+        // A frame that failed inside `rav1d_decode_frame` has already released its
+        // header (dav1d's C reads the stale pointer here). Without it, release the
+        // output CDF too: this is teardown, and nothing can still want it.
+        if f.frame_hdr
+            .as_ref()
+            .map_or(true, |hdr| hdr.refresh_context != 0)
+        {
             let _ = mem::take(&mut f.out_cdf);
         }
         for i in 0..7 {
