@@ -44,10 +44,27 @@ pub use crate::include::dav1d::headers::{
 use crate::include::dav1d::picture::Rav1dPicture;
 pub use crate::include::dav1d::picture::RAV1D_PICTURE_ALIGNMENT as PICTURE_ALIGNMENT;
 use crate::internal::Rav1dContext;
+use crate::log::Rav1dLogger;
 use crate::{
     rav1d_close, rav1d_flush, rav1d_get_frame_delay, rav1d_get_picture, rav1d_open,
     rav1d_send_data, CRef, Rav1dData, Rav1dSettings,
 };
+
+/// Where a [`Decoder`] writes its diagnostic messages, such as the parse errors a corrupt
+/// stream produces. They repeat errors the API also returns, so many applications discard
+/// them or route them into their own logging.
+#[derive(Clone)]
+pub enum Logger {
+    /// Discard them.
+    None,
+    /// The process's standard error. The default, as in dav1d.
+    Stderr,
+    /// The process's standard output.
+    Stdout,
+    /// Hand each message to a callback, e.g. to forward it to `log` or `tracing`. A message
+    /// arrives as written: usually one line, with its trailing newline.
+    Callback(Arc<dyn Fn(&str) + Send + Sync>),
+}
 
 /// Settings for creating a new [`Decoder`] instance.
 /// See documentation for native `Dav1dSettings` struct.
@@ -62,6 +79,16 @@ impl Settings {
     /// Creates a new [`Settings`] instance with default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Where the decoder's diagnostic messages go (standard error by default).
+    pub fn set_logger(&mut self, logger: Logger) {
+        self.inner.logger = match logger {
+            Logger::None => None,
+            Logger::Stderr => Some(Rav1dLogger::Stderr),
+            Logger::Stdout => Some(Rav1dLogger::Stdout),
+            Logger::Callback(callback) => Some(Rav1dLogger::Rust(callback)),
+        };
     }
 
     pub fn set_n_threads(&mut self, n_threads: u32) {
