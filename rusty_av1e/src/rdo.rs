@@ -948,7 +948,7 @@ fn luma_chroma_mode_rdo<T: Pixel>(
   mvs: [MotionVector; 2], ref_frames: [RefType; 2],
   mode_set_chroma: &[PredictionMode], luma_mode_is_intra: bool,
   mode_context: usize, mv_stack: &ArrayVec<CandidateMV, 9>,
-  angle_delta: AngleDelta,
+  angle_delta: AngleDelta, segments: &[std::ops::RangeInclusive<u8>; 2],
 ) {
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
 
@@ -1002,11 +1002,9 @@ fn luma_chroma_mode_rdo<T: Pixel>(
   let _fp = crate::encoder::fwd_phase::enter(0);
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
-    use crate::segmentation::select_segment;
-
     let mut zero_distortion = false;
 
-    for sidx in select_segment(fi, ts, tile_bo, bsize, skip) {
+    for sidx in segments[skip as usize].clone() {
       cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, sidx);
 
       let (tx_size, tx_type) = rdo_tx_size_type(
@@ -1481,6 +1479,10 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   rdo_type: RDOType,
 ) -> PartitionParameters {
   let mut best = PartitionParameters::default();
+  // The segments to try per skip flag depend only on the block (and the frame's
+  // segmentation), so they are selected once here rather than per mode trial.
+  let segments = [false, true]
+    .map(|skip| crate::segmentation::select_segment(fi, ts, tile_bo, bsize, skip));
 
   // we can never have more than 7 reference frame sets
   let mut ref_frames_set = ArrayVec::<_, 7>::new();
@@ -1836,6 +1838,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         mode_contexts[i],
         &mv_stacks[i],
         AngleDelta::default(),
+        &segments,
       );
 
       if harvest_on {
@@ -1872,6 +1875,9 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   mut best: PartitionParameters, is_chroma_block: bool,
 ) -> PartitionParameters {
   let _prof = crate::prof::scope(crate::prof::Stage::IntraModeRdo);
+  // See `inter_frame_rdo_mode_decision`.
+  let segments = [false, true]
+    .map(|skip| crate::segmentation::select_segment(fi, ts, tile_bo, bsize, skip));
   let mut modes = ArrayVec::<_, INTRA_MODES>::new();
 
   // Reduce number of prediction modes at higher speed levels
@@ -2016,6 +2022,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
       0,
       &ArrayVec::<CandidateMV, 9>::new(),
       AngleDelta::default(),
+      &segments,
     );
   });
 
@@ -2053,6 +2060,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
           0,
           &mv_stack,
           AngleDelta { y, uv },
+          &segments,
         );
       }
       best.angle_delta
