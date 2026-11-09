@@ -271,7 +271,7 @@ impl MsacContext {
 pub fn rav1d_msac_decode_bools(s: &mut MsacContext, n: u8) -> c_uint {
     let mut v = 0;
     for _ in 0..n {
-        v = v << 1 | rav1d_msac_decode_bool_equi(s) as c_uint;
+        v = v << 1 | rav1d_msac_decode_bool_equi_bit(s);
     }
     v
 }
@@ -286,7 +286,7 @@ pub fn rav1d_msac_decode_uniform(s: &mut MsacContext, n: c_uint) -> c_int {
     (if v < m {
         v
     } else {
-        (v << 1) - m + rav1d_msac_decode_bool_equi(s) as c_uint
+        (v << 1) - m + rav1d_msac_decode_bool_equi_bit(s)
     }) as c_int
 }
 
