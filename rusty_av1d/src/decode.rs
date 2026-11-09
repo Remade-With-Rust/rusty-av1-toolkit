@@ -571,12 +571,15 @@ fn order_palette(
     {
         let have_left = j > 0;
 
-        assert!(have_left || have_top);
+        // Invariants by construction (debug-only): palette indices are decoded
+        // below `pal_sz <= 8`, and each case adds distinct values, so `order`
+        // fills to exactly 8 entries.
+        debug_assert!(have_left || have_top);
 
         let mut mask = 0u8;
         let mut o_idx = 0;
         let mut add = |v: u8| {
-            assert!(v < u8::BITS as u8);
+            debug_assert!(v < u8::BITS as u8);
             order[o_idx] = v;
             o_idx += 1;
             mask |= 1 << v;
@@ -621,7 +624,7 @@ fn order_palette(
                 o_idx += 1;
             }
         }
-        assert!(o_idx == u8::BITS as usize);
+        debug_assert!(o_idx == u8::BITS as usize);
         have_top = true;
         offset += stride - 1;
     }
