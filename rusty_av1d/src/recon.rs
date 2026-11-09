@@ -1786,7 +1786,9 @@ enum MaybeTempPixels<'a, TmpStride> {
     },
 }
 
-fn mc<BD: BitDepth>(
+/// `LUMA` is set at the call sites that always pass `pl == 0`,
+/// so the chroma subsampling terms fold away there; otherwise `pl` decides at runtime.
+fn mc<BD: BitDepth, const LUMA: bool>(
     f: &Rav1dFrameData,
     emu_edge: &mut ScratchEmuEdge,
     b: Bxy,
@@ -1801,6 +1803,8 @@ fn mc<BD: BitDepth>(
     refidx: usize,
     filter_2d: Filter2d,
 ) -> Result<(), ()> {
+    debug_assert!(!LUMA || pl == 0);
+    let pl = if LUMA { 0 } else { pl };
     let bd = BD::from_c(f.bitdepth_max);
     let ref_data = &refp.p.data.as_ref().unwrap().data;
     let cur_data = &f.cur.data.as_ref().unwrap().data;
@@ -1981,7 +1985,7 @@ fn obmc<BD: BitDepth>(
             if a_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(step4, b_dim[0]);
                 let oh4 = cmp::min(b_dim[1], 16) >> 1;
-                mc::<BD>(
+                mc::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2029,7 +2033,7 @@ fn obmc<BD: BitDepth>(
             if l_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(b_dim[0], 16) >> 1;
                 let oh4 = cmp::min(step4, b_dim[1]);
-                mc::<BD>(
+                mc::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2890,7 +2894,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         // intrabc
         assert!(!frame_hdr.size.super_res.enabled);
         let scratch = t.scratch.inter_mut();
-        mc::<BD>(
+        mc::<BD, true>(
             f,
             &mut scratch.emu_edge,
             t.b,
@@ -2907,7 +2911,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         )?;
         if has_chroma {
             for pl in 1..3 {
-                mc::<BD>(
+                mc::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2955,7 +2959,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     &frame_hdr.gmv[inter.r#ref[i] as usize],
                 )?;
             } else {
-                mc::<BD>(
+                mc::<BD, true>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -3052,7 +3056,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                             &frame_hdr.gmv[inter.r#ref[i] as usize],
                         )?;
                     } else {
-                        mc::<BD>(
+                        mc::<BD, false>(
                             f,
                             &mut scratch.emu_edge,
                             t.b,
@@ -3134,7 +3138,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 },
             )?;
         } else {
-            mc::<BD>(
+            mc::<BD, true>(
                 f,
                 &mut t.scratch.inter_mut().emu_edge,
                 t.b,
@@ -3245,7 +3249,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 if bw4 == 1 && bh4 == ss_ver {
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize - 1);
-                        mc::<BD>(
+                        mc::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
@@ -3284,7 +3288,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*t.l.filter[0].index(by4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[1] + t.b.x as usize - 1);
-                        mc::<BD>(
+                        mc::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
@@ -3320,7 +3324,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*f.a[t.a].filter[0].index(bx4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize);
-                        mc::<BD>(
+                        mc::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
@@ -3352,7 +3356,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     v_off = 2 * BD::pxstride(f.cur.stride[1]);
                 }
                 for pl in 0..2 {
-                    mc::<BD>(
+                    mc::<BD, false>(
                         f,
                         &mut t.scratch.inter_mut().emu_edge,
                         t.b,
@@ -3397,7 +3401,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     }
                 } else {
                     for pl in 0..2 {
-                        mc::<BD>(
+                        mc::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
