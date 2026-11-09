@@ -1608,7 +1608,8 @@ pub(crate) fn pd0_real_cost<T: Pixel>(
   }
   let tx_type = TxType::DCT_DCT;
   let qidx = get_qidx(fi, ts, cw, tile_bo);
-  ts.qc.update(
+  ts.qc.update_plane(
+    0,
     qidx,
     tx_size,
     false,
@@ -3126,7 +3127,8 @@ pub fn write_tx_blocks<T: Pixel, W: Writer>(
   let do_chroma =
     has_chroma(tile_bo, bsize, xdec, ydec, fi.sequence.chroma_sampling);
 
-  ts.qc.update(
+  ts.qc.update_plane(
+    0,
     qidx,
     tx_size,
     luma_mode.is_intra(),
@@ -3229,7 +3231,8 @@ pub fn write_tx_blocks<T: Pixel, W: Writer>(
   };
 
   for p in 1..3 {
-    ts.qc.update(
+    ts.qc.update_plane(
+      p,
       qidx,
       uv_tx_size,
       true,
@@ -3305,7 +3308,8 @@ pub fn write_tx_tree<T: Pixel, W: Writer>(
   let mut partition_has_coeff: bool = false;
   let mut tx_dist = ScaledDistortion::zero();
 
-  ts.qc.update(
+  ts.qc.update_plane(
+    0,
     qidx,
     tx_size,
     luma_mode.is_intra(),
@@ -3391,7 +3395,8 @@ pub fn write_tx_tree<T: Pixel, W: Writer>(
   };
 
   for p in 1..3 {
-    ts.qc.update(
+    ts.qc.update_plane(
+      p,
       qidx,
       uv_tx_size,
       false,
