@@ -1817,7 +1817,8 @@ fn decode_b(
         };
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
 
-        let intra = Av1BlockIntra {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Intra(Av1BlockIntra {
             y_mode,
             uv_mode,
             tx,
@@ -1825,14 +1826,16 @@ fn decode_b(
             y_angle,
             uv_angle,
             cfl_alpha,
+        });
+        let Av1BlockIntraInter::Intra(intra) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Intra(intra.clone()); // cheap 9-byte clone
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_intra)(f, t, Some(ts_c), bs, intra_edge_flags, b, &intra);
+            (bd_fn.recon_b_intra)(f, t, Some(ts_c), bs, intra_edge_flags, b, intra);
         }
 
         if frame_hdr.loopfilter.level_y != [0, 0] {
@@ -2053,7 +2056,8 @@ fn decode_b(
         };
 
         b.uvtx = uvtx;
-        let inter = Av1BlockInter {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Inter(Av1BlockInter {
             nd: Av1BlockInter1d {
                 mv: [r#ref, Default::default()],
                 ..Default::default()
@@ -2069,14 +2073,16 @@ fn decode_b(
             interintra_type: Default::default(),
             tx_split0,
             tx_split1,
+        });
+        let Av1BlockIntraInter::Inter(inter) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Inter(inter.clone()); // Cheap 24-byte clone
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, &inter)?;
+            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, inter)?;
         }
 
         splat_intrabc_mv(c, t, &f.rf, bs, r#ref, bw4 as usize, bh4 as usize);
@@ -2944,7 +2950,8 @@ fn decode_b(
         } = read_vartx_tree(t, f, ts_c, b, bs, bx4, by4);
 
         b.uvtx = uvtx;
-        let inter = Av1BlockInter {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Inter(Av1BlockInter {
             nd,
             comp_type,
             inter_mode,
@@ -2956,14 +2963,16 @@ fn decode_b(
             interintra_type,
             tx_split0,
             tx_split1,
+        });
+        let Av1BlockIntraInter::Inter(inter) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Inter(inter.clone());
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, &inter)?;
+            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, inter)?;
         }
 
         if frame_hdr.loopfilter.level_y != [0, 0] {
@@ -3017,9 +3026,9 @@ fn decode_b(
 
         // context updates
         if is_comp {
-            splat_tworef_mv(c, t, &f.rf, bs, &inter, bw4 as usize, bh4 as usize);
+            splat_tworef_mv(c, t, &f.rf, bs, inter, bw4 as usize, bh4 as usize);
         } else {
-            splat_oneref_mv(c, t, &f.rf, bs, &inter, bw4 as usize, bh4 as usize);
+            splat_oneref_mv(c, t, &f.rf, bs, inter, bw4 as usize, bh4 as usize);
         }
 
         CaseSet::<32, false>::many(
