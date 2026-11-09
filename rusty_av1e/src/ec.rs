@@ -51,6 +51,13 @@ pub trait Writer {
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   );
+  /// [`Writer::symbol_with_update`], always inlined. For the per-coefficient
+  /// sites only, where the call frame costs as much as the symbol; every other
+  /// site keeps the out-of-line copy so code size does not grow with it.
+  fn symbol_with_update_hot<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  );
   /// Write a bool using passed in probability
   fn bool(&mut self, val: bool, f: u16);
   /// Write a single bit with flat probability
@@ -642,6 +649,13 @@ where
   ///   must be greater 32704. There should be at most 16 values.
   ///   The lower 6 bits of the last value hold the count.
   fn symbol_with_update<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    self.symbol_with_update_hot(s, cdf, log, fc)
+  }
+  #[inline(always)]
+  fn symbol_with_update_hot<const CDF_LEN: usize>(
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {

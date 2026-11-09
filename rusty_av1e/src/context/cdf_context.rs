@@ -608,6 +608,16 @@ impl fmt::Debug for CDFContext {
   }
 }
 
+/// [`symbol_with_update!`] through the always-inlined writer body; use only at
+/// per-coefficient sites (see `Writer::symbol_with_update_hot`).
+macro_rules! symbol_with_update_hot {
+  ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
+    let cdf = $self.fc.offset($cdf);
+    $w.symbol_with_update_hot($s, cdf, &mut $self.fc_log, &mut $self.fc);
+    symbol_with_update!($self, $cdf);
+  };
+}
+
 macro_rules! symbol_with_update {
   ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
     let cdf = $self.fc.offset($cdf);

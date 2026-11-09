@@ -2542,14 +2542,14 @@ impl ContextWriter<'_> {
       let level = v.abs();
 
       if c == usize::from(eob) - 1 {
-        symbol_with_update!(
+        symbol_with_update_hot!(
           self,
           w,
           cmp::min(u32::cast_from(level), 3) - 1,
           &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][coeff_ctx]
         );
       } else {
-        symbol_with_update!(
+        symbol_with_update_hot!(
           self,
           w,
           cmp::min(u32::cast_from(level), 3),
@@ -2569,7 +2569,7 @@ impl ContextWriter<'_> {
           let k = cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
           let cdf = &self.fc.coeff_br_cdf
             [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
-          symbol_with_update!(self, w, u32::cast_from(k), cdf);
+          symbol_with_update_hot!(self, w, u32::cast_from(k), cdf);
           if k < T::cast_from(BR_CDF_SIZE - 1) {
             break;
           }
