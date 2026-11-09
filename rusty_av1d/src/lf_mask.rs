@@ -302,22 +302,10 @@ fn mask_edges_intra(
     let thl4c = cmp::min(2, thl4);
 
     // left block edge
-    for y in 0..h4 {
-        let mask = 1u32 << (by4 + y);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        masks[0][bx4][cmp::min(twl4c, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    or_edge_masks(&masks[0][bx4], by4, h4, 16, |y| cmp::min(twl4c, l[y]));
 
     // top block edge
-    for x in 0..w4 {
-        let mask = 1u32 << (bx4 + x);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        // SAFETY: No other mutable references to this sub-slice exist on other
-        // threads.
-        masks[1][by4][cmp::min(thl4c, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    or_edge_masks(&masks[1][by4], bx4, w4, 16, |x| cmp::min(thl4c, a[x]));
 
     // inner (tx) left|right edges
     let hstep = t_dim.w as usize;
