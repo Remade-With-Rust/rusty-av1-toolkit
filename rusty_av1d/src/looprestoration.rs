@@ -10,7 +10,6 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::align::AlignedVec64;
 use crate::cpu::CpuFlags;
-use crate::cursor::CursorMut;
 use crate::disjoint_mut::DisjointMut;
 use crate::ffi_safe::FFISafe;
 #[cfg(all(
@@ -674,26 +673,26 @@ fn selfguided_filter<BD: BitDepth>(
     }
     let bitdepth_min_8 = bd.bitdepth() - 8;
 
-    let mut a = CursorMut::new(sumsq) + 2 * REST_UNIT_STRIDE + 3;
-    let mut b = CursorMut::new(sum) + 2 * REST_UNIT_STRIDE + 3;
-
-    let mut aa = a.clone() - REST_UNIT_STRIDE;
-    let mut bb = b.clone() - REST_UNIT_STRIDE;
+    // Rows -1..=h (every `step`-th), columns -1..=w of `a`/`b`, through row
+    // slices so no per-element offset conversion or bounds check is needed.
+    // `row` is the `a`/`b` index of column -1 in the current row.
+    let mut row = 2 * REST_UNIT_STRIDE + 3 - REST_UNIT_STRIDE - 1;
     for _ in (-1..h as isize + 1).step_by(step) {
-        for i in -1..w as isize + 1 {
-            let a = aa[i] + (1 << 2 * bitdepth_min_8 >> 1) >> 2 * bitdepth_min_8;
-            let b = bb[i].as_::<c_int>() + (1 << bitdepth_min_8 >> 1) >> bitdepth_min_8;
+        let a_row = &mut sumsq[row..][..w + 2];
+        let b_row = &mut sum[row..][..w + 2];
+        for (aa, bb) in iter::zip(a_row, b_row) {
+            let a = *aa + (1 << 2 * bitdepth_min_8 >> 1) >> 2 * bitdepth_min_8;
+            let b = (*bb).as_::<c_int>() + (1 << bitdepth_min_8 >> 1) >> bitdepth_min_8;
 
             let p = cmp::max(a * n - b * b, 0) as c_uint;
             let z = (p * s + (1 << 19)) >> 20;
             let x = dav1d_sgr_x_by_x[cmp::min(z, 255) as usize] as c_uint;
 
             // This is where we invert A and B, so that B is of size coef.
-            aa[i] = ((x * bb[i].as_::<c_uint>() * sgr_one_by_x + (1 << 11)) >> 12) as c_int;
-            bb[i] = x.as_::<BD::Coef>();
+            *aa = ((x * (*bb).as_::<c_uint>() * sgr_one_by_x + (1 << 11)) >> 12) as c_int;
+            *bb = x.as_::<BD::Coef>();
         }
-        aa += step as usize * REST_UNIT_STRIDE;
-        bb += step as usize * REST_UNIT_STRIDE;
+        row += step * REST_UNIT_STRIDE;
     }
 
     const MAX_RESTORATION_WIDTH: usize = 256 * 3 / 2;
