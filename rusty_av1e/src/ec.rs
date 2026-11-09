@@ -558,6 +558,7 @@ where
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
   /// `f`: The probability that the val is one, scaled by 32768.
+  #[inline]
   fn bool(&mut self, val: bool, f: u16) {
     debug_assert!(0 < f);
     debug_assert!(f < 32768);
@@ -567,6 +568,7 @@ where
   ///
   /// - `val`: The value to encode (`false` or `true`).
   /// - `f`: The probability that the `val` is `true`, scaled by `32768`.
+  #[inline]
   fn bit(&mut self, bit: u16) {
     // prom_av1e012: on counting writers a flat bit costs exactly 1 bit by
     // construction — account it instead of running the EC store. Covers every
