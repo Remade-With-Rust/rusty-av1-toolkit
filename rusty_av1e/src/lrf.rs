@@ -1106,6 +1106,33 @@ fn sgrproj_solve_with<T: Pixel>(
         c[1] += sums.c[1] as f64;
       }
 
+      /// `process_line` compiled with AVX2 enabled, where LLVM vectorizes its
+      /// widening multiply-accumulates; the same exact integer sums.
+      #[cfg(nasm_x86_64)]
+      #[target_feature(enable = "avx2")]
+      unsafe fn process_line_avx2<T: Pixel>(
+        h: &mut [[f64; 2]; 2], c: &mut [f64; 2], cdeffed: &[T], input: &[T],
+        f_r1: &[u32], f_r2_ab: &[u32], cdef_w: usize,
+      ) {
+        process_line(h, c, cdeffed, input, f_r1, f_r2_ab, cdef_w)
+      }
+
+      #[cfg(nasm_x86_64)]
+      if fi.cpu_feature_level >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+        // SAFETY: AVX2 is available, checked just above.
+        unsafe {
+          process_line_avx2(
+            &mut h,
+            &mut c,
+            &cdeffed[y],
+            &input[y],
+            &*f_r1,
+            f_r2_01[dy],
+            cdef_w,
+          )
+        };
+        continue;
+      }
       process_line(
         &mut h,
         &mut c,
