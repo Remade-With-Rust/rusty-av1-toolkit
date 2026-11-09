@@ -88,16 +88,13 @@ fn backup2x8<BD: BitDepth>(
     // Precomputing (only `stride[0]`) optimizes better.
     let stride_0 = src[0].pixel_stride::<BD>();
 
-    // Rows are gathered into a local, which nothing can alias, and stored to `dst` once:
-    // `dst` (`lr_bak`) escapes to the filter calls, so storing each row into it directly
-    // made LLVM reload the source picture pointer and length after every row.
+    // Each column of rows is read with one bounds check (`copy_rows`) into a local,
+    // which nothing can alias, and stored to `dst` (`lr_bak`, which escapes to the
+    // filter calls) once, with a fixed-size copy.
     let zero = BD::Pixel::from(0);
     if flag.contains(Backup2x8Flags::Y) {
         let mut rows = [[zero; 2]; 8];
-        for (y, row) in rows.iter_mut().enumerate() {
-            let y_src = src[0] + (y as isize * stride_0 + x_off - 2);
-            BD::pixel_copy(row, &y_src.slice::<BD>(2), 2);
-        }
+        (src[0] + (x_off - 2)).copy_rows::<BD, 2, 8>(stride_0, &mut rows);
         dst[0] = rows;
     }
 
@@ -114,24 +111,20 @@ fn backup2x8<BD: BitDepth>(
     ];
 
     let x_off = x_off >> ss_hor;
-    // Called with a constant row count (4 or 8), so each instance unrolls fully
-    // and its copies back to `dst` stay fixed-size (inline, not `memcpy`).
-    let mut gather = |h: usize| {
-        let mut rows = [[[zero; 2]; 8]; 2];
-        for y in 0..h {
-            for pl in 1..3 {
-                let uv_src = src[pl] + (y as isize * strides[pl] + x_off - 2);
-                BD::pixel_copy(&mut rows[pl - 1][y], &uv_src.slice::<BD>(2), 2);
-            }
-        }
-        for pl in 1..3 {
-            dst[pl][..h].copy_from_slice(&rows[pl - 1][..h]);
-        }
-    };
+    // A constant row count (4 or 8) per branch, so the reads unroll fully
+    // and the copies back to `dst` stay fixed-size (inline, not `memcpy`).
     if ss_ver != 0 {
-        gather(4);
+        for pl in 1..3 {
+            let mut rows = [[zero; 2]; 4];
+            (src[pl] + (x_off - 2)).copy_rows::<BD, 2, 4>(strides[pl], &mut rows);
+            dst[pl][..4].copy_from_slice(&rows);
+        }
     } else {
-        gather(8);
+        for pl in 1..3 {
+            let mut rows = [[zero; 2]; 8];
+            (src[pl] + (x_off - 2)).copy_rows::<BD, 2, 8>(strides[pl], &mut rows);
+            dst[pl] = rows;
+        }
     }
 }
 

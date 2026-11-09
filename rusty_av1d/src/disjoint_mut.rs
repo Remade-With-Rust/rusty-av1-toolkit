@@ -545,6 +545,69 @@ impl<T: AsMutPtr<Target = u8>> DisjointMut<T> {
     /// during the lifetime of the returned borrow.
     ///
     /// [`index_mut`]: DisjointMut::index_mut
+    /// Copy the `N` elements of type `V` at `start + y * stride` (in units of `V`)
+    /// into `dst[y]`, for each of the `ROWS` rows.
+    ///
+    /// Each read is its own disjoint immutable borrow of just those `N` elements,
+    /// as if done by [`Self::slice_as`], so the elements in between
+    /// may be mutably borrowed elsewhere concurrently.
+    /// In release builds, the first and last rows (which bound the others)
+    /// are checked once and the collection's pointer is loaded once,
+    /// rather than a guarded [`Self::slice_as`] per row.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::slice_as`], for each of the read regions.
+    /// This is checked in debug builds, where each read is a [`Self::slice_as`].
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn copy_rows_to<V, const N: usize, const ROWS: usize>(
+        &self,
+        start: usize,
+        stride: isize,
+        dst: &mut [[V; N]; ROWS],
+    ) where
+        V: AsBytes + FromBytes + Copy,
+    {
+        #[cfg(debug_assertions)]
+        for (y, row) in dst.iter_mut().enumerate() {
+            let o = start.wrapping_add_signed(y as isize * stride);
+            row.copy_from_slice(&self.slice_as::<_, V>((o.., ..N)));
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            let len = self.len() / mem::size_of::<V>();
+            // Row offsets are monotonic in `y`, so the first and last rows bound the rest.
+            let last = stride
+                .checked_mul(ROWS as isize - 1)
+                .and_then(|span| start.checked_add_signed(span));
+            let in_bounds = last.is_some_and(|last| {
+                let hi = if stride < 0 { start } else { last };
+                hi.checked_add(N).is_some_and(|end| end <= len)
+            });
+            if !in_bounds {
+                #[inline(never)]
+                fn out_of_bounds(len: usize) -> ! {
+                    panic!("strided read out of range for slice of length {len}")
+                }
+                out_of_bounds(self.len());
+            }
+            let data = self.as_mut_ptr().cast::<V>().cast_const();
+            for y in 0..ROWS {
+                // SAFETY: every row offset lies between `start` and `last` (checked above,
+                // so `start < len <= isize::MAX` and `y * stride` fits in `isize`),
+                // and its `N` elements end by `hi + N <= len`, within the allocation;
+                // the caller guarantees they are not mutably borrowed during the read.
+                dst[y] = unsafe {
+                    data.offset(start as isize + y as isize * stride)
+                        .cast::<[V; N]>()
+                        .read_unaligned()
+                };
+            }
+        }
+    }
+
     #[inline] // Inline to see bounds checks in order to potentially elide them.
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn slice_as<'a, I, V>(&'a self, index: I) -> DisjointImmutGuard<'a, T, [V]>

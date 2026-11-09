@@ -345,6 +345,18 @@ pub type FFISafeRav1dPictureDataComponentOffset<'a> =
     WithOffset<*const FFISafe<'a, Rav1dPictureDataComponent>>;
 
 impl<'a> Rav1dPictureDataComponentOffset<'a> {
+    /// Copy `N` pixels from each of `ROWS` rows `stride` pixels apart, starting here.
+    ///
+    /// See [`DisjointMut::copy_rows_to`]: one bounds check for all of the rows.
+    #[inline(always)]
+    pub fn copy_rows<BD: BitDepth, const N: usize, const ROWS: usize>(
+        &self,
+        stride: isize,
+        dst: &mut [[BD::Pixel; N]; ROWS],
+    ) {
+        self.data.0.copy_rows_to::<BD::Pixel, N, ROWS>(self.offset, stride, dst)
+    }
+
     #[inline] // Inline to see bounds checks in order to potentially elide them.
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn index<BD: BitDepth>(
