@@ -136,6 +136,16 @@ fn filter_8tap<BD: BitDepth>(
     FilterResult { pixel }
 }
 
+/// [`filter_8tap`] along a row (`stride == 1`), from a slice of that row which
+/// starts 3 pixels left of output column 0. Reads the same pixels, but with one
+/// slice check per output pixel instead of 8 accessor guards.
+#[inline]
+fn filter_8tap_row<BD: BitDepth>(row: &[BD::Pixel], x: usize, f: &[i8; 8]) -> FilterResult {
+    let px = &row[x..][..8];
+    let pixel = (0..f.len()).map(|y| f[y] as i32 * px[y].to::<i32>()).sum();
+    FilterResult { pixel }
+}
+
 fn get_filter(m: usize, d: usize, filter_type: Rav1dFilterMode) -> Option<&'static [i8; 8]> {
     let m = m.checked_sub(1)?;
     let i = if d > 4 {
@@ -170,8 +180,9 @@ fn put_8tap_rust<BD: BitDepth>(
 
             for y in 0..tmp_h {
                 let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    mid[y][x] = filter_8tap::<BD>(src, x, fh, 1)
+                    mid[y][x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .get();
                 }
@@ -192,8 +203,9 @@ fn put_8tap_rust<BD: BitDepth>(
                 let src = src + y as isize * src.pixel_stride::<BD>();
                 let dst = dst + y as isize * dst.pixel_stride::<BD>();
                 let dst = &mut *dst.slice_mut::<BD>(w);
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    dst[x] = filter_8tap::<BD>(src, x, fh, 1)
+                    dst[x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd2(6, intermediate_rnd)
                         .clip(bd);
                 }
@@ -297,8 +309,9 @@ fn prep_8tap_rust<BD: BitDepth>(
 
             for y in 0..tmp_h {
                 let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    mid[y][x] = filter_8tap::<BD>(src, x, fh, 1)
+                    mid[y][x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .get();
                 }
@@ -317,8 +330,9 @@ fn prep_8tap_rust<BD: BitDepth>(
             for y in 0..h {
                 let src = src + y as isize * src.pixel_stride::<BD>();
                 let tmp = &mut tmp[y * w..][..w];
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    tmp[x] = filter_8tap::<BD>(src, x, fh, 1)
+                    tmp[x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .sub_prep_bias::<BD>();
                 }
