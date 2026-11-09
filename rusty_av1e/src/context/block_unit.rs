@@ -2530,60 +2530,71 @@ impl ContextWriter<'_> {
     // The loop body is instantiated twice: with the knob-free symbol writer
     // when every writer knob is clear (the default configuration), so no
     // per-symbol knob test survives, and with the knob-aware writer otherwise.
+    // Base-range symbols for one coefficient above NUM_BASE_LEVELS.
+    macro_rules! base_range {
+      ($sym:ident, $level:expr, $pos:expr) => {
+        if $level > T::cast_from(NUM_BASE_LEVELS) {
+          let base_range = $level - T::cast_from(1 + NUM_BASE_LEVELS);
+          let br_ctx = Self::get_br_ctx(levels, $pos, bhl, tx_class);
+          let mut idx: T = T::cast_from(0);
+
+          loop {
+            if idx >= T::cast_from(COEFF_BASE_RANGE) {
+              break;
+            }
+            let k = cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
+            let cdf = &self.fc.coeff_br_cdf
+              [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
+            $sym!(self, w, u32::cast_from(k), cdf);
+            if k < T::cast_from(BR_CDF_SIZE - 1) {
+              break;
+            }
+            idx += T::cast_from(BR_CDF_SIZE - 1);
+          }
+        }
+      };
+    }
+    // The loop body is instantiated twice: with the knob-free symbol writer
+    // when every writer knob is clear (the default configuration), so no
+    // per-symbol knob test survives, and with the knob-aware writer otherwise.
+    // The last coefficient (c == eob - 1, eob >= 1 here) codes its base level
+    // from the eob CDF and is never skipped, so it is peeled off the front of
+    // the reverse scan; the loop then needs neither the `c == eob - 1` test
+    // nor the `c + 1 != eob` term of the skip test.
     macro_rules! coeff_loop {
       ($sym:ident, $may_skip:literal) => {
         let scan_with_ctx =
           scan.iter().copied().zip(coeff_contexts.iter().copied());
-        for (c, ((pos, coeff_ctx), v)) in
-          scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev()
-        {
+        let mut coeffs_rev =
+          scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev();
+        if let Some((_, ((pos, coeff_ctx), v))) = coeffs_rev.next() {
+          let pos = pos as usize;
+          let coeff_ctx = coeff_ctx as usize;
+          let level = v.abs();
+          $sym!(
+            self,
+            w,
+            cmp::min(u32::cast_from(level), 3) - 1,
+            &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][coeff_ctx]
+          );
+          base_range!($sym, level, pos);
+        }
+        for (c, ((pos, coeff_ctx), v)) in coeffs_rev {
           // Skip the base/range cost of the high-frequency middle coefficients
           // (kept: DC, last-eob, and the low-frequency head up to eob/N).
-          // `c > fast_hi` first: it is the term that is false on the default
-          // path (fast_hi == usize::MAX), so one compare decides it there.
-          if $may_skip && c > fast_hi && c != 0 && c + 1 != usize::from(eob) {
+          if $may_skip && c > fast_hi && c != 0 {
             continue;
           }
           let pos = pos as usize;
           let coeff_ctx = coeff_ctx as usize;
           let level = v.abs();
-
-          if c == usize::from(eob) - 1 {
-            $sym!(
-              self,
-              w,
-              cmp::min(u32::cast_from(level), 3) - 1,
-              &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][coeff_ctx]
-            );
-          } else {
-            $sym!(
-              self,
-              w,
-              cmp::min(u32::cast_from(level), 3),
-              &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx]
-            );
-          }
-
-          if level > T::cast_from(NUM_BASE_LEVELS) {
-            let base_range = level - T::cast_from(1 + NUM_BASE_LEVELS);
-            let br_ctx = Self::get_br_ctx(levels, pos, bhl, tx_class);
-            let mut idx: T = T::cast_from(0);
-
-            loop {
-              if idx >= T::cast_from(COEFF_BASE_RANGE) {
-                break;
-              }
-              let k =
-                cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
-              let cdf = &self.fc.coeff_br_cdf
-                [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
-              $sym!(self, w, u32::cast_from(k), cdf);
-              if k < T::cast_from(BR_CDF_SIZE - 1) {
-                break;
-              }
-              idx += T::cast_from(BR_CDF_SIZE - 1);
-            }
-          }
+          $sym!(
+            self,
+            w,
+            cmp::min(u32::cast_from(level), 3),
+            &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx]
+          );
+          base_range!($sym, level, pos);
         }
       };
     }
