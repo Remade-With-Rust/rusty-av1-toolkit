@@ -731,7 +731,11 @@ impl ContextWriter<'_> {
     if bo.0.x >= self.bc.blocks.cols() || bo.0.y >= self.bc.blocks.rows() {
       return;
     }
-    debug_assert!(self.bc.blocks[bo].is_inter());
+    // The block's own mode cell is only written on writers that keep the
+    // block context (prom_av1e024 skips that fill on counting writers, whose
+    // trials never read it), so only those can check it. The caller asserts
+    // the coded mode is inter on every writer.
+    debug_assert!(W::COUNTS_ONLY || self.bc.blocks[bo].is_inter());
     debug_assert!(bsize > BlockSize::BLOCK_4X4);
     debug_assert!(!tx_size.is_rect() || bsize.is_rect_tx_allowed());
 
