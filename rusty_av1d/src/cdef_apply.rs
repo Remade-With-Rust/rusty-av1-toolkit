@@ -88,13 +88,17 @@ fn backup2x8<BD: BitDepth>(
     // Precomputing (only `stride[0]`) optimizes better.
     let stride_0 = src[0].pixel_stride::<BD>();
 
+    // Rows are gathered into a local, which nothing can alias, and stored to `dst` once:
+    // `dst` (`lr_bak`) escapes to the filter calls, so storing each row into it directly
+    // made LLVM reload the source picture pointer and length after every row.
+    let zero = BD::Pixel::from(0);
     if flag.contains(Backup2x8Flags::Y) {
-        for y in 0..8 {
-            let y_dst = &mut dst[0][y];
+        let mut rows = [[zero; 2]; 8];
+        for (y, row) in rows.iter_mut().enumerate() {
             let y_src = src[0] + (y as isize * stride_0 + x_off - 2);
-            let y_len = y_dst.len();
-            BD::pixel_copy(y_dst, &y_src.slice::<BD>(y_len), y_len);
+            BD::pixel_copy(row, &y_src.slice::<BD>(2), 2);
         }
+        dst[0] = rows;
     }
 
     if layout == Rav1dPixelLayout::I400 || !flag.contains(Backup2x8Flags::UV) {
@@ -110,12 +114,21 @@ fn backup2x8<BD: BitDepth>(
     ];
 
     let x_off = x_off >> ss_hor;
-    for y in 0..8 >> ss_ver {
+    let h = 8 >> ss_ver;
+    let mut rows = [[[zero; 2]; 8]; 2];
+    for y in 0..h {
         for pl in 1..3 {
-            let uv_dst = &mut dst[pl][y];
             let uv_src = src[pl] + (y as isize * strides[pl] + x_off - 2);
-            let uv_len = uv_dst.len();
-            BD::pixel_copy(uv_dst, &uv_src.slice::<BD>(uv_len), uv_len);
+            BD::pixel_copy(&mut rows[pl - 1][y], &uv_src.slice::<BD>(2), 2);
+        }
+    }
+    // Fixed-size copies (`h` is 4 or 8), so they stay inline rather than calling `memcpy`.
+    for pl in 1..3 {
+        let rows = &rows[pl - 1];
+        if h == 4 {
+            dst[pl][..4].copy_from_slice(&rows[..4]);
+        } else {
+            dst[pl] = *rows;
         }
     }
 }
