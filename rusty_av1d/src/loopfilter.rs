@@ -87,17 +87,19 @@ pub struct Rav1dLoopFilterDSPContext {
     pub loop_filter_sb: LoopFilterYUVDSPContext,
 }
 
+/// `WD` (4, 6, 8 or 16) is the filter width, a const generic so each
+/// instantiation folds the per-line width tests.
 #[inline(never)]
-fn loop_filter<BD: BitDepth>(
+fn loop_filter<BD: BitDepth, const WD: c_int>(
     dst: Rav1dPictureDataComponentOffset,
     e: u8,
     i: u8,
     h: u8,
     stridea: ptrdiff_t,
     strideb: ptrdiff_t,
-    wd: c_int,
     bd: BD,
 ) {
+    let wd = WD;
     let bitdepth_min_8 = bd.bitdepth() - 8;
     let [f, e, i, h] = [1, e, i, h].map(|n| (n as i32) << bitdepth_min_8);
 
@@ -347,7 +349,12 @@ fn loop_filter_sb128_rust<BD: BitDepth, const HV: usize, const YUV: usize>(
                     4 + 2 * idx
                 }
             };
-            loop_filter(dst, e, i, h, stridea, strideb, idx, bd);
+            match idx {
+                4 => loop_filter::<BD, 4>(dst, e, i, h, stridea, strideb, bd),
+                6 => loop_filter::<BD, 6>(dst, e, i, h, stridea, strideb, bd),
+                8 => loop_filter::<BD, 8>(dst, e, i, h, stridea, strideb, bd),
+                _ => loop_filter::<BD, 16>(dst, e, i, h, stridea, strideb, bd),
+            }
         }
         xy <<= 1;
         dst += 4 * stridea;
