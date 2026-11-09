@@ -296,11 +296,27 @@ const _: () = assert!(EC_MIN_PROB <= (1 << EC_PROB_SHIFT) / 16);
 
 const EC_WIN_SIZE: usize = mem::size_of::<EcWin>() << 3;
 
-#[inline]
+// Out of line: a refill happens once every few symbols, and keeping it out of
+// the inlined `ctx_norm` keeps every decoder's hot path small.
+#[inline(never)]
 fn ctx_refill(s: &mut MsacContext) {
     let mut c = (EC_WIN_SIZE as c_int) - 24 - s.cnt;
     let mut dif = s.dif;
     s.with_buf(|mut buf| {
+        // Word-at-a-time fast path, identical to the byte loop below: that loop
+        // ORs `!b << c` for c = c0, c0 - 8, ... while c >= 0, i.e. it takes
+        // n = c0 / 8 + 1 bytes, which are the top n bytes of a big-endian load
+        // shifted left by c0 % 8. The result is below 2^(c0 + 8), so it fits the
+        // window on 64-bit (c0 <= 56) and 32-bit (c0 <= 24) targets alike. Fewer
+        // than 8 bytes left (end of the tile data) takes the byte loop, which also
+        // fills past the end with ones.
+        if let (Some(word), true) = (buf.first_chunk::<8>(), c >= 0) {
+            let n = (c >> 3) as usize + 1;
+            let bytes = !u64::from_be_bytes(*word) >> (64 - 8 * n);
+            dif |= (bytes << (c & 7)) as EcWin;
+            c -= 8 * n as c_int;
+            return &buf[n..];
+        }
         loop {
             if buf.is_empty() {
                 // set remaining bits to 1;
