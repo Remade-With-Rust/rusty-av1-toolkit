@@ -941,20 +941,27 @@ where
     debug_assert!(s < cdf.len());
     // The above is stricter than the following overflow check: s <= cdf.len()
     let nms = cdf.len() - s;
-    let fl = if s > 0 {
-      // SAFETY: We asserted that s is less than the length of the cdf
-      unsafe { *cdf.get_unchecked(s - 1) }
-    } else {
-      32768
-    };
     // SAFETY: We asserted that s is less than the length of the cdf
     let fh = unsafe { *cdf.get_unchecked(s) };
-    debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
-    debug_assert!(fl <= 32768);
-    if PLAIN {
-      self.store_plain(fl, fh, nms as u16);
+    // Two store sites rather than one store of a selected `fl`: for s == 0 the
+    // lower bound is the constant 32768, which makes `lr_compute`'s `u` fold to
+    // `rng` (no multiply, no `fl >= 32768` select) in the inlined store.
+    if s > 0 {
+      // SAFETY: We asserted that s is less than the length of the cdf
+      let fl = unsafe { *cdf.get_unchecked(s - 1) };
+      debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
+      debug_assert!(fl <= 32768);
+      self.store_sel::<PLAIN>(fl, fh, nms as u16);
     } else {
-      self.store(fl, fh, nms as u16);
+      self.store_sel::<PLAIN>(32768, fh, nms as u16);
+    }
+  }
+  #[inline(always)]
+  fn store_sel<const PLAIN: bool>(&mut self, fl: u16, fh: u16, nms: u16) {
+    if PLAIN {
+      self.store_plain(fl, fh, nms);
+    } else {
+      self.store(fl, fh, nms);
     }
   }
   #[inline(always)]
