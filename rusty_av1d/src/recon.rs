@@ -236,6 +236,8 @@ fn get_skip_ctx(
             dir[..N] != [0x40; N]
         }
 
+        // Two calls per chroma transform block; a real call before.
+        #[inline(always)]
         fn cdir(dir: &[u8]) -> u8 {
             let cdir = match dir.len() {
                 1 => merge_ctx::<1>(dir),
