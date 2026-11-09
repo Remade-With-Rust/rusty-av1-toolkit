@@ -173,8 +173,11 @@ pub fn cdef_dist_wxh<T: Pixel, F: Fn(Area, BlockSize) -> DistortionScale>(
   debug_assert!(src2.plane_cfg.ydec == 0);
 
   let mut sum = Distortion::zero();
-  for y in (0..h).step_by(8) {
-    for x in (0..w).step_by(8) {
+  // Plain loops: `step_by(8)` over a `Range` costs more than the loop body's glue.
+  let mut y = 0;
+  while y < h {
+    let mut x = 0;
+    while x < w {
       let kernel_h = (h - y).min(8);
       let kernel_w = (w - x).min(8);
       let area = Area::StartingAt { x: x as isize, y: y as isize };
@@ -191,7 +194,9 @@ pub fn cdef_dist_wxh<T: Pixel, F: Fn(Area, BlockSize) -> DistortionScale>(
       // cdef is always called on non-subsampled planes, so BLOCK_8X8 is
       // correct here.
       sum += value * compute_bias(area, BlockSize::BLOCK_8X8);
+      x += 8;
     }
+    y += 8;
   }
   sum
 }
