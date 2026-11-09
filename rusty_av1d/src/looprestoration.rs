@@ -1,7 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::{c_int, c_uint};
-use std::ops::Add;
 use std::{cmp, iter, mem, slice};
 
 use bitflags::bitflags;
@@ -22,7 +21,7 @@ use crate::include::common::bitdepth::bd_fn;
 #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
 use crate::include::common::bitdepth::bpc_fn;
 use crate::include::common::bitdepth::{
-    AsPrimitive, BitDepth, DynPixel, LeftPixelRow, ToPrimitive, BPC,
+    AsPrimitive, BitDepth, DynPixel, LeftPixelRow, BPC,
 };
 use crate::include::common::intops::iclip;
 use crate::scratch;
@@ -697,76 +696,74 @@ fn selfguided_filter<BD: BitDepth>(
         bb += step as usize * REST_UNIT_STRIDE;
     }
 
-    fn six_neighbors<P>(p: &CursorMut<P>, i: isize) -> c_int
-    where
-        P: Add<Output = P> + ToPrimitive<c_int> + Copy,
-    {
-        let stride = REST_UNIT_STRIDE as isize;
-        (p[i - stride] + p[i + stride]).as_::<c_int>() * 6
-            + (p[i - 1 - stride] + p[i - 1 + stride] + p[i + 1 - stride] + p[i + 1 + stride])
-                .as_::<c_int>()
-                * 5
-    }
-
-    fn eight_neighbors<P>(p: &CursorMut<P>, i: isize) -> c_int
-    where
-        P: Add<Output = P> + ToPrimitive<c_int> + Copy,
-    {
-        let stride = REST_UNIT_STRIDE as isize;
-        (p[i] + p[i - 1] + p[i + 1] + p[i - stride] + p[i + stride]).as_::<c_int>() * 4
-            + (p[i - 1 - stride] + p[i - 1 + stride] + p[i + 1 - stride] + p[i + 1 + stride])
-                .as_::<c_int>()
-                * 3
-    }
-
     const MAX_RESTORATION_WIDTH: usize = 256 * 3 / 2;
+    const STRIDE: usize = REST_UNIT_STRIDE;
 
-    let mut src = &src[3 * REST_UNIT_STRIDE + 3..];
-    let mut dst = dst.as_mut_slice();
+    // The final pass reads `a`/`b` in the rows around each output row. It takes
+    // plain row slices of length `w + 2` starting one column left of the output
+    // (`c - 1`, where `c` is the `a`/`b` position of output column 0), so every
+    // index is provably in range: a handful of slice checks per row instead of a
+    // `CursorMut` offset conversion and bounds check per neighbour. Sums are
+    // still formed in the element type and in the original order.
+    let a_buf: &[i32] = &sumsq[..];
+    let b_buf: &[BD::Coef] = &sum[..];
+    let center = |j: usize| 2 * STRIDE + 3 + j * STRIDE;
+    let src_row = |j: usize| &src[3 * STRIDE + 3 + j * STRIDE..][..w];
     if n == 25 {
+        let six = |j: usize, dst: &mut [BD::Coef]| {
+            let c = center(j);
+            let (a0, a2) = (&a_buf[c - STRIDE - 1..][..w + 2], &a_buf[c + STRIDE - 1..][..w + 2]);
+            let (b0, b2) = (&b_buf[c - STRIDE - 1..][..w + 2], &b_buf[c + STRIDE - 1..][..w + 2]);
+            let src = src_row(j);
+            let dst = &mut dst[..w];
+            for i in 0..w {
+                let nb = (b0[i + 1] + b2[i + 1]).as_::<c_int>() * 6
+                    + (b0[i] + b2[i] + b0[i + 2] + b2[i + 2]).as_::<c_int>() * 5;
+                let na = (a0[i + 1] + a2[i + 1]) * 6 + (a0[i] + a2[i] + a0[i + 2] + a2[i + 2]) * 5;
+                dst[i] = ((na - nb * src[i].as_::<c_int>() + (1 << 8)) >> 9).as_();
+            }
+        };
         let mut j = 0;
         while j < h - 1 {
+            six(j, &mut dst[j * MAX_RESTORATION_WIDTH..]);
+            let c = center(j + 1);
+            let a1 = &a_buf[c - 1..][..w + 2];
+            let b1 = &b_buf[c - 1..][..w + 2];
+            let src = src_row(j + 1);
+            let dst = &mut dst[(j + 1) * MAX_RESTORATION_WIDTH..][..w];
             for i in 0..w {
-                let (a, b) = (six_neighbors(&b, i as isize), six_neighbors(&a, i as isize));
-                dst[i] = ((b - a * src[i].as_::<c_int>() + (1 << 8)) >> 9).as_();
+                let nb = b1[i + 1].as_::<c_int>() * 6 + (b1[i] + b1[i + 2]).as_::<c_int>() * 5;
+                let na = a1[i + 1] * 6 + (a1[i] + a1[i + 2]) * 5;
+                dst[i] = (na - nb * src[i].as_::<c_int>() + (1 << 7) >> 8).as_();
             }
-            dst = &mut dst[MAX_RESTORATION_WIDTH..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
-            for i in 0..w {
-                let (a, b) = (
-                    b[i].as_::<c_int>() * 6 + (b[i as isize - 1] + b[i + 1]).as_::<c_int>() * 5,
-                    a[i] * 6 + (a[i as isize - 1] + a[i + 1]) * 5,
-                );
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 7) >> 8).as_();
-            }
-            dst = &mut dst[MAX_RESTORATION_WIDTH..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
             j += 2;
         }
         // Last row, when number of rows is odd
         if j + 1 == h {
-            for i in 0..w {
-                let (a, b) = (six_neighbors(&b, i as isize), six_neighbors(&a, i as isize));
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
-            }
+            six(j, &mut dst[j * MAX_RESTORATION_WIDTH..]);
         }
     } else {
-        for _ in 0..h {
+        for j in 0..h {
+            let c = center(j);
+            let (a0, a1, a2) = (
+                &a_buf[c - STRIDE - 1..][..w + 2],
+                &a_buf[c - 1..][..w + 2],
+                &a_buf[c + STRIDE - 1..][..w + 2],
+            );
+            let (b0, b1, b2) = (
+                &b_buf[c - STRIDE - 1..][..w + 2],
+                &b_buf[c - 1..][..w + 2],
+                &b_buf[c + STRIDE - 1..][..w + 2],
+            );
+            let src = src_row(j);
+            let dst = &mut dst[j * 384..][..w];
             for i in 0..w {
-                let (a, b) = (
-                    eight_neighbors(&b, i as isize),
-                    eight_neighbors(&a, i as isize),
-                );
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
+                let nb = (b1[i + 1] + b1[i] + b1[i + 2] + b0[i + 1] + b2[i + 1]).as_::<c_int>() * 4
+                    + (b0[i] + b2[i] + b0[i + 2] + b2[i + 2]).as_::<c_int>() * 3;
+                let na = (a1[i + 1] + a1[i] + a1[i + 2] + a0[i + 1] + a2[i + 1]) * 4
+                    + (a0[i] + a2[i] + a0[i + 2] + a2[i + 2]) * 3;
+                dst[i] = (na - nb * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
             }
-            dst = &mut dst[384..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
         }
     };
     });
