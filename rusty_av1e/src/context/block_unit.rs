@@ -2600,7 +2600,7 @@ impl ContextWriter<'_> {
     }
     // The default configuration (no writer knobs, no subsampled costing)
     // gets a loop with neither knob tests nor the skip test.
-    if w.knobs() == 0 && fast_hi == usize::MAX {
+    if w.knobs() == 0 && fast_hi == <usize>::MAX {
       coeff_loop!(symbol_with_update_plain, false);
     } else {
       coeff_loop!(symbol_with_update_hot, true);
