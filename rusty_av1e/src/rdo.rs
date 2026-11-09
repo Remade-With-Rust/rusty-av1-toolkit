@@ -313,7 +313,7 @@ fn compute_distortion<T: Pixel>(
       |bias_area, bsize| {
         distortion_scale(
           fi,
-          input_region.subregion(bias_area).frame_block_offset(),
+          input_region.subregion_frame_block_offset(bias_area),
           bsize,
         )
       },
@@ -327,7 +327,7 @@ fn compute_distortion<T: Pixel>(
       |bias_area, bsize| {
         distortion_scale(
           fi,
-          input_region.subregion(bias_area).frame_block_offset(),
+          input_region.subregion_frame_block_offset(bias_area),
           bsize,
         )
       },
@@ -363,7 +363,7 @@ fn compute_distortion<T: Pixel>(
         |bias_area, bsize| {
           distortion_scale(
             fi,
-            input_region.subregion(bias_area).frame_block_offset(),
+            input_region.subregion_frame_block_offset(bias_area),
             bsize,
           )
         },
