@@ -1,8 +1,53 @@
-# rav1d
+# rusty_av1d
 
-**rav1d** is an AV1 cross-platform decoder, open-source, and focused on speed
-and correctness. It is a Rust port of
-[dav1d](https://code.videolan.org/videolan/dav1d).
+**rusty_av1d** is the [Remade With Rust](https://github.com/Remade-With-Rust) fork of
+[rav1d](https://github.com/memorysafety/rav1d), the Rust port of the
+[dav1d](https://code.videolan.org/videolan/dav1d) AV1 decoder. It lives in the
+[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) repository
+next to its encoder sibling, [rusty_av1e](https://crates.io/crates/rusty_av1e).
+
+Decoded output is bit-exact with dav1d. Every change is gated on decoded-frame md5s and
+on the 792-stream dav1d-test-data conformance suite, for both the default assembly build
+and the pure-Rust build (`--no-default-features --features bitdepth_8,bitdepth_16`),
+which needs no `nasm` and builds for `wasm32-unknown-unknown`.
+
+## Performance in 1.3.0
+
+1.3.0 carries 45 output-identical decoder changes from the toolkit's November 2026
+instruction-count campaign. Wall time against 1.2.1, single thread:
+
+| Build | Stream | 1.2.1 | 1.3.0 | Speedup |
+|---|---|---:|---:|---:|
+| pure Rust | rav1e-encoded 640x480, 3,000 frames | 9.70 s | 7.85 s | **1.24x** |
+| pure Rust | aom conformance stream, 90 frames | 3.83 s | 3.26 s | **1.17x** |
+| pure Rust | VQ-suite 432x240, 500 frames | 11.29 s | 10.53 s | **1.07x** |
+| asm (default) | rav1e-encoded 640x480, 3,000 frames | 2.68 s | 2.58 s | **1.04x** |
+| asm (default) | aom conformance stream, 90 frames | 2.51 s | 2.43 s | **1.03x** |
+| asm (default) | VQ-suite 432x240, 500 frames | 2.75 s | 2.75 s | within noise |
+
+<sub>Best of 20 to 30 runs per arm on Linux, one pinned core (`taskset`, `nice -10`), the two
+builds interleaved with the leading arm alternating, same toolchain and allocator. Every
+speedup shown won at least 16 of 20 pairs (z >= 2.7); a null arm, one binary against itself,
+reads within about 1%. Short streams are looped so each run lasts seconds; both arms decode the
+same frames with identical md5s.</sub>
+
+Instruction counts (callgrind) fell further than wall time: by 30 to 43% for the pure-Rust
+build and 3 to 9% for the asm build. Most of the difference is removed buffer zeroing, which
+counts one instruction per byte but costs far less than that in time.
+
+What changed, all output-identical:
+
+- **Pure-Rust kernels.** Per-thread scratch instead of zeroing up to 160 KiB per call (inverse
+  transform, loop restoration, motion compensation); row slices and const-generic filter widths
+  instead of per-pixel checked accessors; the Rust range decoder inlined where the token loop
+  calls it, with a word-at-a-time refill.
+- **Shared decode path.** `decode_b` neighbour-context writes dispatch once per block;
+  loop-filter edge masks accumulate per level; inter prediction is specialised by plane
+  subsampling; reference-MV scans are inlined; deblock calls with empty masks are skipped and
+  strided accesses check their bounds once.
+
+The changes, with per-change instruction counts, are listed in
+[docs/instruction-veins-2026-11-08.md](https://github.com/Remade-With-Rust/rusty-av1-toolkit/blob/main/docs/instruction-veins-2026-11-08.md).
 
 # Building
 

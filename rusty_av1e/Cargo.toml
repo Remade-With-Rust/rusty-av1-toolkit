@@ -1,6 +1,6 @@
 [package]
 name = "rusty_av1e"
-version = "0.8.0"
+version = "0.8.1"
 authors = ["Thomas Daede <tdaede@xiph.org>"]
 edition = "2021"
 rust-version = "1.83.0"
@@ -15,7 +15,7 @@ include = [
   "/src/**",
 ]
 license = "BSD-2-Clause"
-description = "Remade With Rust performance fork of rav1e — pure-Rust AV1 encoder with a no-asm build path (~1.10x faster than stock at byte-identical output)"
+description = "Remade With Rust performance fork of rav1e — pure-Rust AV1 encoder with a no-asm build path; output byte-identical to stock rav1e, only faster (measured speedups in the README)"
 readme = "README.md"
 repository = "https://github.com/Remade-With-Rust/rusty-av1-toolkit"
 keywords = ["av1", "video", "encoder", "codec"]

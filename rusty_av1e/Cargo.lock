@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_av1e"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aligned-vec",
  "aom-sys",

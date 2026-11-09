@@ -13,10 +13,51 @@ against the stock bitstream. The same disciplined, measured primitives seed the 
 AV2 encoder (`rav2e`, rav1e-derived). A separate **experimental** track
 (bitstream-changing, BD-rate-gated) explores speed/size trade-offs behind a flag.
 
+**Status (2026-11-09, 0.8.1):** the default encode is still **byte-identical to stock
+rav1e** and runs **1.08x to 1.18x faster than 0.8.0** single-threaded (paired medians 1.12x
+to 1.16x), after 30 output-identical changes from an instruction-count campaign that cut
+the encoder's instruction count by 20 to 22%. See [Performance in 0.8.1](#performance-in-081).
+
 **Status (2026-07-01):** on branch `opt-entropy`, **~10% faster whole-encode than stock
 rav1e — byte-identical** (real CLI, 7-round interleaved A/B; both binaries emit the exact
 same file, SHA256 `e6c294bb…6ce2d`). Three kept bricks; the coefficient-entropy path
 (48% of encode) profiled to its irreducible serial floor.
+
+## Performance in 0.8.1
+
+Wall time against 0.8.0, single thread (`--threads 1 --tiles 1`):
+
+| Clip | Speed | 0.8.0 | 0.8.1 | Speedup |
+|---|---:|---:|---:|---:|
+| shields 640x360, 10 frames (real video) | 6 (default) | 1.51 s | 1.29 s | **1.18x** |
+| shields 640x360, 10 frames | 2 | 7.00 s | 6.37 s | **1.10x** |
+| testsrc2 640x480, 30 frames (synthetic) | 6 | 4.01 s | 3.71 s | **1.08x** |
+
+<sub>Best of 20 to 30 runs per arm on Linux, one pinned core (`taskset`, `nice -10`), the two
+builds interleaved with the leading arm alternating, same toolchain and allocator. The paired
+medians are 1.16x, 1.12x and 1.14x, and 0.8.1 won every pair (30/30, 20/20, 20/20); a null arm,
+one binary against itself, reads within 1.5%. Both arms write byte-identical files.</sub>
+
+Instruction counts (callgrind) fell 19.9% and 21.7% on the two profiling workloads (shields
+and testsrc2). What changed, all byte-identical:
+
+- **The RDO's rate counter.** The fast-path knobs resolve once per writer instead of per
+  symbol, flat-probability bits inline, and the per-coefficient symbol path is specialised
+  per transform block.
+- **Coefficient coding.** The skip test is reordered, the hot context helpers are inlined, the
+  last coefficient is peeled off the scan, and per-coefficient bounds checks fold by masking.
+- **The loop-restoration search.** Thread-local scratch, plain vector loops instead of
+  `step_by`, and AVX2-compiled twins of two self-guided kernels.
+- **RDO trials.** A skip trial's motion-compensated prediction is reused by the next trial,
+  segments are chosen once per block, the default transform is returned without search setup,
+  quantizers are cached per plane, and empty blocks are not dequantized.
+- **Distortion, motion-search and quantization glue.** Plain loops, inlined kernels, table
+  lookups, and an AVX2-compiled end-of-block search.
+
+Also in 0.8.1: the CLI's default allocator moves to rusty_alloc 2.4, measured neutral against
+2.2, and the debug-build lib tests pass again (555/555). The changes, with per-change
+instruction counts, are listed in
+[docs/instruction-veins-2026-11-08.md](https://github.com/Remade-With-Rust/rusty-av1-toolkit/blob/main/docs/instruction-veins-2026-11-08.md).
 
 ## The ruleset (hard rules)
 
@@ -27,7 +68,7 @@ same file, SHA256 `e6c294bb…6ce2d`). Three kept bricks; the coefficient-entrop
    attempted on an unmeasured target.
 2. **The byte-identical gate is absolute.** A brick may not change one output byte. The
    gate is an **FNV-1a hash of the bitstream** (`688d…95e`, pinned in
-   `tests/profile_encode.rs`) plus the 547-test lib suite; kept bricks are re-validated
+   `tests/profile_encode.rs`) plus the 555-test lib suite; kept bricks are re-validated
    against the stock CLI's SHA256. If the hash moves, it is not a brick — it is a bug or
    an experiment (see rule 5).
 3. **One brick per commit; revert if not faster.** Each change is isolated, measured
@@ -121,7 +162,7 @@ For each measured target, in ROI order:
 3. **OPTIMIZE** — one technique: eliminate-redundancy → vectorize → hand-SIMD/asm. **Inspect
    the emitted asm first** (`--emit asm`) — "the compiler already vectorized it" was *false*
    for B7a-SIMD; the scalar kernel had zero SIMD.
-4. **GATE** — FNV bitstream hash unchanged **and** 547/547 lib tests **and** oracle-equal.
+4. **GATE** — FNV bitstream hash unchanged **and** 555/555 lib tests **and** oracle-equal.
 5. **VERDICT** — interleaved whole-encode A/B if the win is >noise; otherwise the
    non-overlapping stage median. **Revert if it doesn't beat baseline.**
 6. **RECORD** — one row in `docs/entropy-bricks.md` (kept or *do-not-retry*), so the ledger,

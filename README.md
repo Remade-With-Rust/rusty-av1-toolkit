@@ -51,16 +51,39 @@ FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com
 | | Stock rav1e / rav1d | **rusty-av1-toolkit** |
 |---|---|---|
 | Language | Rust | **Rust** (fork + tuned) |
-| Encoder, default (`--racecar off`) | baseline | **~1.10× faster, byte-identical bitstream** |
+| Encoder, default (`--racecar off`) | baseline | **byte-identical bitstream**; ~1.10× faster (2026-07), then **1.08–1.18× faster again in 0.8.1** (2026-11) |
 | Encoder, opt-in (`--racecar on`) | — | **~1.69× faster** (bitstream changes; pair `--tune Psnr`) |
 | Encoder, opt-in (`RAV1E_FAST=fast`) | — | **content-adaptive quality tier** — per-clip dispatches, each gated so declined content stays byte-identical |
-| Decoder | rav1d (safe-Rust dav1d port) | **same, profiled at its performance floor** |
+| Decoder | rav1d (safe-Rust dav1d port) | **bit-exact**; 1.3.0 is **1.03–1.04× faster** (asm build) and **1.07–1.24× faster** (pure-Rust build) than 1.2.1 |
 | Memory safety | encoder mixed · decoder safe-forward | **same** — `unsafe`/asm isolated |
 | License (copyright) | BSD-2 | **BSD-2** — embed freely, no copyleft |
 
-<sub>Encoder speed figures are whole-encode wall-clock vs stock rav1e via real CLI A/B on
-this machine; `--racecar off` is verified byte-identical to stock output. Your
-mileage varies with clip, speed level, and CPU.</sub>
+<sub>The 2026-07 encoder figure is whole-encode wall-clock vs stock rav1e via real CLI A/B on
+this machine; `--racecar off` is verified byte-identical to stock output. The 2026-11 figures
+are single-thread wall time against the previous release, pinned and interleaved (see
+[November 2026](#november-2026-75-instruction-count-wins)). Your mileage varies with clip,
+speed level, and CPU.</sub>
+
+### November 2026: 75 instruction-count wins
+
+A campaign measured on **callgrind instruction counts**, which are exact where a stopwatch on
+this machine is not, took five output-identical wins from each of fifteen hot spots across both
+codecs. Every win kept the encoder's six reference encodes byte-identical, or the decoder's
+md5s and its 792-stream conformance suite intact on both builds. The batch was then timed:
+
+| | Instruction count | Wall time, single thread |
+|---|---:|---|
+| Encoder, 0.8.1 vs 0.8.0 | −20% to −22% | **1.08–1.18× faster**; won every pair |
+| Decoder asm build, 1.3.0 vs 1.2.1 | −3% to −9% | **1.03–1.04× faster** on two of three streams, the third within noise |
+| Decoder pure-Rust build, 1.3.0 vs 1.2.1 | −30% to −43% | **1.07–1.24× faster** |
+
+<sub>Best of 20 to 30 runs per arm on Linux, one pinned core, the two builds interleaved with
+the leading arm alternating, same toolchain and allocator; a null arm (one binary against
+itself) reads within 1.5% for the encoder and about 1% for the decoder. Instruction counts fall
+further than time mostly where the removed work was buffer zeroing. Per-crate tables:
+[rusty_av1e](rusty_av1e/README.md#performance-in-081) ·
+[rusty_av1d](rusty_av1d/README.md#performance-in-130). Every change, with its instruction
+count: [docs/instruction-veins-2026-11-08.md](docs/instruction-veins-2026-11-08.md).</sub>
 
 ### The content-adaptive tier (`RAV1E_FAST=fast`, opt-in)
 
@@ -105,8 +128,8 @@ Two AV1 codecs in Rust, bundled in one repo:
 
 | Dir | Crate | Upstream | What it is |
 |-----|-------|----------|------------|
-| [`rusty_av1e/`](rusty_av1e/) | `rav1e` | [xiph/rav1e](https://github.com/xiph/rav1e) | AV1 **encoder**, performance-tuned fork |
-| [`rusty_av1d/`](rusty_av1d/) | `rav1d` | [memorysafety/rav1d](https://github.com/memorysafety/rav1d) | AV1 **decoder**, safe-Rust fork (dav1d port) |
+| [`rusty_av1e/`](rusty_av1e/) | [`rusty_av1e`](https://crates.io/crates/rusty_av1e) | [xiph/rav1e](https://github.com/xiph/rav1e) | AV1 **encoder**, performance-tuned fork |
+| [`rusty_av1d/`](rusty_av1d/) | [`rusty_av1d`](https://crates.io/crates/rusty_av1d) | [memorysafety/rav1d](https://github.com/memorysafety/rav1d) | AV1 **decoder**, safe-Rust fork (dav1d port) |
 
 The encoder is a fork of **rav1e** focused on encode speed: its hot kernels have
 been reworked so the **default path produces the identical stock bitstream, just
@@ -156,7 +179,7 @@ own directory so its profiles and toolchain apply:
 ```sh
 # Encoder (asm release — needs nasm on PATH):
 cd rusty_av1e && cargo build --release
-./target/release/rav1e input.y4m -o out.ivf                          # byte-identical, ~10% faster
+./target/release/rav1e input.y4m -o out.ivf                          # byte-identical to stock, faster
 ./target/release/rav1e input.y4m -o out.ivf --racecar on --tune Psnr # ~1.7×, bitstream changes
 
 # Decoder:
@@ -167,25 +190,26 @@ cd rusty_av1d && cargo build --release
 **Requirements:** Rust (each crate pins its own toolchain where needed) and `nasm`
 on `PATH` for the SIMD kernels.
 
-### Optional: the pure-Rust allocator (`--features rusty_alloc`)
+### The pure-Rust allocator (`rusty_alloc`, on by default in the CLIs)
 
-Both CLIs can route their allocations through
-[rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the sibling
-pure-Rust mimalloc remake, instead of the platform allocator:
+Both CLIs route their allocations through
+[rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc) 2.4, the sibling
+pure-Rust mimalloc remake, instead of the platform allocator. It is a default feature
+of both CLI packages; build without it to use the platform allocator:
 
 ```sh
-cd rusty_av1e && cargo build --release --features rusty_alloc
-cd rusty_av1d && cargo build --release -p rav1d-cli --features rusty_alloc
+cd rusty_av1e && cargo build --release --no-default-features --features binaries,asm,threading,signal_support,git_version
+cd rusty_av1d && cargo build --release -p rav1d-cli --no-default-features --features asm,asm_arm64_dotprod,asm_arm64_i8mm,bitdepth_8,bitdepth_16
 ```
 
 The `#[global_allocator]` is declared **in the binaries only**. Neither library
 crate — nor the encoder's `capi` cdylib — picks an allocator on behalf of its
 consumers, which is what lets an embedder keep its own. Output is unaffected on
 either allocator, so the conformance gates hold on both arms. Requires a
-toolchain new enough for edition 2024 (rustc ≥ 1.85); the default build keeps the
-crates' declared MSRVs.
+toolchain new enough for edition 2024 (rustc ≥ 1.85); library users who build
+without the default features keep the crates' declared MSRVs.
 
-**Measured** — foreman_cif 300f, `--tiles 8 --threads 16`, ABBA-interleaved,
+**Measured** when the feature was added — foreman_cif 300f, `--tiles 8 --threads 16`, ABBA-interleaved,
 High priority, N=31 pairs, against a null arm (the same binary vs itself):
 
 | arm | median wall ratio | paired | median CPU ratio | cores-busy |
@@ -205,14 +229,18 @@ is expected rather than disappointing, because `MemPool` already recycles the
 frame buffers, so steady-state decoding barely calls the allocator at all. It is
 wired up for symmetry and for the `seek_stress` soak, not for speed.
 
-Both features are **opt-in**, deliberately: turning them on raises the MSRV to
-1.85, and the encoder win is real only in threaded configurations.
+Both CLIs have enabled it by default since August 2026, so building them with the
+default features needs rustc ≥ 1.85. The encoder win is real only in threaded
+configurations. The move from rusty_alloc 2.2 to 2.4 measured neutral, single-threaded,
+on both codecs (paired medians 0.997× to 1.001×).
 
 ## Roadmap
 
 - [x] Fork rav1e → `rusty_av1e`; rework hot kernels; **byte-identical ~1.10× fast path**.
 - [x] `--racecar` modes (`off` byte-identical · `on` tx-domain-rate ~1.69× · `stock` baseline).
 - [x] Fork rav1d → `rusty_av1d`; per-primitive profiling/audit; decodes AV1.
+- [x] November 2026: 75 instruction-count wins across both codecs, all output-identical
+  (encoder 0.8.1, decoder 1.3.0).
 - [ ] Track upstream rav1e / rav1d fixes (remotes wired: `rav1e-upstream`, `rav1d-upstream`).
 - [ ] Publish prebuilt binaries.
 
