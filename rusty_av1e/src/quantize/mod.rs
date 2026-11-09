@@ -354,6 +354,14 @@ impl QuantizationContext {
     // The AC positions in scan order, as a plain slice: the same positions as
     // `scan.iter().take(eob).skip(1)` without the adapters' per-step bookkeeping.
     let ac_scan = scan.get(1..usize::from(eob).min(scan.len())).unwrap_or(&[]);
+    // Every scan has a power-of-two length (the coded transform area) and holds
+    // positions below it, so with both buffers sliced to that length, masking a
+    // position with `n - 1` changes nothing but proves the index in bounds.
+    let n = scan.len();
+    debug_assert!(n.is_power_of_two());
+    let mask = n - 1;
+    let coeffs = &coeffs[..n];
+    let qcoeffs = &mut qcoeffs[..n];
     // prom_av1e014 tried a two-pass split here (precompute both rounding
     // candidates, resolve the level_mode recurrence separately): REFUTED,
     // +39% slower — OoO already hides the 1-bit carried chain, and the
@@ -368,7 +376,7 @@ impl QuantizationContext {
       let ac_quant = self.ac_quant.get() as u32;
       let ac_doffset = self.ac_offset1 - self.ac_offset0;
       for &pos in ac_scan {
-        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+        let coeff = i32::cast_from(coeffs[pos as usize & mask]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
         let level0 = divu_pair(abs_coeff, self.ac_mul_add);
@@ -382,7 +390,7 @@ impl QuantizationContext {
         level_mode =
           if abs_qcoeff == 1 { level_mode } else { (abs_qcoeff > 1) as u32 };
 
-        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+        qcoeffs[pos as usize & mask] = T::cast_from(copysign(abs_qcoeff, coeff));
       }
     } else {
       // Normal mode (--racecar off): the stock rav1e branchy loop, verbatim
@@ -391,7 +399,7 @@ impl QuantizationContext {
       let mut level_mode = 1;
       let ac_quant = self.ac_quant.get() as u32;
       for &pos in ac_scan {
-        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+        let coeff = i32::cast_from(coeffs[pos as usize & mask]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
         let level0 = divu_pair(abs_coeff, self.ac_mul_add);
@@ -409,7 +417,7 @@ impl QuantizationContext {
           level_mode = 1;
         }
 
-        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+        qcoeffs[pos as usize & mask] = T::cast_from(copysign(abs_qcoeff, coeff));
       }
     }
 
