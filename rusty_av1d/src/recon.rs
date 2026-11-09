@@ -39,6 +39,7 @@ use crate::msac::{
     rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bool_equi_bit,
     rav1d_msac_decode_bools,
     rav1d_msac_decode_hi_tok, rav1d_msac_decode_symbol_adapt16, rav1d_msac_decode_symbol_adapt4,
+    rav1d_msac_decode_symbol_adapt4_coef,
     rav1d_msac_decode_symbol_adapt8, MsacContext,
 };
 use crate::picture::Rav1dThreadPicture;
@@ -986,7 +987,7 @@ fn decode_coefs<BD: BitDepth>(
             if tx_class == TxClass::TwoD {
                 y |= x;
             }
-            tok = rav1d_msac_decode_symbol_adapt4(&mut ts_c.msac, &mut lo_cdf[lo_ctx.get()], 3);
+            tok = rav1d_msac_decode_symbol_adapt4_coef(&mut ts_c.msac, &mut lo_cdf[lo_ctx.get()], 3);
             if dbg {
                 println!(
                     "Post-lo_tok[{}][{}][{}][{}={}={}]: r={}",

@@ -391,6 +391,14 @@ pub fn rav1d_msac_decode_subexp(s: &mut MsacContext, r#ref: c_uint, n: c_uint, m
 ///
 /// `n_symbols` is in the range `0..16`, so it is really a `u4`.
 fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
+    symbol_adapt_rust_inline(s, cdf, n_symbols)
+}
+
+/// The body of [`rav1d_msac_decode_symbol_adapt_rust`], always inlined; used
+/// directly only by the coefficient decoder (see
+/// [`rav1d_msac_decode_symbol_adapt4_coef`]).
+#[inline(always)]
+fn symbol_adapt_rust_inline(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
     let c = (s.dif >> (EC_WIN_SIZE - 16)) as c_uint;
     let r = s.rng >> 8;
     let mut u;
@@ -541,6 +549,39 @@ pub fn rav1d_msac_decode_symbol_adapt4(s: &mut MsacContext, cdf: &mut [u16], n_s
             };
         } else {
             ret = rav1d_msac_decode_symbol_adapt_rust(s, cdf, n_symbols);
+        }
+    }
+    debug_assert!(ret < 4);
+    ret as u8 % 4
+}
+
+/// [`rav1d_msac_decode_symbol_adapt4`] for the coefficient token loop. On the
+/// pure-Rust path (no `asm`, and `wasm32`) the decoder body is inlined there,
+/// where 96% of all symbol decodes happen: the call frame goes and the CDF
+/// length and `n_symbols` become constants. Every other site keeps the
+/// out-of-line body, so code size does not grow with it. The asm paths are
+/// unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_symbol_adapt4_coef(
+    s: &mut MsacContext,
+    cdf: &mut [u16],
+    n_symbols: u8,
+) -> u8 {
+    debug_assert!(n_symbols < 4);
+    let ret;
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_symbol_adapt_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_symbol_adapt4_sse2(&mut s.asm, cdf.as_mut_ptr(), n_symbols as usize)
+            };
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_symbol_adapt_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_symbol_adapt4_neon(&mut s.asm, cdf.as_mut_ptr(), n_symbols as usize)
+            };
+        } else {
+            ret = symbol_adapt_rust_inline(s, cdf, n_symbols);
         }
     }
     debug_assert!(ret < 4);
