@@ -190,36 +190,32 @@ impl BlockSize {
   pub fn from_width_and_height_opt(
     w: usize, h: usize,
   ) -> Result<BlockSize, InvalidBlockSize> {
-    match (w, h) {
-      (4, 4) => Ok(BLOCK_4X4),
-      (4, 8) => Ok(BLOCK_4X8),
-      (4, 16) => Ok(BLOCK_4X16),
-      (8, 4) => Ok(BLOCK_8X4),
-      (8, 8) => Ok(BLOCK_8X8),
-      (8, 16) => Ok(BLOCK_8X16),
-      (8, 32) => Ok(BLOCK_8X32),
-      (16, 4) => Ok(BLOCK_16X4),
-      (16, 8) => Ok(BLOCK_16X8),
-      (16, 16) => Ok(BLOCK_16X16),
-      (16, 32) => Ok(BLOCK_16X32),
-      (16, 64) => Ok(BLOCK_16X64),
-      (32, 8) => Ok(BLOCK_32X8),
-      (32, 16) => Ok(BLOCK_32X16),
-      (32, 32) => Ok(BLOCK_32X32),
-      (32, 64) => Ok(BLOCK_32X64),
-      (64, 16) => Ok(BLOCK_64X16),
-      (64, 32) => Ok(BLOCK_64X32),
-      (64, 64) => Ok(BLOCK_64X64),
-      (64, 128) => Ok(BLOCK_64X128),
-      (128, 64) => Ok(BLOCK_128X64),
-      (128, 128) => Ok(BLOCK_128X128),
-      _ => Err(InvalidBlockSize),
+    // Every block size is a pair of powers of two in 4..=128, so a table indexed
+    // by their log2s (2..=7) replaces the 22-arm match; `None` marks the pairs
+    // that are not block sizes, and anything else is rejected before indexing.
+    const N: Option<BlockSize> = None;
+    #[rustfmt::skip]
+    const TABLE: [[Option<BlockSize>; 6]; 6] = [
+      // h:   4                     8                     16                     32                     64                      128
+      [Some(BLOCK_4X4),    Some(BLOCK_4X8),    Some(BLOCK_4X16),   N,                  N,                   N],                    // w 4
+      [Some(BLOCK_8X4),    Some(BLOCK_8X8),    Some(BLOCK_8X16),   Some(BLOCK_8X32),   N,                   N],                    // w 8
+      [Some(BLOCK_16X4),   Some(BLOCK_16X8),   Some(BLOCK_16X16),  Some(BLOCK_16X32),  Some(BLOCK_16X64),   N],                    // w 16
+      [N,                  Some(BLOCK_32X8),   Some(BLOCK_32X16),  Some(BLOCK_32X32),  Some(BLOCK_32X64),   N],                    // w 32
+      [N,                  N,                  Some(BLOCK_64X16),  Some(BLOCK_64X32),  Some(BLOCK_64X64),   Some(BLOCK_64X128)],   // w 64
+      [N,                  N,                  N,                  N,                  Some(BLOCK_128X64),  Some(BLOCK_128X128)],  // w 128
+    ];
+    let valid = |n: usize| n.is_power_of_two() && (4..=128).contains(&n);
+    if !(valid(w) && valid(h)) {
+      return Err(InvalidBlockSize);
     }
+    TABLE[w.trailing_zeros() as usize - 2][h.trailing_zeros() as usize - 2]
+      .ok_or(InvalidBlockSize)
   }
 
   /// # Panics
   ///
   /// - If the given `w` and `h` do not produce a valid block size.
+  #[inline]
   pub fn from_width_and_height(w: usize, h: usize) -> BlockSize {
     Self::from_width_and_height_opt(w, h).unwrap()
   }
