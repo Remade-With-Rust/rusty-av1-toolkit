@@ -2531,7 +2531,7 @@ impl ContextWriter<'_> {
     // when every writer knob is clear (the default configuration), so no
     // per-symbol knob test survives, and with the knob-aware writer otherwise.
     macro_rules! coeff_loop {
-      ($sym:ident) => {
+      ($sym:ident, $may_skip:literal) => {
         let scan_with_ctx =
           scan.iter().copied().zip(coeff_contexts.iter().copied());
         for (c, ((pos, coeff_ctx), v)) in
@@ -2541,7 +2541,7 @@ impl ContextWriter<'_> {
           // (kept: DC, last-eob, and the low-frequency head up to eob/N).
           // `c > fast_hi` first: it is the term that is false on the default
           // path (fast_hi == usize::MAX), so one compare decides it there.
-          if c > fast_hi && c != 0 && c + 1 != usize::from(eob) {
+          if $may_skip && c > fast_hi && c != 0 && c + 1 != usize::from(eob) {
             continue;
           }
           let pos = pos as usize;
@@ -2587,10 +2587,12 @@ impl ContextWriter<'_> {
         }
       };
     }
-    if w.knobs() == 0 {
-      coeff_loop!(symbol_with_update_plain);
+    // The default configuration (no writer knobs, no subsampled costing)
+    // gets a loop with neither knob tests nor the skip test.
+    if w.knobs() == 0 && fast_hi == usize::MAX {
+      coeff_loop!(symbol_with_update_plain, false);
     } else {
-      coeff_loop!(symbol_with_update_hot);
+      coeff_loop!(symbol_with_update_hot, true);
     }
   }
 
