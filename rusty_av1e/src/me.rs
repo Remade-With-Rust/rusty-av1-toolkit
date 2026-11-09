@@ -1384,7 +1384,9 @@ fn subpel_diamond_search<T: Pixel>(
   assert!(!current.is_empty());
 }
 
-#[inline]
+// `always`: the search loops call this per candidate; inlined, the per-block parts
+// (the block-size and SAD function lookups for `w` x `h`) can be hoisted out of them.
+#[inline(always)]
 fn get_fullpel_mv_rd<T: Pixel>(
   fi: &FrameInvariants<T>, po: PlaneOffset, org_region: &PlaneRegion<T>,
   p_ref: &Plane<T>, bit_depth: usize, pmv: [MotionVector; 2], lambda: u32,
