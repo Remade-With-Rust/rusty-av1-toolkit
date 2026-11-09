@@ -5,7 +5,6 @@ use std::mem::MaybeUninit;
 
 use crate::ctypes::ptrdiff_t;
 use parking_lot::RwLock;
-use zerocopy::FromBytes;
 
 use crate::align::{Align16, AlignedVec2, ArrayDefault};
 use crate::ctx::CaseSet;
@@ -458,19 +457,14 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let by4 = by & 31;
 
     let filter_level_yuv = filter_level.0.map(|a| a[0][0]);
-    let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
+    // Each 4-byte level cache unit holds the Y levels in `0..2` and the UV levels in `2..4`.
+    let [y0, y1, uv0, uv1] = filter_level_yuv;
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
-        for _y in 0..bh4 {
-            for x in 0..bw4 {
-                let idx = 4 * (level_cache_off + x);
-                // `0.., ..2` is for Y
-                let lvl = &mut *level_cache.index_mut((idx + 0.., ..2));
-                *u16::mut_from(lvl).unwrap() = filter_level_y;
-            }
-            level_cache_off += b4_stride;
-        }
+        let level_cache_off = by * b4_stride + bx;
+        // `0.., ..2` is for Y
+        let (unit, row) = ((4, bw4), (4 * b4_stride, bh4));
+        level_cache.write_strided(4 * level_cache_off + 0, unit, row, [y0, y1]);
 
         mask_edges_intra(&lflvl.filter_y, by4, bx4, bw4, bh4, ytx, ay, ly);
     }
@@ -498,16 +492,10 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
-    for _y in 0..cbh4 {
-        for x in 0..cbw4 {
-            let idx = 4 * (level_cache_off + x);
-            // `2.., ..2` is for UV
-            let lvl = &mut *level_cache.index_mut((idx + 2.., ..2));
-            *u16::mut_from(lvl).unwrap() = filter_level_uv;
-        }
-        level_cache_off += b4_stride;
-    }
+    let level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    // `2.., ..2` is for UV
+    let (unit, row) = ((4, cbw4), (4 * b4_stride, cbh4));
+    level_cache.write_strided(4 * level_cache_off + 2, unit, row, [uv0, uv1]);
 
     mask_edges_chroma(
         &lflvl.filter_uv,
@@ -557,19 +545,14 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let by4 = by & 31;
 
     let filter_level_yuv = filter_level.0.map(|a| a[r#ref][is_gmv]);
-    let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
+    // Each 4-byte level cache unit holds the Y levels in `0..2` and the UV levels in `2..4`.
+    let [y0, y1, uv0, uv1] = filter_level_yuv;
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
-        for _y in 0..bh4 {
-            for x in 0..bw4 {
-                let idx = 4 * (level_cache_off + x);
-                // `0.., ..2` is for Y
-                let lvl = &mut *level_cache.index_mut((idx + 0.., ..2));
-                *u16::mut_from(lvl).unwrap() = filter_level_y;
-            }
-            level_cache_off += b4_stride;
-        }
+        let level_cache_off = by * b4_stride + bx;
+        // `0.., ..2` is for Y
+        let (unit, row) = ((4, bw4), (4 * b4_stride, bh4));
+        level_cache.write_strided(4 * level_cache_off + 0, unit, row, [y0, y1]);
 
         mask_edges_inter(
             &lflvl.filter_y,
@@ -608,16 +591,10 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
-    for _y in 0..cbh4 {
-        for x in 0..cbw4 {
-            let idx = 4 * (level_cache_off + x);
-            // `2.., ..2` is for UV
-            let lvl = &mut *level_cache.index_mut((idx + 2.., ..2));
-            *u16::mut_from(lvl).unwrap() = filter_level_uv;
-        }
-        level_cache_off += b4_stride;
-    }
+    let level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    // `2.., ..2` is for UV
+    let (unit, row) = ((4, cbw4), (4 * b4_stride, cbh4));
+    level_cache.write_strided(4 * level_cache_off + 2, unit, row, [uv0, uv1]);
 
     mask_edges_chroma(
         &lflvl.filter_uv,

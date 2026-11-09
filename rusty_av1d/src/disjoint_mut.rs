@@ -366,6 +366,85 @@ impl<T: ?Sized + AsMutPtr> DisjointMut<T> {
         let slice = unsafe { &*index.get_mut(self.as_mut_slice()).cast_const() };
         DisjointImmutGuard::new(self, slice, bounds)
     }
+
+    /// Write `val` to the `N` elements at `start + y * row_stride + x * stride`
+    /// for each `y` in `0..rows` and `x` in `0..count`.
+    ///
+    /// Each write is its own disjoint mutable borrow of just those `N` elements,
+    /// as if done by `self.index_mut(o..o + N).copy_from_slice(&val)`,
+    /// so the elements in between (e.g. another interleaved plane)
+    /// may be borrowed elsewhere concurrently.
+    /// In release builds, the bounds of all the writes are checked once
+    /// and the collection's pointer is loaded once,
+    /// whereas per-element [`Self::index_mut`] calls reload both after every store,
+    /// as the store might alias them.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::index_mut`], for each of the `rows * count` written regions.
+    /// This is checked in debug builds, where each write is an [`Self::index_mut`].
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn write_strided<const N: usize>(
+        &self,
+        start: usize,
+        (stride, count): (usize, usize),
+        (row_stride, rows): (usize, usize),
+        val: [<T as AsMutPtr>::Target; N],
+    ) where
+        <T as AsMutPtr>::Target: Copy,
+    {
+        #[cfg(debug_assertions)]
+        for y in 0..rows {
+            for x in 0..count {
+                let o = start + y * row_stride + x * stride;
+                self.index_mut(o..o + N).copy_from_slice(&val);
+            }
+        }
+
+        #[cfg(not(debug_assertions))]
+        if count != 0 && rows != 0 {
+            let slice = self.as_mut_slice();
+            let len = slice.len();
+            let in_bounds = (rows - 1)
+                .checked_mul(row_stride)
+                .zip((count - 1).checked_mul(stride))
+                .and_then(|(y, x)| y.checked_add(x))
+                .and_then(|it| it.checked_add(start))
+                .and_then(|it| it.checked_add(N))
+                .is_some_and(|end| end <= len);
+            if !in_bounds {
+                #[inline(never)]
+                fn out_of_bounds(len: usize) -> ! {
+                    panic!("strided write out of range for slice of length {len}")
+                }
+                out_of_bounds(len);
+            }
+            let data = slice.cast::<<T as AsMutPtr>::Target>();
+            // SAFETY (for each write below): `start + y * row_stride + x * stride + N <= len`
+            // (checked above), so the `N` elements are within the allocation,
+            // and the caller guarantees they are not otherwise borrowed during the write.
+            // `[Target; N]` has the alignment of `Target`, which `data.add(_)` has.
+            let write = |o: usize| unsafe {
+                data.add(o)
+                    .cast::<[<T as AsMutPtr>::Target; N]>()
+                    .write(val)
+            };
+            if count == 1 {
+                // A single column: no inner loop (whose unrolled remainder setup
+                // would otherwise run for every row).
+                for y in 0..rows {
+                    write(start + y * row_stride);
+                }
+            } else {
+                for y in 0..rows {
+                    for x in 0..count {
+                        write(start + y * row_stride + x * stride);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl<T: AsMutPtr<Target = u8>> DisjointMut<T> {
