@@ -153,7 +153,9 @@ const fn divu_pair(x: u32, d: (u32, u32, u32)) -> u32 {
   let a = a as u64;
   let b = b as u64;
 
-  (((a * x + b) >> 32) >> shift) as u32
+  // One shift: `shift` is floor(log2(d)) <= 31 (see `divu_gen`), so `32 + shift`
+  // is always a valid u64 shift and equals shifting by 32 and then by `shift`.
+  ((a * x + b) >> (32 + shift)) as u32
 }
 
 /// The highest scan index (`iscan`) among coefficients at least `deadzone` in
