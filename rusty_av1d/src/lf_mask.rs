@@ -1,5 +1,6 @@
 use std::cmp;
 use std::ffi::c_int;
+use std::iter::zip;
 use std::mem::MaybeUninit;
 
 use crate::ctypes::ptrdiff_t;
@@ -147,6 +148,36 @@ fn decomp_tx(
     };
 }
 
+/// ORs bit `base + i` into `masks[level(i)]` for each `i` in `0..n`,
+/// where each level's mask is stored as two halves split at bit `split`.
+///
+/// One word per level is accumulated in registers and each level's halves are
+/// ORed into `masks` once, rather than a read-modify-write of `masks` per row/column.
+#[inline(always)]
+fn or_edge_masks<const L: usize>(
+    masks: &[[RelaxedAtomic<u16>; 2]; L],
+    base: usize,
+    n: usize,
+    split: u32,
+    mut level: impl FnMut(usize) -> u8,
+) {
+    let mut acc = [0u32; L];
+    for i in 0..n {
+        acc[level(i) as usize] |= 1 << (base + i);
+    }
+    for (masks, acc) in zip(masks, acc) {
+        if acc == 0 {
+            continue;
+        }
+        let halves = [(acc & ((1 << split) - 1)) as u16, (acc >> split) as u16];
+        for (mask, half) in zip(masks, halves) {
+            if half != 0 {
+                mask.update(|it| it | half);
+            }
+        }
+    }
+}
+
 #[inline]
 fn mask_edges_inter(
     masks: &[[[[RelaxedAtomic<u16>; 2]; 3]; 32]; 2],
@@ -179,24 +210,18 @@ fn mask_edges_inter(
     // * `txa[1][1][y][0..w4]` where `y` is the start of a block edge
 
     // left block edge
-    for y in 0..h4 {
-        let mask = 1u32 << (by4 + y);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
+    or_edge_masks(&masks[0][bx4], by4, h4, 16, |y| {
         // SAFETY: y < h4 so txa[0][0][y][0] is initialized.
         let txa_y = unsafe { txa[0][0][y][0].assume_init() };
-        masks[0][bx4][cmp::min(txa_y, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+        cmp::min(txa_y, l[y])
+    });
 
     // top block edge
-    for x in 0..w4 {
-        let mask = 1u32 << (bx4 + x);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
+    or_edge_masks(&masks[1][by4], bx4, w4, 16, |x| {
         // SAFETY: x < h4 so txa[1][0][0][x] is initialized.
         let txa_x = unsafe { txa[1][0][0][x].assume_init() };
-        masks[1][by4][cmp::min(txa_x, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+        cmp::min(txa_x, a[x])
+    });
     if !skip {
         // inner (tx) left|right edges
         for y in 0..h4 {
