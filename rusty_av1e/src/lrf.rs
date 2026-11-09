@@ -874,6 +874,35 @@ fn sgrproj_stripe_filter_with<T: Pixel, U: Pixel>(
         }
       }
 
+      /// `apply_filter` compiled with AVX2 enabled, where LLVM vectorizes its
+      /// 32-bit multiplies (`vpmulld`, absent from the x86-64 baseline).
+      #[cfg(nasm_x86_64)]
+      #[target_feature(enable = "avx2")]
+      unsafe fn apply_filter_avx2<U: Pixel>(
+        out: &mut [U], line: &[U], f_r1: &[u32], f_r2_ab: &[u32],
+        stripe_w: usize, bit_depth: usize, w0: i32, w1: i32, w2: i32,
+      ) {
+        apply_filter(out, line, f_r1, f_r2_ab, stripe_w, bit_depth, w0, w1, w2)
+      }
+
+      #[cfg(nasm_x86_64)]
+      if fi.cpu_feature_level >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+        // SAFETY: AVX2 is available, checked just above.
+        unsafe {
+          apply_filter_avx2(
+            &mut out[y],
+            line,
+            &*f_r1,
+            f_r2_ab[dy],
+            stripe_w,
+            fi.sequence.bit_depth,
+            w0,
+            w1,
+            w2,
+          )
+        };
+        continue;
+      }
       apply_filter(
         &mut out[y],
         line,
