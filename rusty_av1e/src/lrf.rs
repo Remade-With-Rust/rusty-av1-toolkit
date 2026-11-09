@@ -478,53 +478,68 @@ impl<'a, T: Pixel> Iterator for VertPaddedIter<'a, T> {
 impl<T: Pixel> ExactSizeIterator for VertPaddedIter<'_, T> {}
 impl<T: Pixel> FusedIterator for VertPaddedIter<'_, T> {}
 
-struct HorzPaddedIter<'a, T: Pixel> {
-  // Active area cropping is done using the length of the slice
-  slice: &'a [T],
-  // x index of the iterator
-  // When less than 0, repeat the first element. When greater than end, repeat
-  // the last element
-  index: isize,
-  // The index at which to terminate. Can be larger than the slice length.
-  end: usize,
-}
+/// The row above the first row of the integral images.
+static INTEGRAL_ZEROS: [u32; 4 + IMAGE_WIDTH_MAX + 3] = [0; 4 + IMAGE_WIDTH_MAX + 3];
 
-impl<'a, T: Pixel> HorzPaddedIter<'a, T> {
-  fn new(
-    slice: &'a [T], start_index: isize, width: usize,
-  ) -> HorzPaddedIter<'a, T> {
-    HorzPaddedIter {
-      slice,
-      index: start_index,
-      end: (width as isize + start_index) as usize,
-    }
+/// One row of the integral images: the running sums (and sums of squares) of
+/// the row padded to `width` elements, `row[clamp(start_index_x + j, 0, len - 1)]`,
+/// each added to the row above.
+///
+/// The padded row is a run of the first element, the row itself, then a run of
+/// the last element, so it is walked as those three runs over pre-sliced rows,
+/// rather than clamping the index of every element.
+#[inline(always)]
+fn integral_image_row<T: Pixel>(
+  row: &[T], start_index_x: isize, width: usize, above: &[u32],
+  sq_above: &[u32], out: &mut [u32], sq_out: &mut [u32],
+) {
+  let len = row.len() as isize;
+  let pad_l = (-start_index_x).clamp(0, width as isize) as usize;
+  let mid_end = (len - start_index_x).clamp(pad_l as isize, width as isize) as usize;
+  let mid = &row[(start_index_x + pad_l as isize) as usize..][..mid_end - pad_l];
+  let first = u32::cast_from(row[0]);
+  let last = u32::cast_from(row[row.len() - 1]);
+
+  let (above, sq_above) = (&above[..width], &sq_above[..width]);
+  let (out, sq_out) = (&mut out[..width], &mut sq_out[..width]);
+  let (out_l, out_rest) = out.split_at_mut(pad_l);
+  let (out_m, out_r) = out_rest.split_at_mut(mid_end - pad_l);
+  let (sq_out_l, sq_out_rest) = sq_out.split_at_mut(pad_l);
+  let (sq_out_m, sq_out_r) = sq_out_rest.split_at_mut(mid_end - pad_l);
+
+  let mut sum: u32 = 0;
+  let mut sq_sum: u32 = 0;
+  // Wrap adds to prevent undefined behaviour on overflow. Overflow is
+  // cancelled out when calculating the sum of a region.
+  let mut step =
+    |current: u32, above: &u32, sq_above: &u32, out: &mut u32, sq_out: &mut u32| {
+      sum = sum.wrapping_add(current);
+      *out = sum.wrapping_add(*above);
+      sq_sum = sq_sum.wrapping_add(current * current);
+      *sq_out = sq_sum.wrapping_add(*sq_above);
+    };
+  for ((a, sa), (o, so)) in above[..pad_l]
+    .iter()
+    .zip(&sq_above[..pad_l])
+    .zip(out_l.iter_mut().zip(sq_out_l.iter_mut()))
+  {
+    step(first, a, sa, o, so);
+  }
+  for ((&v, (a, sa)), (o, so)) in mid
+    .iter()
+    .zip(above[pad_l..mid_end].iter().zip(&sq_above[pad_l..mid_end]))
+    .zip(out_m.iter_mut().zip(sq_out_m.iter_mut()))
+  {
+    step(u32::cast_from(v), a, sa, o, so);
+  }
+  for ((a, sa), (o, so)) in above[mid_end..]
+    .iter()
+    .zip(&sq_above[mid_end..])
+    .zip(out_r.iter_mut().zip(sq_out_r.iter_mut()))
+  {
+    step(last, a, sa, o, so);
   }
 }
-
-impl<'a, T: Pixel> Iterator for HorzPaddedIter<'a, T> {
-  type Item = &'a T;
-
-  #[inline(always)]
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.index < self.end as isize {
-      // clamp to the edges of the frame
-      let x = clamp(self.index, 0, self.slice.len() as isize - 1) as usize;
-      self.index += 1;
-      Some(&self.slice[x])
-    } else {
-      None
-    }
-  }
-
-  #[inline(always)]
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    let size: usize = (self.end as isize - self.index) as usize;
-    (size, Some(size))
-  }
-}
-
-impl<T: Pixel> ExactSizeIterator for HorzPaddedIter<'_, T> {}
-impl<T: Pixel> FusedIterator for HorzPaddedIter<'_, T> {}
 
 #[profiling::function]
 pub fn setup_integral_image<T: Pixel>(
@@ -559,41 +574,28 @@ pub fn setup_integral_image<T: Pixel>(
     stripe_h + (stripe_h & 1),
     crop_h,
   )
-  .map(|row: &[T]| {
-    HorzPaddedIter::new(
-      // Limit how many unique elements we use
-      &row[..row_uniques],
-      start_index_x,
-      left_w + stripe_w + right_w,
-    )
-  });
+  // Limit how many unique elements we use
+  .map(|row: &[T]| &row[..row_uniques]);
+  let width = left_w + stripe_w + right_w;
 
-  // Setup the first row
+  // Setup the first row (the row above it is all zeros)
   {
-    let mut sum: u32 = 0;
-    let mut sq_sum: u32 = 0;
     // Remove the first row and use it outside of the main loop
     let row = rows_iter.next().unwrap();
-    for (src, (integral, sq_integral)) in
-      row.zip(integral_image.iter_mut().zip(sq_integral_image.iter_mut()))
-    {
-      let current = u32::cast_from(*src);
-
-      // Wrap adds to prevent undefined behaviour on overflow. Overflow is
-      // cancelled out when calculating the sum of a region.
-      sum = sum.wrapping_add(current);
-      *integral = sum;
-      sq_sum = sq_sum.wrapping_add(current * current);
-      *sq_integral = sq_sum;
-    }
+    integral_image_row(
+      row,
+      start_index_x,
+      width,
+      &INTEGRAL_ZEROS,
+      &INTEGRAL_ZEROS,
+      integral_image,
+      sq_integral_image,
+    );
   }
   // Calculate all other rows
   let mut integral_slice = &mut integral_image[..];
   let mut sq_integral_slice = &mut sq_integral_image[..];
   for row in rows_iter {
-    let mut sum: u32 = 0;
-    let mut sq_sum: u32 = 0;
-
     // Split the data between the previous row and future rows.
     // This allows us to mutate the current row while accessing the
     // previous row.
@@ -601,23 +603,15 @@ pub fn setup_integral_image<T: Pixel>(
       integral_slice.split_at_mut(integral_image_stride);
     let (sq_integral_row_prev, sq_integral_row) =
       sq_integral_slice.split_at_mut(integral_image_stride);
-    for (
-      src,
-      ((integral_above, sq_integral_above), (integral, sq_integral)),
-    ) in row.zip(
-      integral_row_prev
-        .iter()
-        .zip(sq_integral_row_prev.iter())
-        .zip(integral_row.iter_mut().zip(sq_integral_row.iter_mut())),
-    ) {
-      let current = u32::cast_from(*src);
-      // Wrap adds to prevent undefined behaviour on overflow. Overflow is
-      // cancelled out when calculating the sum of a region.
-      sum = sum.wrapping_add(current);
-      *integral = sum.wrapping_add(*integral_above);
-      sq_sum = sq_sum.wrapping_add(current * current);
-      *sq_integral = sq_sum.wrapping_add(*sq_integral_above);
-    }
+    integral_image_row(
+      row,
+      start_index_x,
+      width,
+      integral_row_prev,
+      sq_integral_row_prev,
+      integral_row,
+      sq_integral_row,
+    );
 
     // The current row also contains all future rows. Replacing the slice with
     // it moves down a row.
