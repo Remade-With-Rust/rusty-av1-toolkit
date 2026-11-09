@@ -2539,7 +2539,9 @@ impl ContextWriter<'_> {
         {
           // Skip the base/range cost of the high-frequency middle coefficients
           // (kept: DC, last-eob, and the low-frequency head up to eob/N).
-          if c != 0 && c + 1 != usize::from(eob) && c > fast_hi {
+          // `c > fast_hi` first: it is the term that is false on the default
+          // path (fast_hi == usize::MAX), so one compare decides it there.
+          if c > fast_hi && c != 0 && c + 1 != usize::from(eob) {
             continue;
           }
           let pos = pos as usize;
