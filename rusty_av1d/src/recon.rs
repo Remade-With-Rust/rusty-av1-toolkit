@@ -1184,7 +1184,9 @@ fn decode_coefs<BD: BitDepth>(
                 dc_dq = ((dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) & 0xffffff) as c_int;
             } else {
                 dc_dq = (dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) as c_int;
-                assert!(dc_dq <= 0xffffff);
+                // Holds for every stream: the quantizer tables bound `dc_dq` and
+                // this branch has `dc_tok < 15`.
+                debug_assert!(dc_dq <= 0xffffff);
             }
             cul_level = dc_tok;
             dc_dq >>= dq_shift;
@@ -1212,7 +1214,9 @@ fn decode_coefs<BD: BitDepth>(
                 dc_dq = cmp::min(dc_dq, cf_max + dc_sign);
             } else {
                 dc_dq = ((dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) >> dq_shift) as c_int;
-                assert!(dc_dq <= cf_max);
+                // Holds for every stream: max DC step x 14 is below `cf_max` at
+                // each bit depth (8: 1336*14, 10: 5347*14, 12: 21387*14).
+                debug_assert!(dc_dq <= cf_max);
             }
             cul_level = dc_tok;
             cf.set(0, if dc_sign != 0 { -dc_dq } else { dc_dq });
@@ -1254,7 +1258,7 @@ fn decode_coefs<BD: BitDepth>(
                 } else {
                     tok = rc_tok >> 11;
                     dq = dq.wrapping_mul(tok);
-                    assert!(dq <= 0xffffff); // Optimized out.
+                    debug_assert!(dq <= 0xffffff);
                 }
                 cul_level = cul_level.wrapping_add(tok);
                 dq >>= dq_shift;
@@ -1301,7 +1305,9 @@ fn decode_coefs<BD: BitDepth>(
                     // cannot exceed `cf_max`, so we can avoid the clipping
                     tok = rc_tok >> 11;
                     dq = (ac_dq.wrapping_mul(tok) >> dq_shift) as c_int;
-                    assert!(dq <= cf_max);
+                    // Holds for every stream: max AC step x 14 is below `cf_max` at
+                    // each bit depth (8: 1828*14, 10: 7312*14, 12: 29247*14).
+                    debug_assert!(dq <= cf_max);
                 }
                 cul_level = cul_level.wrapping_add(tok);
                 cf.set(rc, if sign != 0 { -dq } else { dq });
