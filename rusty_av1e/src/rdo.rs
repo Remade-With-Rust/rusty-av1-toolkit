@@ -763,6 +763,7 @@ pub fn compute_rd_cost<T: Pixel>(
 /// `pred_in_rec` is cleared if the transform type search runs, because its
 /// trials overwrite the block in the reconstruction (see
 /// [`encode_block_post_cdef`]).
+#[inline]
 pub fn rdo_tx_size_type<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
@@ -777,14 +778,49 @@ pub fn rdo_tx_size_type<T: Pixel>(
     tx_size = sub_tx_size_map[tx_size as usize]; // Always choose one level split size
   }
 
-  let mut best_tx_type = TxType::DCT_DCT;
-  let mut best_tx_size = tx_size;
-  let mut best_rd = f64::MAX;
-
   // prom_av1e041: the DEEP dispatch unlocks transform RDO. tx-SIZE RDO stays
   // intra (inter uses the sub_tx_size default); tx-TYPE RDO (ADST/DCT selection)
   // is unlocked for INTER too — the SVT busy-content lever we lacked.
   let deep = crate::encoder::deep::active();
+  // When neither search can run, the answer is the default transform at this
+  // size, without the search setup: the size search is intra only, and the
+  // type search needs the deep dispatch for inter and never runs for skip.
+  // This is every inter trial outside the deep dispatch.
+  if !(fi.config.speed_settings.transform.rdo_tx_decision || deep)
+    || (is_inter && (!deep || skip))
+  {
+    return (tx_size, TxType::DCT_DCT);
+  }
+  rdo_tx_size_type_search(
+    fi,
+    ts,
+    cw,
+    bsize,
+    tile_bo,
+    luma_mode,
+    ref_frames,
+    mvs,
+    skip,
+    pred_in_rec,
+    tx_size,
+    deep,
+  )
+}
+
+/// The transform size and type searches of [`rdo_tx_size_type`], starting
+/// from the block's largest transform, `tx_size`.
+#[inline(never)]
+fn rdo_tx_size_type_search<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
+  luma_mode: PredictionMode, ref_frames: [RefType; 2], mvs: [MotionVector; 2],
+  skip: bool, pred_in_rec: &mut bool, mut tx_size: TxSize, deep: bool,
+) -> (TxSize, TxType) {
+  let is_inter = !luma_mode.is_intra();
+  let mut best_tx_type = TxType::DCT_DCT;
+  let mut best_tx_size = tx_size;
+  let mut best_rd = f64::MAX;
+
   let do_rdo_tx_size = fi.tx_mode_select
     && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
     && !is_inter;
