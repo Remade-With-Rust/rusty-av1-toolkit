@@ -460,6 +460,9 @@ pub struct Rav1dRefmvsDSPContext {
     pub splat_mv: splat_mv::Fn,
 }
 
+// `always`: ~155K calls per 60 inter frames at ~36 instructions, a third of it call
+// overhead (8 args, 2 on the stack); inlined, intra neighbours also skip the call.
+#[inline(always)]
 fn add_spatial_candidate(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
