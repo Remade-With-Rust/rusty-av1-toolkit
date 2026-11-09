@@ -37,8 +37,6 @@
 //! * is far simpler than the `case_set*` implementation, consisting of a `match` and array writes
 //!
 //! [`BlockContext`]: crate::env::BlockContext
-use std::iter::zip;
-
 use crate::disjoint_mut::{AsMutPtr, DisjointMut};
 
 #[inline(always)]
@@ -190,24 +188,32 @@ impl<const UP_TO: usize, const WITH_DEFAULT: bool> CaseSet<UP_TO, WITH_DEFAULT> 
         set_ctx(&CaseSetter { offset, len, width }, ctx);
     }
 
-    /// Perform many case sets in one call.
+    /// Perform the case sets for both directions (left and above) in one call.
     ///
     /// This allows specifying the `set_ctx` closure inline easily,
     /// and also allows you to group the same args together.
     ///
-    /// The `lens`, `offsets`, and `dirs` are zipped and passed to [`CaseSet::one`],
+    /// The `lens`, `offsets`, and `dirs` are paired up and passed to [`CaseSet::one`],
     /// where `dirs` can be an array of any type and whose elements are passed back to the `set_ctx` closure.
+    ///
+    /// A loop rather than two calls, so the closure is inlined once (two copies are
+    /// too big and stop being inlined). Each direction's arguments are selected rather
+    /// than indexed, so they stay in registers instead of being spilled to the stack
+    /// as zipped array iterators.
     #[inline]
-    pub fn many<T, F, const N: usize>(
-        dirs: [T; N],
-        lens: [usize; N],
-        offsets: [usize; N],
-        mut set_ctx: F,
-    ) where
+    pub fn many<T, F>(dirs: [T; 2], lens: [usize; 2], offsets: [usize; 2], mut set_ctx: F)
+    where
         F: FnMut(&CaseSetter<UP_TO, WITH_DEFAULT>, T),
     {
-        for (dir, (len, offset)) in zip(dirs, zip(lens, offsets)) {
-            Self::one(dir, len, offset, &mut set_ctx);
+        let [dir0, dir1] = dirs;
+        let mut next = Some(dir1);
+        let mut args = (dir0, lens[0], offsets[0]);
+        loop {
+            Self::one(args.0, args.1, args.2, &mut set_ctx);
+            match next.take() {
+                Some(dir1) => args = (dir1, lens[1], offsets[1]),
+                None => break,
+            }
         }
     }
 }
