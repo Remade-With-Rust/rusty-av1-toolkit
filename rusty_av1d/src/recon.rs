@@ -1788,11 +1788,12 @@ enum MaybeTempPixels<'a, TmpStride> {
 
 /// Calls [`mc`] specialized for plane `pl`'s subsampling.
 #[inline(always)]
-fn mc_pl<BD: BitDepth>(
+fn mc_pl<BD: BitDepth, const PAIR: bool>(
     f: &Rav1dFrameData,
     emu_edge: &mut ScratchEmuEdge,
     b: Bxy,
     dst: MaybeTempPixels<()>,
+    dst2: Option<Rav1dPictureDataComponentOffset>,
     bw4: c_int,
     bh4: c_int,
     bx: c_int,
@@ -1804,25 +1805,30 @@ fn mc_pl<BD: BitDepth>(
     filter_2d: Filter2d,
 ) -> Result<(), ()> {
     match (pl != 0, f.cur.p.layout) {
-        (true, Rav1dPixelLayout::I420) => mc::<BD, true, true>(
-            f, emu_edge, b, dst, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        (true, Rav1dPixelLayout::I420) => mc::<BD, true, true, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
         ),
-        (true, Rav1dPixelLayout::I422) => mc::<BD, true, false>(
-            f, emu_edge, b, dst, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        (true, Rav1dPixelLayout::I422) => mc::<BD, true, false, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
         ),
-        _ => mc::<BD, false, false>(
-            f, emu_edge, b, dst, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        _ => mc::<BD, false, false, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
         ),
     }
 }
 
 /// `SS_HOR`/`SS_VER` are plane `pl`'s subsampling (see [`mc_pl`]), made constant so
 /// the subsampled geometry folds; luma call sites use [`mc`]`::<BD, false, false>`.
-fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool>(
+///
+/// With `PAIR`, `dst2` (if any) is plane `pl + 1`, sharing the subsampling and so the
+/// reference geometry (the two chroma planes of a block are predicted in one call).
+/// Without it, `dst2` is unused and the second-plane code compiles away.
+fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool, const PAIR: bool>(
     f: &Rav1dFrameData,
     emu_edge: &mut ScratchEmuEdge,
     b: Bxy,
     dst: MaybeTempPixels<()>,
+    dst2: Option<Rav1dPictureDataComponentOffset>,
     bw4: c_int,
     bh4: c_int,
     bx: c_int,
@@ -1861,44 +1867,54 @@ fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool>(
             w = f.bw * 4 >> ss_hor;
             h = f.bh * 4 >> ss_ver;
         }
-        let r#ref = if dx < (mx != 0) as c_int * 3
-            || dy < (my != 0) as c_int * 3
-            || dx + bw4 * h_mul + (mx != 0) as c_int * 4 > w
-            || dy + bh4 * v_mul + (my != 0) as c_int * 4 > h
-        {
-            let emu_edge_buf = emu_edge.buf_mut::<BD>();
-            f.dsp.mc.emu_edge.call::<BD>(
-                (bw4 * h_mul + (mx != 0) as c_int * 7) as intptr_t,
-                (bh4 * v_mul + (my != 0) as c_int * 7) as intptr_t,
-                w as intptr_t,
-                h as intptr_t,
-                (dx - (mx != 0) as c_int * 3) as intptr_t,
-                (dy - (my != 0) as c_int * 3) as intptr_t,
-                emu_edge_buf,
-                192,
-                &ref_data[pl],
-            );
-            let stride = 192;
-            Rav1dPictureDataComponentOffset {
-                data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
-                offset: stride * (my != 0) as usize * 3 + (mx != 0) as usize * 3,
-            }
-        } else {
-            let r#ref = &ref_data[pl];
-            r#ref.with_offset::<BD>() + (dy as isize * r#ref.pixel_stride::<BD>()) + dx as usize
-        };
+        macro_rules! plane {
+            ($dst:expr, $pl:expr) => {{
+                let (dst, pl) = ($dst, $pl);
+                let r#ref = if dx < (mx != 0) as c_int * 3
+                    || dy < (my != 0) as c_int * 3
+                    || dx + bw4 * h_mul + (mx != 0) as c_int * 4 > w
+                    || dy + bh4 * v_mul + (my != 0) as c_int * 4 > h
+                {
+                    let emu_edge_buf = emu_edge.buf_mut::<BD>();
+                    f.dsp.mc.emu_edge.call::<BD>(
+                        (bw4 * h_mul + (mx != 0) as c_int * 7) as intptr_t,
+                        (bh4 * v_mul + (my != 0) as c_int * 7) as intptr_t,
+                        w as intptr_t,
+                        h as intptr_t,
+                        (dx - (mx != 0) as c_int * 3) as intptr_t,
+                        (dy - (my != 0) as c_int * 3) as intptr_t,
+                        emu_edge_buf,
+                        192,
+                        &ref_data[pl],
+                    );
+                    let stride = 192;
+                    Rav1dPictureDataComponentOffset {
+                        data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
+                        offset: stride * (my != 0) as usize * 3 + (mx != 0) as usize * 3,
+                    }
+                } else {
+                    let r#ref = &ref_data[pl];
+                    r#ref.with_offset::<BD>() + (dy as isize * r#ref.pixel_stride::<BD>()) + dx as usize
+                };
 
-        let w = bw4 * h_mul;
-        let h = bh4 * v_mul;
-        let mx = mx << (ss_hor == 0) as u8;
-        let my = my << (ss_ver == 0) as u8;
-        match dst {
-            MaybeTempPixels::NonTemp { dst } => {
-                f.dsp.mc.mc[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, bd);
-            }
-            MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
-                f.dsp.mc.mct[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, bd);
-            }
+                let w = bw4 * h_mul;
+                let h = bh4 * v_mul;
+                let mx = mx << (ss_hor == 0) as u8;
+                let my = my << (ss_ver == 0) as u8;
+                match dst {
+                    MaybeTempPixels::NonTemp { dst } => {
+                        f.dsp.mc.mc[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, bd);
+                    }
+                    MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
+                        f.dsp.mc.mct[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, bd);
+                    }
+                }
+            }};
+        }
+        plane!(dst, pl);
+        if let (true, Some(dst)) = (PAIR, dst2) {
+            let dst: MaybeTempPixels<()> = MaybeTempPixels::NonTemp { dst };
+            plane!(dst, pl + 1);
         }
     } else {
         assert!(!ptr::eq(refp, &f.sr_cur));
@@ -1935,45 +1951,55 @@ fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool>(
 
         let w = refp.p.p.w + ss_hor >> ss_hor;
         let h = refp.p.p.h + ss_ver >> ss_ver;
-        let r#ref = if left < 3 || top < 3 || right + 4 > w || bottom + 4 > h {
-            let emu_edge_buf = emu_edge.buf_mut::<BD>();
-            f.dsp.mc.emu_edge.call::<BD>(
-                (right - left + 7) as intptr_t,
-                (bottom - top + 7) as intptr_t,
-                w as intptr_t,
-                h as intptr_t,
-                (left - 3) as intptr_t,
-                (top - 3) as intptr_t,
-                emu_edge_buf,
-                320,
-                &ref_data[pl],
-            );
-            if debug_block_info!(f, b) {
-                println!("Emu");
-            }
-            let stride = 320;
-            Rav1dPictureDataComponentOffset {
-                data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
-                offset: stride * 3 + 3,
-            }
-        } else {
-            let r#ref = &ref_data[pl];
-            r#ref.with_offset::<BD>() + (top as isize * r#ref.pixel_stride::<BD>()) + left as isize
-        };
+        macro_rules! plane {
+            ($dst:expr, $pl:expr) => {{
+                let (dst, pl) = ($dst, $pl);
+                let r#ref = if left < 3 || top < 3 || right + 4 > w || bottom + 4 > h {
+                    let emu_edge_buf = emu_edge.buf_mut::<BD>();
+                    f.dsp.mc.emu_edge.call::<BD>(
+                        (right - left + 7) as intptr_t,
+                        (bottom - top + 7) as intptr_t,
+                        w as intptr_t,
+                        h as intptr_t,
+                        (left - 3) as intptr_t,
+                        (top - 3) as intptr_t,
+                        emu_edge_buf,
+                        320,
+                        &ref_data[pl],
+                    );
+                    if debug_block_info!(f, b) {
+                        println!("Emu");
+                    }
+                    let stride = 320;
+                    Rav1dPictureDataComponentOffset {
+                        data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
+                        offset: stride * 3 + 3,
+                    }
+                } else {
+                    let r#ref = &ref_data[pl];
+                    r#ref.with_offset::<BD>() + (top as isize * r#ref.pixel_stride::<BD>()) + left as isize
+                };
 
-        let w = bw4 * h_mul;
-        let h = bh4 * v_mul;
-        let mx = pos_x & 0x3ff;
-        let my = pos_y & 0x3ff;
-        let dx = f.svc[refidx][0].step;
-        let dy = f.svc[refidx][1].step;
-        match dst {
-            MaybeTempPixels::NonTemp { dst } => {
-                f.dsp.mc.mc_scaled[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, dx, dy, bd);
-            }
-            MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
-                f.dsp.mc.mct_scaled[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, dx, dy, bd);
-            }
+                let w = bw4 * h_mul;
+                let h = bh4 * v_mul;
+                let mx = pos_x & 0x3ff;
+                let my = pos_y & 0x3ff;
+                let dx = f.svc[refidx][0].step;
+                let dy = f.svc[refidx][1].step;
+                match dst {
+                    MaybeTempPixels::NonTemp { dst } => {
+                        f.dsp.mc.mc_scaled[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, dx, dy, bd);
+                    }
+                    MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
+                        f.dsp.mc.mct_scaled[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, dx, dy, bd);
+                    }
+                }
+            }};
+        }
+        plane!(dst, pl);
+        if let (true, Some(dst)) = (PAIR, dst2) {
+            let dst: MaybeTempPixels<()> = MaybeTempPixels::NonTemp { dst };
+            plane!(dst, pl + 1);
         }
     }
 
@@ -2015,7 +2041,7 @@ fn obmc<BD: BitDepth>(
             if a_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(step4, b_dim[0]);
                 let oh4 = cmp::min(b_dim[1], 16) >> 1;
-                mc_pl::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2028,6 +2054,7 @@ fn obmc<BD: BitDepth>(
                             offset: 0,
                         },
                     },
+                    None,
                     ow4 as c_int,
                     oh4 as c_int * 3 + 3 >> 2,
                     t.b.x + x,
@@ -2063,7 +2090,7 @@ fn obmc<BD: BitDepth>(
             if l_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(b_dim[0], 16) >> 1;
                 let oh4 = cmp::min(step4, b_dim[1]);
-                mc_pl::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2076,6 +2103,7 @@ fn obmc<BD: BitDepth>(
                             offset: 0,
                         },
                     },
+                    None,
                     ow4 as c_int,
                     oh4 as c_int,
                     t.b.x,
@@ -2924,11 +2952,12 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         // intrabc
         assert!(!frame_hdr.size.super_res.enabled);
         let scratch = t.scratch.inter_mut();
-        mc::<BD, false, false>(
+        mc::<BD, false, false, false>(
             f,
             &mut scratch.emu_edge,
             t.b,
             MaybeTempPixels::NonTemp { dst: y_dst },
+            None,
             bw4,
             bh4,
             t.b.x,
@@ -2941,13 +2970,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         )?;
         if has_chroma {
             for pl in 1..3 {
-                mc_pl::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
                     MaybeTempPixels::NonTemp {
                         dst: cur_data[pl].with_offset::<BD>() + uvdstoff,
                     },
+                    None,
                     bw4 << (bw4 == ss_hor) as c_int,
                     bh4 << (bh4 == ss_ver) as c_int,
                     t.b.x & !ss_hor,
@@ -2989,7 +3019,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     &frame_hdr.gmv[inter.r#ref[i] as usize],
                 )?;
             } else {
-                mc::<BD, false, false>(
+                mc::<BD, false, false, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2997,6 +3027,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         tmp: &mut tmp[i],
                         tmp_stride: (),
                     },
+                    None,
                     bw4,
                     bh4,
                     t.b.x,
@@ -3086,7 +3117,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                             &frame_hdr.gmv[inter.r#ref[i] as usize],
                         )?;
                     } else {
-                        mc_pl::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut scratch.emu_edge,
                             t.b,
@@ -3094,6 +3125,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                                 tmp: &mut tmp[i],
                                 tmp_stride: (),
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x,
@@ -3168,11 +3200,12 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 },
             )?;
         } else {
-            mc::<BD, false, false>(
+            mc::<BD, false, false, false>(
                 f,
                 &mut t.scratch.inter_mut().emu_edge,
                 t.b,
                 MaybeTempPixels::NonTemp { dst: y_dst },
+                None,
                 bw4,
                 bh4,
                 t.b.x,
@@ -3279,13 +3312,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 if bw4 == 1 && bh4 == ss_ver {
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize - 1);
-                        mc_pl::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x - 1,
@@ -3318,13 +3352,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*t.l.filter[0].index(by4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[1] + t.b.x as usize - 1);
-                        mc_pl::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + v_off,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x - 1,
@@ -3354,13 +3389,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*f.a[t.a].filter[0].index(bx4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize);
-                        mc_pl::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + h_off,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x,
@@ -3386,13 +3422,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     v_off = 2 * BD::pxstride(f.cur.stride[1]);
                 }
                 for pl in 0..2 {
-                    mc_pl::<BD>(
+                    mc_pl::<BD, false>(
                         f,
                         &mut t.scratch.inter_mut().emu_edge,
                         t.b,
                         MaybeTempPixels::NonTemp {
                             dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + h_off + v_off,
                         },
+                        None,
                         bw4,
                         bh4,
                         t.b.x,
@@ -3430,27 +3467,28 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         )?;
                     }
                 } else {
-                    for pl in 0..2 {
-                        mc_pl::<BD>(
-                            f,
-                            &mut t.scratch.inter_mut().emu_edge,
-                            t.b,
-                            MaybeTempPixels::NonTemp {
-                                dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff,
-                            },
-                            bw4 << (bw4 == ss_hor) as c_int,
-                            bh4 << (bh4 == ss_ver) as c_int,
-                            t.b.x & !ss_hor,
-                            t.b.y & !ss_ver,
-                            1 + pl,
-                            inter.nd.one_d.mv[0],
-                            refp,
-                            inter.r#ref[0] as usize,
-                            filter_2d,
-                        )?;
-                        let uv_dst = cur_data[1 + pl].with_offset::<BD>() + uvdstoff;
-                        if inter.motion_mode == MotionMode::Obmc {
-                            obmc::<BD>(f, t, uv_dst, b_dim, 1 + pl, bx4, by4, w4, h4)?;
+                    let uv_dst = |pl: usize| cur_data[1 + pl].with_offset::<BD>() + uvdstoff;
+                    // Both chroma planes in one call, as they share the reference geometry.
+                    // OBMC for each plane then follows (it only touches that plane).
+                    mc_pl::<BD, true>(
+                        f,
+                        &mut t.scratch.inter_mut().emu_edge,
+                        t.b,
+                        MaybeTempPixels::NonTemp { dst: uv_dst(0) },
+                        Some(uv_dst(1)),
+                        bw4 << (bw4 == ss_hor) as c_int,
+                        bh4 << (bh4 == ss_ver) as c_int,
+                        t.b.x & !ss_hor,
+                        t.b.y & !ss_ver,
+                        1,
+                        inter.nd.one_d.mv[0],
+                        refp,
+                        inter.r#ref[0] as usize,
+                        filter_2d,
+                    )?;
+                    if inter.motion_mode == MotionMode::Obmc {
+                        for pl in 0..2 {
+                            obmc::<BD>(f, t, uv_dst(pl), b_dim, 1 + pl, bx4, by4, w4, h4)?;
                         }
                     }
                 }
