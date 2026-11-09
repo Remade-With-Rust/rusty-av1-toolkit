@@ -114,22 +114,24 @@ fn backup2x8<BD: BitDepth>(
     ];
 
     let x_off = x_off >> ss_hor;
-    let h = 8 >> ss_ver;
-    let mut rows = [[[zero; 2]; 8]; 2];
-    for y in 0..h {
+    // Called with a constant row count (4 or 8), so each instance unrolls fully
+    // and its copies back to `dst` stay fixed-size (inline, not `memcpy`).
+    let mut gather = |h: usize| {
+        let mut rows = [[[zero; 2]; 8]; 2];
+        for y in 0..h {
+            for pl in 1..3 {
+                let uv_src = src[pl] + (y as isize * strides[pl] + x_off - 2);
+                BD::pixel_copy(&mut rows[pl - 1][y], &uv_src.slice::<BD>(2), 2);
+            }
+        }
         for pl in 1..3 {
-            let uv_src = src[pl] + (y as isize * strides[pl] + x_off - 2);
-            BD::pixel_copy(&mut rows[pl - 1][y], &uv_src.slice::<BD>(2), 2);
+            dst[pl][..h].copy_from_slice(&rows[pl - 1][..h]);
         }
-    }
-    // Fixed-size copies (`h` is 4 or 8), so they stay inline rather than calling `memcpy`.
-    for pl in 1..3 {
-        let rows = &rows[pl - 1];
-        if h == 4 {
-            dst[pl][..4].copy_from_slice(&rows[..4]);
-        } else {
-            dst[pl] = *rows;
-        }
+    };
+    if ss_ver != 0 {
+        gather(4);
+    } else {
+        gather(8);
     }
 }
 
