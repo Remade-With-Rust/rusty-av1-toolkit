@@ -2158,6 +2158,29 @@ fn predict_obmc_plane<T: Pixel>(
   }
 }
 
+/// The block's pixels in the reconstruction, in every plane that
+/// [`motion_compensate`] writes: the debug check for a reused prediction.
+#[cfg(debug_assertions)]
+fn rec_block_pixels<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &TileStateMut<'_, T>, bsize: BlockSize,
+  tile_bo: TileBlockOffset,
+) -> Vec<T> {
+  let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
+  let chroma =
+    has_chroma(tile_bo, bsize, xdec, ydec, fi.sequence.chroma_sampling);
+  let mut px = Vec::new();
+  for p in 0..if chroma { 3 } else { 1 } {
+    let plane_bsize =
+      if p == 0 { bsize } else { bsize.subsampled_size(xdec, ydec).unwrap() };
+    let region =
+      ts.rec.planes[p].subregion(Area::BlockStartingAt { bo: tile_bo.0 });
+    for row in region.rows_iter().take(plane_bsize.height()) {
+      px.extend_from_slice(&row[..plane_bsize.width().min(row.len())]);
+    }
+  }
+  px
+}
+
 pub fn motion_compensate<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, luma_mode: PredictionMode, ref_frames: [RefType; 2],
@@ -2554,6 +2577,7 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   tx_type: TxType, mode_context: usize, mv_stack: &[CandidateMV],
   rdo_type: RDOType, need_recon_pixel: bool,
   enc_stats: Option<&mut EncoderStats>, luma_reuse: Option<&mut LumaReuse>,
+  pred_in_rec: bool,
 ) -> (bool, ScaledDistortion) {
   let _prof = crate::prof::scope(crate::prof::Stage::EncodeBlockPost);
   #[cfg(feature = "profile")]
@@ -2997,9 +3021,25 @@ pub fn encode_block_post_cdef<T: Pixel, W: Writer>(
   }
 
   if is_inter {
-    motion_compensate(
-      fi, ts, cw, luma_mode, ref_frames, mvs, bsize, tile_bo, false,
-    );
+    // `pred_in_rec`: the reconstruction already holds this exact prediction
+    // (left by a skip trial of the same mode and motion vectors), so motion
+    // compensation would rewrite the same pixels. Debug builds redo it anyway
+    // and check that it changed nothing.
+    if !pred_in_rec || cfg!(debug_assertions) {
+      #[cfg(debug_assertions)]
+      let before =
+        pred_in_rec.then(|| rec_block_pixels(fi, ts, bsize, tile_bo));
+      motion_compensate(
+        fi, ts, cw, luma_mode, ref_frames, mvs, bsize, tile_bo, false,
+      );
+      #[cfg(debug_assertions)]
+      if let Some(before) = before {
+        assert!(
+          before == rec_block_pixels(fi, ts, bsize, tile_bo),
+          "a reused inter prediction differs from motion compensation"
+        );
+      }
+    }
     write_tx_tree(
       fi,
       ts,
@@ -3432,6 +3472,7 @@ pub fn encode_block_with_modes<T: Pixel, W: Writer>(
     skip = true;
     rdo_tx_size_type(
       fi, ts, cw, bsize, tile_bo, mode_luma, ref_frames, mvs, skip,
+      &mut false,
     )
   } else {
     (mode_decision.tx_size, mode_decision.tx_type)
@@ -3467,8 +3508,8 @@ pub fn encode_block_with_modes<T: Pixel, W: Writer>(
     rdo_type,
     true,
     enc_stats,
-  
     None,
+    false,
   );
 }
 
@@ -4941,6 +4982,7 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
       // of current partition can change, i.e. neighboring partitions can split down more.
       let (tx_size, tx_type) = rdo_tx_size_type(
         fi, ts, cw, bsize, tile_bo, mode_luma, ref_frames, mvs, skip,
+        &mut false,
       );
 
       let mut mv_stack = ArrayVec::<CandidateMV, 9>::new();
@@ -5070,9 +5112,9 @@ fn encode_partition_topdown<T: Pixel, W: Writer>(
         RDOType::PixelDistRealRate,
         true,
         Some(enc_stats),
-      
-    None,
-  );
+        None,
+        false,
+      );
     }
     PARTITION_SPLIT | PARTITION_HORZ | PARTITION_VERT => {
       if !rdo_output.part_modes.is_empty() {

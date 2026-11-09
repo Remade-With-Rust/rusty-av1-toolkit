@@ -758,11 +758,16 @@ pub fn compute_rd_cost<T: Pixel>(
   fi.lambda.mul_add(rate_in_bits, distortion.0 as f64)
 }
 
+/// RDO-based transform size and type decision for a block.
+///
+/// `pred_in_rec` is cleared if the transform type search runs, because its
+/// trials overwrite the block in the reconstruction (see
+/// [`encode_block_post_cdef`]).
 pub fn rdo_tx_size_type<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
   luma_mode: PredictionMode, ref_frames: [RefType; 2], mvs: [MotionVector; 2],
-  skip: bool,
+  skip: bool, pred_in_rec: &mut bool,
 ) -> (TxSize, TxType) {
   let _prof = crate::prof::scope(crate::prof::Stage::RdoTxSizeType);
   let is_inter = !luma_mode.is_intra();
@@ -807,6 +812,7 @@ pub fn rdo_tx_size_type<T: Pixel>(
       if do_rdo_tx_type { RAV1E_TX_TYPES } else { &[TxType::DCT_DCT] };
 
     // Luma plane transform type decision
+    *pred_in_rec = false;
     let (tx_type, rd_cost) = rdo_tx_type_decision(
       fi,
       ts,
@@ -1000,6 +1006,11 @@ fn luma_chroma_mode_rdo<T: Pixel>(
 
   #[cfg(feature = "profile")]
   let _fp = crate::encoder::fwd_phase::enter(0);
+  // Whether `ts.rec` holds this block's inter prediction for `luma_mode`,
+  // `ref_frames` and `mvs`, so the next trial need not motion compensate again.
+  // A skip trial leaves it there: it codes no residual, so its motion
+  // compensation is the last write to the block.
+  let mut pred_in_rec = false;
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
     let mut zero_distortion = false;
@@ -1008,7 +1019,16 @@ fn luma_chroma_mode_rdo<T: Pixel>(
       cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, sidx);
 
       let (tx_size, tx_type) = rdo_tx_size_type(
-        fi, ts, cw, bsize, tile_bo, luma_mode, ref_frames, mvs, skip,
+        fi,
+        ts,
+        cw,
+        bsize,
+        tile_bo,
+        luma_mode,
+        ref_frames,
+        mvs,
+        skip,
+        &mut pred_in_rec,
       );
       // prom_av1e017: across chroma-mode iterations only the chroma coding
       // differs — cache the luma tx section from iteration 1 and skip it on
@@ -1063,7 +1083,9 @@ fn luma_chroma_mode_rdo<T: Pixel>(
           need_recon_pixel,
           None,
           luma_reuse.as_mut(),
+          pred_in_rec,
         );
+        pred_in_rec = skip && !luma_mode_is_intra;
 
         let rate = wr.tell_frac() - tell;
         let distortion = if fi.use_tx_domain_distortion && !need_recon_pixel {
@@ -1235,8 +1257,8 @@ pub fn rdo_mode_decision<T: Pixel>(
           rdo_type,
           true, // For CFL, luma should be always reconstructed.
           None,
-        
           None,
+          false,
         );
 
         let rate = wr.tell_frac() - tell;
@@ -1323,6 +1345,7 @@ pub fn rdo_mode_decision<T: Pixel>(
         true,
         None,
         None,
+        false,
       );
       let rate = wr.tell_frac() - tell;
       let distortion =
