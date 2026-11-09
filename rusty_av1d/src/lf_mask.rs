@@ -148,22 +148,24 @@ fn decomp_tx(
     };
 }
 
-/// ORs bit `base + i` into `masks[level(i)]` for each `i` in `0..n`,
+/// ORs bit `base + i` into `masks[level]` for the `i`th of `levels`,
 /// where each level's mask is stored as two halves split at bit `split`.
 ///
 /// One word per level is accumulated in registers and each level's halves are
 /// ORed into `masks` once, rather than a read-modify-write of `masks` per row/column.
+/// `levels` iterates pre-sliced rows/columns, so there is no bounds check per element.
 #[inline(always)]
 fn or_edge_masks<const L: usize>(
     masks: &[[RelaxedAtomic<u16>; 2]; L],
     base: usize,
-    n: usize,
     split: u32,
-    mut level: impl FnMut(usize) -> u8,
+    levels: impl Iterator<Item = u8>,
 ) {
     let mut acc = [0u32; L];
-    for i in 0..n {
-        acc[level(i) as usize] |= 1 << (base + i);
+    let mut bit = 1u32 << base;
+    for level in levels {
+        acc[level as usize] |= bit;
+        bit <<= 1;
     }
     for (masks, acc) in zip(masks, acc) {
         if acc == 0 {
@@ -210,18 +212,20 @@ fn mask_edges_inter(
     // * `txa[1][1][y][0..w4]` where `y` is the start of a block edge
 
     // left block edge
-    or_edge_masks(&masks[0][bx4], by4, h4, 16, |y| {
-        // SAFETY: y < h4 so txa[0][0][y][0] is initialized.
-        let txa_y = unsafe { txa[0][0][y][0].assume_init() };
-        cmp::min(txa_y, l[y])
+    let left = zip(&txa[0][0][..h4], &l[..h4]).map(|(txa, &l)| {
+        // SAFETY: rows `..h4` so txa[0][0][y][0] is initialized.
+        let txa_y = unsafe { txa[0].assume_init() };
+        cmp::min(txa_y, l)
     });
+    or_edge_masks(&masks[0][bx4], by4, 16, left);
 
     // top block edge
-    or_edge_masks(&masks[1][by4], bx4, w4, 16, |x| {
-        // SAFETY: x < h4 so txa[1][0][0][x] is initialized.
-        let txa_x = unsafe { txa[1][0][0][x].assume_init() };
-        cmp::min(txa_x, a[x])
+    let top = zip(&txa[1][0][0][..w4], &a[..w4]).map(|(txa, &a)| {
+        // SAFETY: columns `..w4` so txa[1][0][0][x] is initialized.
+        let txa_x = unsafe { txa.assume_init() };
+        cmp::min(txa_x, a)
     });
+    or_edge_masks(&masks[1][by4], bx4, 16, top);
     if !skip {
         // inner (tx) left|right edges
         for y in 0..h4 {
@@ -302,10 +306,12 @@ fn mask_edges_intra(
     let thl4c = cmp::min(2, thl4);
 
     // left block edge
-    or_edge_masks(&masks[0][bx4], by4, h4, 16, |y| cmp::min(twl4c, l[y]));
+    let left = l[..h4].iter().map(|&l| cmp::min(twl4c, l));
+    or_edge_masks(&masks[0][bx4], by4, 16, left);
 
     // top block edge
-    or_edge_masks(&masks[1][by4], bx4, w4, 16, |x| cmp::min(thl4c, a[x]));
+    let top = a[..w4].iter().map(|&a| cmp::min(thl4c, a));
+    or_edge_masks(&masks[1][by4], bx4, 16, top);
 
     // inner (tx) left|right edges
     let hstep = t_dim.w as usize;
@@ -370,11 +376,16 @@ fn mask_edges_chroma(
     let vmask = 16 >> ss_ver;
     let hmask = 16 >> ss_hor;
 
+    // Chroma edges are mostly 1-2 units, where indexing beats a sliced iterator's
+    // setup (LLVM unrolls the latter with an odd-count prologue).
+
     // left block edge
-    or_edge_masks(&masks[0][cbx4], cby4, ch4, vmask as u32, |y| cmp::min(twl4c, l[y]));
+    let left = (0..ch4).map(|y| cmp::min(twl4c, l[y]));
+    or_edge_masks(&masks[0][cbx4], cby4, vmask as u32, left);
 
     // top block edge
-    or_edge_masks(&masks[1][cby4], cbx4, cw4, hmask as u32, |x| cmp::min(thl4c, a[x]));
+    let top = (0..cw4).map(|x| cmp::min(thl4c, a[x]));
+    or_edge_masks(&masks[1][cby4], cbx4, hmask as u32, top);
 
     if !skip_inter {
         // inner (tx) left|right edges
