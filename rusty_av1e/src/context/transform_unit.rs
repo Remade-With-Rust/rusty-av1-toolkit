@@ -1270,6 +1270,9 @@ impl ContextWriter<'_> {
     unsafe { slice_assume_init_mut(coeffs) }
   }
 
+  // Called once per coefficient above NUM_BASE_LEVELS from the coefficient
+  // loop; a plain `#[inline]` hint was declined there (measured no-op).
+  #[inline(always)]
   pub fn get_br_ctx(
     levels: &[u8],
     coeff_idx: usize, // raster order
