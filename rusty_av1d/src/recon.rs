@@ -1841,7 +1841,6 @@ fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool, const PAIR: bool>(
 ) -> Result<(), ()> {
     let bd = BD::from_c(f.bitdepth_max);
     let ref_data = &refp.p.data.as_ref().unwrap().data;
-    let cur_data = &f.cur.data.as_ref().unwrap().data;
 
     let ss_ver = SS_VER as c_int;
     let ss_hor = SS_HOR as c_int;
@@ -1860,7 +1859,11 @@ fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool, const PAIR: bool>(
         let w;
         let h;
 
-        if !ref_data[0].ref_eq(&cur_data[0]) {
+        // Intra block copy predicts from the current picture, which is exactly when
+        // the reference is `f.sr_cur` (super-res is off then, so it shares `f.cur`'s data);
+        // comparing the reference itself saves unwrapping `f.cur.data` per call.
+        if !ptr::eq(refp, &f.sr_cur) {
+            debug_assert!(!ref_data[0].ref_eq(&f.cur.data.as_ref().unwrap().data[0]));
             w = f.cur.p.w + ss_hor >> ss_hor;
             h = f.cur.p.h + ss_ver >> ss_ver;
         } else {
