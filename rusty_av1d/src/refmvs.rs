@@ -544,6 +544,8 @@ fn add_spatial_candidate(
     }
 }
 
+// `always`: ~50K calls each per rav1e60 decode, with 13 arguments (7 on the stack).
+#[inline(always)]
 fn scan_row(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
@@ -613,6 +615,8 @@ fn scan_row(
     }
 }
 
+// `always`: ~50K calls each per rav1e60 decode, with 13 arguments (7 on the stack).
+#[inline(always)]
 fn scan_col(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
