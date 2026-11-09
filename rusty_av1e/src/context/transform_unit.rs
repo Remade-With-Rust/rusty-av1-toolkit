@@ -1252,8 +1252,12 @@ impl ContextWriter<'_> {
     );
     let last = usize::from(eob) - 1;
     let (body, last_c) = coeffs.split_at_mut(last);
+    // Scan positions are below the coded area (<= MAX_CODED_TX_SQUARE, a power
+    // of two), so the mask never changes `pos`; it lets the index be proven in
+    // range and drops a bounds check per coefficient.
+    const _: () = assert!(MAX_CODED_TX_SQUARE.is_power_of_two());
     for (coeff, &pos) in body.iter_mut().zip(&scan[..last]) {
-      coeff.write(ctx_area[pos as usize] as i8);
+      coeff.write(ctx_area[pos as usize & (MAX_CODED_TX_SQUARE - 1)] as i8);
     }
     // the eob position's context depends only on its scan index
     let eob_ctx: i8 = if last == 0 {
