@@ -738,3 +738,52 @@ pub fn rav1d_msac_decode_hi_tok(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
     debug_assert!(ret < 16);
     ret % 16
 }
+
+/// [`rav1d_msac_decode_hi_tok`] for the coefficient token loop: on the
+/// pure-Rust path its up-to-four 4-ary decodes use the inlined body (see
+/// [`rav1d_msac_decode_symbol_adapt4_coef`]). The asm paths are unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_hi_tok_coef(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    let ret;
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_hi_tok_rust`].
+            ret = (unsafe {
+                dav1d_msac_decode_hi_tok_sse2(&mut s.asm, cdf.as_mut_ptr())
+            }) as u8;
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_hi_tok_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_hi_tok_neon(&mut s.asm, cdf.as_mut_ptr())
+            } as u8;
+        } else {
+            // Only the first decode is inlined: a result below 3 ends the token,
+            // which is the common case. The continuation is rare, so it stays out
+            // of line and does not grow the token loop.
+            let tok_br = symbol_adapt_rust_inline(s, cdf, 3);
+            ret = if tok_br == 3 { hi_tok_rust_tail(s, cdf) } else { 3 + tok_br };
+        }
+    }
+    debug_assert!(ret < 16);
+    ret % 16
+}
+
+/// The continuation of [`rav1d_msac_decode_hi_tok_coef`] after a first `3`.
+#[cfg_attr(
+    all(feature = "asm", any(target_feature = "sse2", target_feature = "neon")),
+    allow(dead_code)
+)]
+#[cold]
+#[inline(never)]
+fn hi_tok_rust_tail(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    let mut tok_br = rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+    let mut tok = 6 + tok_br;
+    if tok_br == 3 {
+        tok_br = rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+        tok = 9 + tok_br;
+        if tok_br == 3 {
+            tok = 12 + rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+        }
+    }
+    tok
+}

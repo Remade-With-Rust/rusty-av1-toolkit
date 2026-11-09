@@ -39,7 +39,7 @@ use crate::msac::{
     rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bool_equi_bit,
     rav1d_msac_decode_bools,
     rav1d_msac_decode_hi_tok, rav1d_msac_decode_symbol_adapt16, rav1d_msac_decode_symbol_adapt4,
-    rav1d_msac_decode_symbol_adapt4_coef,
+    rav1d_msac_decode_symbol_adapt4_coef, rav1d_msac_decode_hi_tok_coef,
     rav1d_msac_decode_symbol_adapt8, MsacContext,
 };
 use crate::picture::Rav1dThreadPicture;
@@ -1001,7 +1001,7 @@ fn decode_coefs<BD: BitDepth>(
                 } else {
                     7
                 } + if mag > 12 { 6 } else { (mag + 1) >> 1 };
-                tok = rav1d_msac_decode_hi_tok(&mut ts_c.msac, &mut hi_cdf[ctx as usize]);
+                tok = rav1d_msac_decode_hi_tok_coef(&mut ts_c.msac, &mut hi_cdf[ctx as usize]);
                 if dbg {
                     println!(
                         "Post-hi_tok[{}][{}][{}][{}={}={}]: r={}",
