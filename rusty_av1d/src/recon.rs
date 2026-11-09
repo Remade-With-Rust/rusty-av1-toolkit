@@ -2927,17 +2927,22 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
     let has_chroma = f.cur.p.layout != Rav1dPixelLayout::I400
         && (bw4 > ss_hor || t.b.x & 1 != 0)
         && (bh4 > ss_ver || t.b.y & 1 != 0);
-    let chr_layout_idx = if f.cur.p.layout == Rav1dPixelLayout::I400 {
-        Rav1dPixelLayout::I400
-    } else {
-        Rav1dPixelLayout::I444 - f.cur.p.layout
-    } as usize;
-    let chr_layout_idx_w_mask = f
-        .cur
-        .p
-        .layout
-        .try_into()
-        .unwrap_or(Rav1dPixelLayoutSubSampled::I444);
+    // Only the wedge, masked compound and inter-intra paths need these, so they are
+    // derived there rather than for every inter block.
+    let chr_layout_idx = || {
+        (if f.cur.p.layout == Rav1dPixelLayout::I400 {
+            Rav1dPixelLayout::I400
+        } else {
+            Rav1dPixelLayout::I444 - f.cur.p.layout
+        }) as usize
+    };
+    let chr_layout_idx_w_mask = || {
+        f.cur
+            .p
+            .layout
+            .try_into()
+            .unwrap_or(Rav1dPixelLayoutSubSampled::I444)
+    };
 
     // prediction
     let cbh4 = bh4 + ss_ver >> ss_ver;
@@ -3063,7 +3068,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 );
             }
             CompInterType::Seg => {
-                f.dsp.mc.w_mask[chr_layout_idx_w_mask].call(
+                f.dsp.mc.w_mask[chr_layout_idx_w_mask()].call(
                     y_dst,
                     &tmp[inter.nd.one_d.mask_sign() as usize],
                     &tmp[!inter.nd.one_d.mask_sign() as usize],
@@ -3087,7 +3092,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     bd,
                 );
                 if has_chroma {
-                    mask = DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx]
+                    mask = DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx()]
                         [inter.nd.one_d.mask_sign() as usize]
                         [inter.nd.one_d.wedge_idx as usize];
                 }
@@ -3498,11 +3503,11 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     // transform size...
                     let ii_mask = match interintra_type {
                         InterIntraType::Blend => {
-                            DAV1D_II_MASKS[bs as usize][chr_layout_idx]
+                            DAV1D_II_MASKS[bs as usize][chr_layout_idx()]
                                 [inter.nd.one_d.interintra_mode.get() as usize]
                         }
                         InterIntraType::Wedge => {
-                            DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx][0]
+                            DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx()][0]
                                 [inter.nd.one_d.wedge_idx as usize]
                         }
                     };
