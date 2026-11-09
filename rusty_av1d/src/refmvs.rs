@@ -773,6 +773,9 @@ fn add_temporal_candidate(
     };
 }
 
+// `always`: called from the candidate search with `cnt`; inlined, it no longer forces
+// the count through memory on every append.
+#[inline(always)]
 fn add_compound_extended_candidate(
     same: &mut [RefMvsCandidate],
     same_count: &mut [usize; 4],
@@ -842,6 +845,9 @@ fn add_compound_extended_candidate(
     }
 }
 
+// `always`: called from the candidate search with `cnt`; inlined, it no longer forces
+// the count through memory on every append.
+#[inline(always)]
 fn add_single_extended_candidate(
     mvstack: &mut [RefMvsCandidate; 8],
     cnt: &mut usize,
