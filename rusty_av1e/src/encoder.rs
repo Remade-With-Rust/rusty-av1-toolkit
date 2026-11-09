@@ -1965,34 +1965,40 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
     true
   };
 
-  // Reconstruct
-  dequantize(
-    qidx,
-    qcoeffs,
-    eob,
-    rcoeffs,
-    tx_size,
-    fi.sequence.bit_depth,
-    fi.dc_delta_q[p],
-    fi.ac_delta_q[p],
-    fi.cpu_feature_level,
-  );
-  // SAFETY: dequantize initialized rcoeffs
-  let rcoeffs = unsafe { slice_assume_init_mut(rcoeffs) };
-
-  if eob == 0 {
-    // All zero coefficients is a no-op
-  } else if !fi.use_tx_domain_distortion || need_recon_pixel {
-    inverse_transform_add(
-      rcoeffs,
-      &mut rec.subregion_mut(area),
+  // Reconstruct. With no coefficients (`eob == 0`) the dequantized block is all
+  // zero and nothing reads it: the inverse transform is a no-op, and the tx-domain
+  // distortion below is then just the energy of `coeffs`. So it is not dequantized
+  // (`rcoeffs` is left empty, which the distortion sum treats as all zero).
+  let rcoeffs: &[_] = if eob == 0 {
+    &[]
+  } else {
+    dequantize(
+      qidx,
+      qcoeffs,
       eob,
+      rcoeffs,
       tx_size,
-      tx_type,
       fi.sequence.bit_depth,
+      fi.dc_delta_q[p],
+      fi.ac_delta_q[p],
       fi.cpu_feature_level,
     );
-  }
+    // SAFETY: dequantize initialized rcoeffs
+    let rcoeffs = unsafe { slice_assume_init_mut(rcoeffs) };
+
+    if !fi.use_tx_domain_distortion || need_recon_pixel {
+      inverse_transform_add(
+        rcoeffs,
+        &mut rec.subregion_mut(area),
+        eob,
+        tx_size,
+        tx_type,
+        fi.sequence.bit_depth,
+        fi.cpu_feature_level,
+      );
+    }
+    rcoeffs
+  };
 
   // TAP REMOVED: measured at/below the rdtsc-pair floor — the bucket was the
   // instrument, and the guard's atomic add leaked into the parent scope.
