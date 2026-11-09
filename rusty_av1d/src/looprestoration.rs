@@ -375,6 +375,12 @@ unsafe extern "C" fn wiener_c_erased<BD: BitDepth>(
     wiener_rust(p, left, lpf, lpf_off, w, h, params, edges, bd)
 }
 
+thread_local! {
+    /// Padded-input and horizontal-pass scratch for [`wiener_rust`] and the
+    /// self-guided drivers, reused without zeroing (see [`scratch`]).
+    static LR_UNIT: scratch::Arena = const { scratch::Arena::new() };
+}
+
 // FIXME Could split into luma and chroma specific functions,
 // (since first and last tops are always 0 for chroma)
 // FIXME Could implement a version that requires less temporary memory
@@ -391,14 +397,13 @@ fn wiener_rust<BD: BitDepth>(
     bd: BD,
 ) {
     // Wiener filtering is applied to a maximum stripe height of 64 + 3 pixels
-    // of padding above and below
-    let mut tmp = [0.into(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
-
-    // Values stored between horizontal and vertical filtering don't
-    // fit in a u8.
-    let mut hor = [0; (64 + 3 + 3) * REST_UNIT_STRIDE];
+    // of padding above and below.
+    // `padding` writes every `tmp` cell the horizontal pass reads, and the horizontal
+    // pass writes every `hor` cell the vertical pass reads.
+    // Values stored between horizontal and vertical filtering don't fit in a u8.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], hor: &mut [u16; LEN]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
 
     let filter = &params.filter;
     let bitdepth = bd.bitdepth().as_::<c_int>();
@@ -442,6 +447,7 @@ fn wiener_rust<BD: BitDepth>(
                 iclip(sum + rounding_off_v >> round_bits_v, 0, bd.into_c()).as_();
         }
     }
+    });
 }
 
 /// Sum over a 3x3 area
