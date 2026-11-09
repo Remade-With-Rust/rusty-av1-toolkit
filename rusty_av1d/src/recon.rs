@@ -36,7 +36,8 @@ use crate::levels::{
 use crate::lf_apply::{rav1d_copy_lpf, rav1d_loopfilter_sbrow_cols, rav1d_loopfilter_sbrow_rows};
 use crate::lr_apply::rav1d_lr_sbrow;
 use crate::msac::{
-    rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bools,
+    rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bool_equi_bit,
+    rav1d_msac_decode_bools,
     rav1d_msac_decode_hi_tok, rav1d_msac_decode_symbol_adapt16, rav1d_msac_decode_symbol_adapt4,
     rav1d_msac_decode_symbol_adapt8, MsacContext,
 };
@@ -146,11 +147,11 @@ fn read_golomb(msac: &mut MsacContext) -> u32 {
     let mut len = 0;
     let mut val = 1;
 
-    while !rav1d_msac_decode_bool_equi(msac) && len < 32 {
+    while rav1d_msac_decode_bool_equi_bit(msac) == 0 && len < 32 {
         len += 1;
     }
     for _ in 0..len {
-        val = (val << 1) + rav1d_msac_decode_bool_equi(msac) as u32;
+        val = (val << 1) + rav1d_msac_decode_bool_equi_bit(msac);
     }
 
     val - 1

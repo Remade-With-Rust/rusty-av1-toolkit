@@ -620,6 +620,23 @@ pub fn rav1d_msac_decode_bool_adapt(s: &mut MsacContext, cdf: &mut [u16; 2]) -> 
     }
 }
 
+/// [`rav1d_msac_decode_bool_equi`] as `0` or `1`, for callers that use the bit
+/// arithmetically. The x86 asm already returns exactly 0 or 1 in a 32-bit
+/// register (its `setb al` follows a shift that leaves the rest of `eax` zero,
+/// and the 32-bit build zero-extends `al`), so this skips the `!= 0` and the
+/// re-widening a `bool` round trip costs at every call.
+#[inline(always)]
+pub fn rav1d_msac_decode_bool_equi_bit(s: &mut MsacContext) -> u32 {
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe { dav1d_msac_decode_bool_equi_sse2(&mut s.asm) }
+        } else {
+            rav1d_msac_decode_bool_equi(s) as u32
+        }
+    }
+}
+
 pub fn rav1d_msac_decode_bool_equi(s: &mut MsacContext) -> bool {
     cfg_if! {
         if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
