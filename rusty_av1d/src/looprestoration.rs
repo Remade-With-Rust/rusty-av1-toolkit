@@ -25,6 +25,7 @@ use crate::include::common::bitdepth::{
     AsPrimitive, BitDepth, DynPixel, LeftPixelRow, ToPrimitive, BPC,
 };
 use crate::include::common::intops::iclip;
+use crate::scratch;
 use crate::include::dav1d::picture::{
     FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
 };
@@ -636,6 +637,11 @@ fn boxsum5<BD: BitDepth>(
     }
 }
 
+thread_local! {
+    /// Box-sum scratch for [`selfguided_filter`], reused without zeroing (see [`scratch`]).
+    static SGR_BOXSUM: scratch::Arena = const { scratch::Arena::new() };
+}
+
 #[inline(never)]
 fn selfguided_filter<BD: BitDepth>(
     dst: &mut [BD::Coef; 64 * 384],
@@ -650,20 +656,21 @@ fn selfguided_filter<BD: BitDepth>(
 
     // Selfguided filter is applied to a maximum stripe height of 64 + 3 pixels
     // of padding above and below
-    let mut sumsq = [0; (64 + 2 + 2) * REST_UNIT_STRIDE];
+    const BOXSUM_LEN: usize = (64 + 2 + 2) * REST_UNIT_STRIDE;
+    // Every cell read below is first written by `boxsum3`/`boxsum5`.
     // By inverting `a` and `b` after the boxsums, `b` can be of `BD::Coef` instead of `i32`.
-    let mut sum = [0.as_::<BD::Coef>(); (64 + 2 + 2) * REST_UNIT_STRIDE];
+    scratch::with2(&SGR_BOXSUM, |sumsq: &mut [i32; BOXSUM_LEN], sum: &mut [BD::Coef; BOXSUM_LEN]| {
 
     let step = (n == 25) as usize + 1;
     if n == 25 {
-        boxsum5::<BD>(&mut sumsq, &mut sum, src, w + 6, h + 6);
+        boxsum5::<BD>(sumsq, sum, src, w + 6, h + 6);
     } else {
-        boxsum3::<BD>(&mut sumsq, &mut sum, src, w + 6, h + 6);
+        boxsum3::<BD>(sumsq, sum, src, w + 6, h + 6);
     }
     let bitdepth_min_8 = bd.bitdepth() - 8;
 
-    let mut a = CursorMut::new(&mut sumsq) + 2 * REST_UNIT_STRIDE + 3;
-    let mut b = CursorMut::new(&mut sum) + 2 * REST_UNIT_STRIDE + 3;
+    let mut a = CursorMut::new(sumsq) + 2 * REST_UNIT_STRIDE + 3;
+    let mut b = CursorMut::new(sum) + 2 * REST_UNIT_STRIDE + 3;
 
     let mut aa = a.clone() - REST_UNIT_STRIDE;
     let mut bb = b.clone() - REST_UNIT_STRIDE;
@@ -756,6 +763,7 @@ fn selfguided_filter<BD: BitDepth>(
             a += REST_UNIT_STRIDE;
         }
     };
+    });
 }
 
 /// # Safety
