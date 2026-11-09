@@ -1675,7 +1675,7 @@ pub(crate) fn pd0_real_cost<T: Pixel>(
       );
       // SAFETY: forward_transform initialized coeffs.
       let coeffs = unsafe { slice_assume_init_mut(coeffs) };
-      let eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type);
+      let eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type, fi.cpu_feature_level);
       dequantize(
         qidx,
         qcoeffs,
@@ -1890,7 +1890,7 @@ pub fn encode_tx_block<T: Pixel, W: Writer>(
   // SAFETY: forward_transform initialized coeffs
   let coeffs = unsafe { slice_assume_init_mut(coeffs) };
 
-  let mut eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type);
+  let mut eob = ts.qc.quantize(coeffs, qcoeffs, tx_size, tx_type, fi.cpu_feature_level);
 
   // prom_av1e047: coefficient trellis (RDOQ) — final encode only, on the shared
   // qcoeffs before BOTH coding and recon so they stay consistent. Reads the

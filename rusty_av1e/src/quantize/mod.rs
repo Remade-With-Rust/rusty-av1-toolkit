@@ -156,6 +156,30 @@ const fn divu_pair(x: u32, d: (u32, u32, u32)) -> u32 {
   (((a * x + b) >> 32) >> shift) as u32
 }
 
+/// The highest scan index (`iscan`) among coefficients at least `deadzone` in
+/// magnitude, or 0.
+#[inline(always)]
+fn max_scan_index_over<T: Coefficient>(
+  iscan: &[u16], coeffs: &[T], deadzone: T,
+) -> u16 {
+  iscan
+    .iter()
+    .zip(coeffs)
+    .map(|(&i, &c)| if c.abs() >= deadzone { i } else { 0 })
+    .max()
+    .unwrap_or(0)
+}
+
+/// [`max_scan_index_over`] compiled with AVX2 enabled, where LLVM vectorizes the
+/// reduction (unsigned 16-bit max is not in the x86-64 baseline).
+#[cfg(nasm_x86_64)]
+#[target_feature(enable = "avx2")]
+unsafe fn max_scan_index_over_avx2<T: Coefficient>(
+  iscan: &[u16], coeffs: &[T], deadzone: T,
+) -> u16 {
+  max_scan_index_over(iscan, coeffs, deadzone)
+}
+
 #[inline]
 const fn copysign(value: u32, signed: i32) -> i32 {
   if signed < 0 {
@@ -268,6 +292,7 @@ impl QuantizationContext {
   #[inline]
   pub fn quantize<T: Coefficient>(
     &self, coeffs: &[T], qcoeffs: &mut [T], tx_size: TxSize, tx_type: TxType,
+    cpu: crate::cpu_features::CpuFeatureLevel,
   ) -> u16 {
     let _prof = crate::prof::scope(crate::prof::Stage::Quantize);
     let scan = av1_scan_orders[tx_size as usize][tx_type as usize].scan;
@@ -292,12 +317,19 @@ impl QuantizationContext {
     );
     let eob = {
       let _q1 = crate::prof::scope(crate::prof::Stage::QuantEobScan);
-      let eob_minus_one = iscan
-        .iter()
-        .zip(coeffs)
-        .map(|(&i, &c)| if c.abs() >= deadzone { i } else { 0 })
-        .max()
-        .unwrap_or(0);
+      #[cfg(nasm_x86_64)]
+      let eob_minus_one =
+        if cpu >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+          // SAFETY: AVX2 is available, checked just above.
+          unsafe { max_scan_index_over_avx2(iscan, coeffs, deadzone) }
+        } else {
+          max_scan_index_over(iscan, coeffs, deadzone)
+        };
+      #[cfg(not(nasm_x86_64))]
+      let eob_minus_one = {
+        let _ = cpu;
+        max_scan_index_over(iscan, coeffs, deadzone)
+      };
       // We skip the DC coefficient since it has its own quantizer index.
       if eob_minus_one > 0 {
         eob_minus_one + 1
