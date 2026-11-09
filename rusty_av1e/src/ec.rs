@@ -151,6 +151,9 @@ pub struct WriterBase<S> {
   /// Extra offset added to `tell()` and `tell_frac()` to approximate costs
   /// of actually coding a symbol
   fake_bits_frac: u32,
+  /// `harvest::WK_*` knob bits, resolved once at construction instead of one
+  /// OnceLock test per symbol.
+  knobs: u8,
   /// Use-specific storage
   s: S,
 }
@@ -200,7 +203,7 @@ pub struct WriterCheckpoint {
 /// Constructor for a counting Writer
 impl WriterCounter {
   #[inline]
-  pub const fn new() -> WriterBase<WriterCounter> {
+  pub fn new() -> WriterBase<WriterCounter> {
     WriterBase::new(WriterCounter { bits: 0 })
   }
 }
@@ -208,7 +211,7 @@ impl WriterCounter {
 /// Constructor for a recording Writer
 impl WriterRecorder {
   #[inline]
-  pub const fn new() -> WriterBase<WriterRecorder> {
+  pub fn new() -> WriterBase<WriterRecorder> {
     WriterBase::new(WriterRecorder { storage: Vec::new(), bits: 0 })
   }
 }
@@ -216,7 +219,7 @@ impl WriterRecorder {
 /// Constructor for a encoding Writer
 impl WriterEncoder {
   #[inline]
-  pub const fn new() -> WriterBase<WriterEncoder> {
+  pub fn new() -> WriterBase<WriterEncoder> {
     WriterBase::new(WriterEncoder { precarry: Vec::new(), low: 0 })
   }
 }
@@ -228,7 +231,7 @@ impl StorageBackend for WriterBase<WriterCounter> {
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     // prom_av1e015: cost by prob→bits table instead of simulating the range
     // coder (the libaom av1_prob_cost structure). See harvest::fastsym().
-    if crate::harvest::fastsym() {
+    if self.knobs & crate::harvest::WK_FASTSYM != 0 {
       let w =
         usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
       self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
@@ -277,7 +280,7 @@ impl StorageBackend for WriterBase<WriterRecorder> {
     // (replay re-runs the real coding from the stored tokens), so under
     // fastsym the cost comes from the prob→bits table instead. The token
     // push is untouched — replay integrity does not depend on rng/bits.
-    if crate::harvest::fastsym() {
+    if self.knobs & crate::harvest::WK_FASTSYM != 0 {
       let w =
         usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
       self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
@@ -378,8 +381,14 @@ impl<S> WriterBase<S> {
   /// actual encoder and Recorder.
   #[inline]
   #[cfg(not(feature = "desync_finder"))]
-  const fn new(storage: S) -> Self {
-    WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
+  fn new(storage: S) -> Self {
+    WriterBase {
+      rng: 0x8000,
+      cnt: -9,
+      fake_bits_frac: 0,
+      knobs: crate::harvest::writer_knobs(),
+      s: storage,
+    }
   }
 
   #[inline]
@@ -390,6 +399,7 @@ impl<S> WriterBase<S> {
       cnt: -9,
       debug: std::env::var_os("RAV1E_DEBUG").is_some(),
       fake_bits_frac: 0,
+      knobs: crate::harvest::writer_knobs(),
       s: storage,
     }
   }
@@ -562,7 +572,9 @@ where
     // construction — account it instead of running the EC store. Covers every
     // flat-bit site in the rate path (signs, eob extras, golomb/quniform via
     // literal, MV bits). BD-gated via RAV1E_FASTRATE (rng drift epsilons).
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FASTRATE != 0
+    {
       self.add_bits_frac(8);
       return;
     }
@@ -580,7 +592,9 @@ where
   fn literal(&mut self, bits: u8, s: u32) {
     // prom_av1e012: see bit() — one accounting add replaces `bits` EC stores
     // on counting writers.
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FASTRATE != 0
+    {
       self.add_bits_frac(8 * u32::from(bits));
       return;
     }
@@ -645,7 +659,8 @@ where
     // reads the current (final-encode-evolved) distribution. Counter-only:
     // recorder tokens are replayed into the real bitstream and must carry
     // spec-adaptive brackets.
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::frozen()
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FROZEN != 0
     {
       let cdf = fc.read(cdf);
       self.symbol(s, cdf);
