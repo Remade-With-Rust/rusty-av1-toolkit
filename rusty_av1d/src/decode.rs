@@ -3877,12 +3877,12 @@ fn setup_tile(
 
 fn read_restoration_info(
     ts: &Rav1dTileState,
+    ts_c: &mut Rav1dTileStateContext,
     lr: &mut Av1RestorationUnit,
     p: usize,
     frame_type: Rav1dRestorationType,
     debug_block_info: bool,
 ) {
-    let ts_c = &mut *ts.context.try_lock().unwrap();
     let lr_ref = ts.lr_ref.try_read().unwrap()[p];
 
     if frame_type == Rav1dRestorationType::Switchable {
@@ -4096,6 +4096,9 @@ pub(crate) fn rav1d_decode_tile_sbrow(
     let sb128y = t.b.y >> 5;
     t.a = (col_sb128_start + tile_row * f.sb128w) as usize;
     t.lf_mask = Some((sb128y * f.sb128w + col_sb128_start) as usize);
+    // Locked once for the superblock row rather than per superblock (and again per
+    // restoration plane): this tile's context is only used by this thread meanwhile.
+    let mut ts_c = ts.context.try_lock().unwrap();
     for bx in (ts.tiling.col_start..ts.tiling.col_end).step_by(sb_step as usize) {
         t.b.x = bx;
         if c.flush.load(Ordering::Acquire) {
@@ -4157,7 +4160,7 @@ pub(crate) fn rav1d_decode_tile_sbrow(
                         .try_write()
                         .unwrap();
 
-                    read_restoration_info(ts, &mut lr, p, frame_type, debug_block_info!(f, t.b));
+                    read_restoration_info(ts, &mut ts_c, &mut lr, p, frame_type, debug_block_info!(f, t.b));
                 }
             } else {
                 let x = 4 * t.b.x >> ss_hor;
@@ -4176,14 +4179,14 @@ pub(crate) fn rav1d_decode_tile_sbrow(
                     .try_write()
                     .unwrap();
 
-                read_restoration_info(ts, &mut lr, p, frame_type, debug_block_info!(f, t.b));
+                read_restoration_info(ts, &mut ts_c, &mut lr, p, frame_type, debug_block_info!(f, t.b));
             }
         }
         decode_sb(
             c,
             t,
             f,
-            &mut FrameThreadPassState::First(&mut f.ts[t.ts].context.try_lock().unwrap()),
+            &mut FrameThreadPassState::First(&mut ts_c),
             root_bl,
             EdgeIndex::root(),
         )?;
@@ -4192,6 +4195,7 @@ pub(crate) fn rav1d_decode_tile_sbrow(
             t.lf_mask = t.lf_mask.map(|i| i + 1);
         }
     }
+    drop(ts_c);
 
     if f.seq_hdr().ref_frame_mvs != 0
         && c.tc.len() > 1
