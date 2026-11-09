@@ -687,6 +687,21 @@ fn scan_col(
     }
 }
 
+/// Stable sort by descending weight, i.e. `sort_by_key(|cand| -cand.weight)`.
+///
+/// Written out as an insertion sort: there are at most 8 candidates and usually 1-3,
+/// where the standard library's (also insertion) sort is mostly an out-of-line call.
+#[inline(always)]
+fn sort_by_weight(cands: &mut [RefMvsCandidate]) {
+    for i in 1..cands.len() {
+        let mut j = i;
+        while j > 0 && cands[j - 1].weight < cands[j].weight {
+            cands.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
 #[inline]
 fn mv_projection(mv: Mv, num: i32, den: i32) -> Mv {
     static DIV_MULT: [u16; 32] = [
@@ -1178,10 +1193,8 @@ pub(crate) fn rav1d_refmvs_find(
     };
 
     // sorting (nearest, then "secondary")
-    // Previously used bubble sort; now we use Rust's stable sort,
-    // which for small slices is insertion sort.
-    mvstack[..nearest_cnt].sort_by_key(|cand| -cand.weight);
-    mvstack[nearest_cnt..*cnt].sort_by_key(|cand| -cand.weight);
+    sort_by_weight(&mut mvstack[..nearest_cnt]);
+    sort_by_weight(&mut mvstack[nearest_cnt..*cnt]);
 
     if r#ref.r#ref[1] > 0 {
         if *cnt < 2 {
