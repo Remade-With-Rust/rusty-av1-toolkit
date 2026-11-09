@@ -37,6 +37,20 @@ use crate::wrap_fn_ptr::wrap_fn_ptr;
 
 pub type Itx1dFn = fn(c: &mut [i32], stride: NonZeroUsize, min: i32, max: i32);
 
+thread_local! {
+    /// Row/column scratch for [`inv_txfm_add`], reused across calls without zeroing.
+    ///
+    /// Every cell the transform reads is written earlier in the same call: the row
+    /// pass writes all `w` outputs of each of the `sh` coded rows, 64-point transforms
+    /// read only their first 32 inputs, and the column pass writes all `h` rows before
+    /// the final add reads them. dav1d's C leaves this buffer uninitialized for the
+    /// same reason. Stale values are therefore never observed, and the 16 KiB zero
+    /// fill the stack array paid on every call (8,210 instructions per transform) is
+    /// gone.
+    static ITX_TMP: std::cell::RefCell<[i32; 64 * 64]> =
+        const { std::cell::RefCell::new([0; 64 * 64]) };
+}
+
 #[inline(never)]
 fn inv_txfm_add<BD: BitDepth>(
     dst: Rav1dPictureDataComponentOffset,
@@ -95,7 +109,7 @@ fn inv_txfm_add<BD: BitDepth>(
     let row_clip_max = !row_clip_min;
     let col_clip_max = !col_clip_min;
 
-    let mut tmp = [0; 64 * 64];
+    ITX_TMP.with_borrow_mut(|tmp| {
     let mut c = &mut tmp[..];
     for y in 0..sh {
         if is_rect2 {
@@ -132,6 +146,7 @@ fn inv_txfm_add<BD: BitDepth>(
             dst[x] = bd.iclip_pixel(dst[x].as_::<i32>() + (tmp[y * w + x] + 8 >> 4));
         }
     }
+    });
 }
 
 fn inv_txfm_add_rust<const W: usize, const H: usize, const TYPE: TxfmType, BD: BitDepth>(

@@ -36,8 +36,11 @@ use crate::levels::{
 use crate::lf_apply::{rav1d_copy_lpf, rav1d_loopfilter_sbrow_cols, rav1d_loopfilter_sbrow_rows};
 use crate::lr_apply::rav1d_lr_sbrow;
 use crate::msac::{
-    rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bools,
+    rav1d_msac_decode_bool_adapt, rav1d_msac_decode_bool_equi, rav1d_msac_decode_bool_equi_bit,
+    rav1d_msac_decode_bools,
     rav1d_msac_decode_hi_tok, rav1d_msac_decode_symbol_adapt16, rav1d_msac_decode_symbol_adapt4,
+    rav1d_msac_decode_symbol_adapt4_coef, rav1d_msac_decode_hi_tok_coef,
+    rav1d_msac_decode_bool_equi_coef,
     rav1d_msac_decode_symbol_adapt8, MsacContext,
 };
 use crate::picture::Rav1dThreadPicture;
@@ -146,11 +149,11 @@ fn read_golomb(msac: &mut MsacContext) -> u32 {
     let mut len = 0;
     let mut val = 1;
 
-    while !rav1d_msac_decode_bool_equi(msac) && len < 32 {
+    while rav1d_msac_decode_bool_equi_bit(msac) == 0 && len < 32 {
         len += 1;
     }
     for _ in 0..len {
-        val = (val << 1) + rav1d_msac_decode_bool_equi(msac) as u32;
+        val = (val << 1) + rav1d_msac_decode_bool_equi_bit(msac);
     }
 
     val - 1
@@ -235,6 +238,8 @@ fn get_skip_ctx(
             dir[..N] != [0x40; N]
         }
 
+        // Two calls per chroma transform block; a real call before.
+        #[inline(always)]
         fn cdir(dir: &[u8]) -> u8 {
             let cdir = match dir.len() {
                 1 => merge_ctx::<1>(dir),
@@ -983,7 +988,7 @@ fn decode_coefs<BD: BitDepth>(
             if tx_class == TxClass::TwoD {
                 y |= x;
             }
-            tok = rav1d_msac_decode_symbol_adapt4(&mut ts_c.msac, &mut lo_cdf[lo_ctx.get()], 3);
+            tok = rav1d_msac_decode_symbol_adapt4_coef(&mut ts_c.msac, &mut lo_cdf[lo_ctx.get()], 3);
             if dbg {
                 println!(
                     "Post-lo_tok[{}][{}][{}][{}={}={}]: r={}",
@@ -997,7 +1002,7 @@ fn decode_coefs<BD: BitDepth>(
                 } else {
                     7
                 } + if mag > 12 { 6 } else { (mag + 1) >> 1 };
-                tok = rav1d_msac_decode_hi_tok(&mut ts_c.msac, &mut hi_cdf[ctx as usize]);
+                tok = rav1d_msac_decode_hi_tok_coef(&mut ts_c.msac, &mut hi_cdf[ctx as usize]);
                 if dbg {
                     println!(
                         "Post-hi_tok[{}][{}][{}][{}={}={}]: r={}",
@@ -1183,7 +1188,9 @@ fn decode_coefs<BD: BitDepth>(
                 dc_dq = ((dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) & 0xffffff) as c_int;
             } else {
                 dc_dq = (dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) as c_int;
-                assert!(dc_dq <= 0xffffff);
+                // Holds for every stream: the quantizer tables bound `dc_dq` and
+                // this branch has `dc_tok < 15`.
+                debug_assert!(dc_dq <= 0xffffff);
             }
             cul_level = dc_tok;
             dc_dq >>= dq_shift;
@@ -1211,7 +1218,9 @@ fn decode_coefs<BD: BitDepth>(
                 dc_dq = cmp::min(dc_dq, cf_max + dc_sign);
             } else {
                 dc_dq = ((dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) >> dq_shift) as c_int;
-                assert!(dc_dq <= cf_max);
+                // Holds for every stream: max DC step x 14 is below `cf_max` at
+                // each bit depth (8: 1336*14, 10: 5347*14, 12: 21387*14).
+                debug_assert!(dc_dq <= cf_max);
             }
             cul_level = dc_tok;
             cf.set(0, if dc_sign != 0 { -dc_dq } else { dc_dq });
@@ -1224,7 +1233,7 @@ fn decode_coefs<BD: BitDepth>(
         Some(Ac::Qm(qm_tbl)) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
             loop {
-                let sign = rav1d_msac_decode_bool_equi(&mut ts_c.msac);
+                let sign = rav1d_msac_decode_bool_equi_coef(&mut ts_c.msac);
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, ts_c.msac.rng);
                 }
@@ -1253,7 +1262,7 @@ fn decode_coefs<BD: BitDepth>(
                 } else {
                     tok = rc_tok >> 11;
                     dq = dq.wrapping_mul(tok);
-                    assert!(dq <= 0xffffff); // Optimized out.
+                    debug_assert!(dq <= 0xffffff);
                 }
                 cul_level = cul_level.wrapping_add(tok);
                 dq >>= dq_shift;
@@ -1269,7 +1278,7 @@ fn decode_coefs<BD: BitDepth>(
         Some(Ac::NoQm) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
             loop {
-                let sign = rav1d_msac_decode_bool_equi(&mut ts_c.msac) as c_int;
+                let sign = rav1d_msac_decode_bool_equi_coef(&mut ts_c.msac) as c_int;
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, ts_c.msac.rng);
                 }
@@ -1300,7 +1309,9 @@ fn decode_coefs<BD: BitDepth>(
                     // cannot exceed `cf_max`, so we can avoid the clipping
                     tok = rc_tok >> 11;
                     dq = (ac_dq.wrapping_mul(tok) >> dq_shift) as c_int;
-                    assert!(dq <= cf_max);
+                    // Holds for every stream: max AC step x 14 is below `cf_max` at
+                    // each bit depth (8: 1828*14, 10: 7312*14, 12: 29247*14).
+                    debug_assert!(dq <= cf_max);
                 }
                 cul_level = cul_level.wrapping_add(tok);
                 cf.set(rc, if sign != 0 { -dq } else { dq });
@@ -1775,11 +1786,49 @@ enum MaybeTempPixels<'a, TmpStride> {
     },
 }
 
-fn mc<BD: BitDepth>(
+/// Calls [`mc`] specialized for plane `pl`'s subsampling.
+#[inline(always)]
+fn mc_pl<BD: BitDepth, const PAIR: bool>(
     f: &Rav1dFrameData,
     emu_edge: &mut ScratchEmuEdge,
     b: Bxy,
     dst: MaybeTempPixels<()>,
+    dst2: Option<Rav1dPictureDataComponentOffset>,
+    bw4: c_int,
+    bh4: c_int,
+    bx: c_int,
+    by: c_int,
+    pl: usize,
+    mv: Mv,
+    refp: &Rav1dThreadPicture,
+    refidx: usize,
+    filter_2d: Filter2d,
+) -> Result<(), ()> {
+    match (pl != 0, f.cur.p.layout) {
+        (true, Rav1dPixelLayout::I420) => mc::<BD, true, true, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        ),
+        (true, Rav1dPixelLayout::I422) => mc::<BD, true, false, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        ),
+        _ => mc::<BD, false, false, PAIR>(
+            f, emu_edge, b, dst, dst2, bw4, bh4, bx, by, pl, mv, refp, refidx, filter_2d,
+        ),
+    }
+}
+
+/// `SS_HOR`/`SS_VER` are plane `pl`'s subsampling (see [`mc_pl`]), made constant so
+/// the subsampled geometry folds; luma call sites use [`mc`]`::<BD, false, false>`.
+///
+/// With `PAIR`, `dst2` (if any) is plane `pl + 1`, sharing the subsampling and so the
+/// reference geometry (the two chroma planes of a block are predicted in one call).
+/// Without it, `dst2` is unused and the second-plane code compiles away.
+fn mc<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool, const PAIR: bool>(
+    f: &Rav1dFrameData,
+    emu_edge: &mut ScratchEmuEdge,
+    b: Bxy,
+    dst: MaybeTempPixels<()>,
+    dst2: Option<Rav1dPictureDataComponentOffset>,
     bw4: c_int,
     bh4: c_int,
     bx: c_int,
@@ -1792,10 +1841,11 @@ fn mc<BD: BitDepth>(
 ) -> Result<(), ()> {
     let bd = BD::from_c(f.bitdepth_max);
     let ref_data = &refp.p.data.as_ref().unwrap().data;
-    let cur_data = &f.cur.data.as_ref().unwrap().data;
 
-    let ss_ver = (pl != 0 && f.cur.p.layout == Rav1dPixelLayout::I420) as c_int;
-    let ss_hor = (pl != 0 && f.cur.p.layout != Rav1dPixelLayout::I444) as c_int;
+    let ss_ver = SS_VER as c_int;
+    let ss_hor = SS_HOR as c_int;
+    debug_assert_eq!(ss_ver, (pl != 0 && f.cur.p.layout == Rav1dPixelLayout::I420) as c_int);
+    debug_assert_eq!(ss_hor, (pl != 0 && f.cur.p.layout != Rav1dPixelLayout::I444) as c_int);
     let h_mul = 4 >> ss_hor;
     let v_mul = 4 >> ss_ver;
     let mvx = mv.x as c_int;
@@ -1809,51 +1859,65 @@ fn mc<BD: BitDepth>(
         let w;
         let h;
 
-        if !ref_data[0].ref_eq(&cur_data[0]) {
+        // Intra block copy predicts from the current picture, which is exactly when
+        // the reference is `f.sr_cur` (super-res is off then, so it shares `f.cur`'s data);
+        // comparing the reference itself saves unwrapping `f.cur.data` per call.
+        if !ptr::eq(refp, &f.sr_cur) {
+            debug_assert!(!ref_data[0].ref_eq(&f.cur.data.as_ref().unwrap().data[0]));
             w = f.cur.p.w + ss_hor >> ss_hor;
             h = f.cur.p.h + ss_ver >> ss_ver;
         } else {
             w = f.bw * 4 >> ss_hor;
             h = f.bh * 4 >> ss_ver;
         }
-        let r#ref = if dx < (mx != 0) as c_int * 3
-            || dy < (my != 0) as c_int * 3
-            || dx + bw4 * h_mul + (mx != 0) as c_int * 4 > w
-            || dy + bh4 * v_mul + (my != 0) as c_int * 4 > h
-        {
-            let emu_edge_buf = emu_edge.buf_mut::<BD>();
-            f.dsp.mc.emu_edge.call::<BD>(
-                (bw4 * h_mul + (mx != 0) as c_int * 7) as intptr_t,
-                (bh4 * v_mul + (my != 0) as c_int * 7) as intptr_t,
-                w as intptr_t,
-                h as intptr_t,
-                (dx - (mx != 0) as c_int * 3) as intptr_t,
-                (dy - (my != 0) as c_int * 3) as intptr_t,
-                emu_edge_buf,
-                192,
-                &ref_data[pl],
-            );
-            let stride = 192;
-            Rav1dPictureDataComponentOffset {
-                data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
-                offset: stride * (my != 0) as usize * 3 + (mx != 0) as usize * 3,
-            }
-        } else {
-            let r#ref = &ref_data[pl];
-            r#ref.with_offset::<BD>() + (dy as isize * r#ref.pixel_stride::<BD>()) + dx as usize
-        };
+        macro_rules! plane {
+            ($dst:expr, $pl:expr) => {{
+                let (dst, pl) = ($dst, $pl);
+                let r#ref = if dx < (mx != 0) as c_int * 3
+                    || dy < (my != 0) as c_int * 3
+                    || dx + bw4 * h_mul + (mx != 0) as c_int * 4 > w
+                    || dy + bh4 * v_mul + (my != 0) as c_int * 4 > h
+                {
+                    let emu_edge_buf = emu_edge.buf_mut::<BD>();
+                    f.dsp.mc.emu_edge.call::<BD>(
+                        (bw4 * h_mul + (mx != 0) as c_int * 7) as intptr_t,
+                        (bh4 * v_mul + (my != 0) as c_int * 7) as intptr_t,
+                        w as intptr_t,
+                        h as intptr_t,
+                        (dx - (mx != 0) as c_int * 3) as intptr_t,
+                        (dy - (my != 0) as c_int * 3) as intptr_t,
+                        emu_edge_buf,
+                        192,
+                        &ref_data[pl],
+                    );
+                    let stride = 192;
+                    Rav1dPictureDataComponentOffset {
+                        data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
+                        offset: stride * (my != 0) as usize * 3 + (mx != 0) as usize * 3,
+                    }
+                } else {
+                    let r#ref = &ref_data[pl];
+                    r#ref.with_offset::<BD>() + (dy as isize * r#ref.pixel_stride::<BD>()) + dx as usize
+                };
 
-        let w = bw4 * h_mul;
-        let h = bh4 * v_mul;
-        let mx = mx << (ss_hor == 0) as u8;
-        let my = my << (ss_ver == 0) as u8;
-        match dst {
-            MaybeTempPixels::NonTemp { dst } => {
-                f.dsp.mc.mc[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, bd);
-            }
-            MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
-                f.dsp.mc.mct[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, bd);
-            }
+                let w = bw4 * h_mul;
+                let h = bh4 * v_mul;
+                let mx = mx << (ss_hor == 0) as u8;
+                let my = my << (ss_ver == 0) as u8;
+                match dst {
+                    MaybeTempPixels::NonTemp { dst } => {
+                        f.dsp.mc.mc[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, bd);
+                    }
+                    MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
+                        f.dsp.mc.mct[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, bd);
+                    }
+                }
+            }};
+        }
+        plane!(dst, pl);
+        if let (true, Some(dst)) = (PAIR, dst2) {
+            let dst: MaybeTempPixels<()> = MaybeTempPixels::NonTemp { dst };
+            plane!(dst, pl + 1);
         }
     } else {
         assert!(!ptr::eq(refp, &f.sr_cur));
@@ -1890,45 +1954,55 @@ fn mc<BD: BitDepth>(
 
         let w = refp.p.p.w + ss_hor >> ss_hor;
         let h = refp.p.p.h + ss_ver >> ss_ver;
-        let r#ref = if left < 3 || top < 3 || right + 4 > w || bottom + 4 > h {
-            let emu_edge_buf = emu_edge.buf_mut::<BD>();
-            f.dsp.mc.emu_edge.call::<BD>(
-                (right - left + 7) as intptr_t,
-                (bottom - top + 7) as intptr_t,
-                w as intptr_t,
-                h as intptr_t,
-                (left - 3) as intptr_t,
-                (top - 3) as intptr_t,
-                emu_edge_buf,
-                320,
-                &ref_data[pl],
-            );
-            if debug_block_info!(f, b) {
-                println!("Emu");
-            }
-            let stride = 320;
-            Rav1dPictureDataComponentOffset {
-                data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
-                offset: stride * 3 + 3,
-            }
-        } else {
-            let r#ref = &ref_data[pl];
-            r#ref.with_offset::<BD>() + (top as isize * r#ref.pixel_stride::<BD>()) + left as isize
-        };
+        macro_rules! plane {
+            ($dst:expr, $pl:expr) => {{
+                let (dst, pl) = ($dst, $pl);
+                let r#ref = if left < 3 || top < 3 || right + 4 > w || bottom + 4 > h {
+                    let emu_edge_buf = emu_edge.buf_mut::<BD>();
+                    f.dsp.mc.emu_edge.call::<BD>(
+                        (right - left + 7) as intptr_t,
+                        (bottom - top + 7) as intptr_t,
+                        w as intptr_t,
+                        h as intptr_t,
+                        (left - 3) as intptr_t,
+                        (top - 3) as intptr_t,
+                        emu_edge_buf,
+                        320,
+                        &ref_data[pl],
+                    );
+                    if debug_block_info!(f, b) {
+                        println!("Emu");
+                    }
+                    let stride = 320;
+                    Rav1dPictureDataComponentOffset {
+                        data: &Rav1dPictureDataComponent::wrap_buf::<BD>(emu_edge_buf, stride),
+                        offset: stride * 3 + 3,
+                    }
+                } else {
+                    let r#ref = &ref_data[pl];
+                    r#ref.with_offset::<BD>() + (top as isize * r#ref.pixel_stride::<BD>()) + left as isize
+                };
 
-        let w = bw4 * h_mul;
-        let h = bh4 * v_mul;
-        let mx = pos_x & 0x3ff;
-        let my = pos_y & 0x3ff;
-        let dx = f.svc[refidx][0].step;
-        let dy = f.svc[refidx][1].step;
-        match dst {
-            MaybeTempPixels::NonTemp { dst } => {
-                f.dsp.mc.mc_scaled[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, dx, dy, bd);
-            }
-            MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
-                f.dsp.mc.mct_scaled[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, dx, dy, bd);
-            }
+                let w = bw4 * h_mul;
+                let h = bh4 * v_mul;
+                let mx = pos_x & 0x3ff;
+                let my = pos_y & 0x3ff;
+                let dx = f.svc[refidx][0].step;
+                let dy = f.svc[refidx][1].step;
+                match dst {
+                    MaybeTempPixels::NonTemp { dst } => {
+                        f.dsp.mc.mc_scaled[filter_2d].call::<BD>(dst, r#ref, w, h, mx, my, dx, dy, bd);
+                    }
+                    MaybeTempPixels::Temp { tmp, tmp_stride: _ } => {
+                        f.dsp.mc.mct_scaled[filter_2d].call::<BD>(tmp, r#ref, w, h, mx, my, dx, dy, bd);
+                    }
+                }
+            }};
+        }
+        plane!(dst, pl);
+        if let (true, Some(dst)) = (PAIR, dst2) {
+            let dst: MaybeTempPixels<()> = MaybeTempPixels::NonTemp { dst };
+            plane!(dst, pl + 1);
         }
     }
 
@@ -1970,7 +2044,7 @@ fn obmc<BD: BitDepth>(
             if a_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(step4, b_dim[0]);
                 let oh4 = cmp::min(b_dim[1], 16) >> 1;
-                mc::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -1983,6 +2057,7 @@ fn obmc<BD: BitDepth>(
                             offset: 0,
                         },
                     },
+                    None,
                     ow4 as c_int,
                     oh4 as c_int * 3 + 3 >> 2,
                     t.b.x + x,
@@ -2018,7 +2093,7 @@ fn obmc<BD: BitDepth>(
             if l_r.r#ref.r#ref[0] > 0 {
                 let ow4 = cmp::min(b_dim[0], 16) >> 1;
                 let oh4 = cmp::min(step4, b_dim[1]);
-                mc::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2031,6 +2106,7 @@ fn obmc<BD: BitDepth>(
                             offset: 0,
                         },
                     },
+                    None,
                     ow4 as c_int,
                     oh4 as c_int,
                     t.b.x,
@@ -2854,17 +2930,22 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
     let has_chroma = f.cur.p.layout != Rav1dPixelLayout::I400
         && (bw4 > ss_hor || t.b.x & 1 != 0)
         && (bh4 > ss_ver || t.b.y & 1 != 0);
-    let chr_layout_idx = if f.cur.p.layout == Rav1dPixelLayout::I400 {
-        Rav1dPixelLayout::I400
-    } else {
-        Rav1dPixelLayout::I444 - f.cur.p.layout
-    } as usize;
-    let chr_layout_idx_w_mask = f
-        .cur
-        .p
-        .layout
-        .try_into()
-        .unwrap_or(Rav1dPixelLayoutSubSampled::I444);
+    // Only the wedge, masked compound and inter-intra paths need these, so they are
+    // derived there rather than for every inter block.
+    let chr_layout_idx = || {
+        (if f.cur.p.layout == Rav1dPixelLayout::I400 {
+            Rav1dPixelLayout::I400
+        } else {
+            Rav1dPixelLayout::I444 - f.cur.p.layout
+        }) as usize
+    };
+    let chr_layout_idx_w_mask = || {
+        f.cur
+            .p
+            .layout
+            .try_into()
+            .unwrap_or(Rav1dPixelLayoutSubSampled::I444)
+    };
 
     // prediction
     let cbh4 = bh4 + ss_ver >> ss_ver;
@@ -2879,11 +2960,12 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         // intrabc
         assert!(!frame_hdr.size.super_res.enabled);
         let scratch = t.scratch.inter_mut();
-        mc::<BD>(
+        mc::<BD, false, false, false>(
             f,
             &mut scratch.emu_edge,
             t.b,
             MaybeTempPixels::NonTemp { dst: y_dst },
+            None,
             bw4,
             bh4,
             t.b.x,
@@ -2896,13 +2978,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
         )?;
         if has_chroma {
             for pl in 1..3 {
-                mc::<BD>(
+                mc_pl::<BD, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
                     MaybeTempPixels::NonTemp {
                         dst: cur_data[pl].with_offset::<BD>() + uvdstoff,
                     },
+                    None,
                     bw4 << (bw4 == ss_hor) as c_int,
                     bh4 << (bh4 == ss_ver) as c_int,
                     t.b.x & !ss_hor,
@@ -2944,7 +3027,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     &frame_hdr.gmv[inter.r#ref[i] as usize],
                 )?;
             } else {
-                mc::<BD>(
+                mc::<BD, false, false, false>(
                     f,
                     &mut scratch.emu_edge,
                     t.b,
@@ -2952,6 +3035,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         tmp: &mut tmp[i],
                         tmp_stride: (),
                     },
+                    None,
                     bw4,
                     bh4,
                     t.b.x,
@@ -2987,7 +3071,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 );
             }
             CompInterType::Seg => {
-                f.dsp.mc.w_mask[chr_layout_idx_w_mask].call(
+                f.dsp.mc.w_mask[chr_layout_idx_w_mask()].call(
                     y_dst,
                     &tmp[inter.nd.one_d.mask_sign() as usize],
                     &tmp[!inter.nd.one_d.mask_sign() as usize],
@@ -3011,7 +3095,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     bd,
                 );
                 if has_chroma {
-                    mask = DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx]
+                    mask = DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx()]
                         [inter.nd.one_d.mask_sign() as usize]
                         [inter.nd.one_d.wedge_idx as usize];
                 }
@@ -3041,7 +3125,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                             &frame_hdr.gmv[inter.r#ref[i] as usize],
                         )?;
                     } else {
-                        mc::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut scratch.emu_edge,
                             t.b,
@@ -3049,6 +3133,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                                 tmp: &mut tmp[i],
                                 tmp_stride: (),
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x,
@@ -3123,11 +3208,12 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 },
             )?;
         } else {
-            mc::<BD>(
+            mc::<BD, false, false, false>(
                 f,
                 &mut t.scratch.inter_mut().emu_edge,
                 t.b,
                 MaybeTempPixels::NonTemp { dst: y_dst },
+                None,
                 bw4,
                 bh4,
                 t.b.x,
@@ -3234,13 +3320,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                 if bw4 == 1 && bh4 == ss_ver {
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize - 1);
-                        mc::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x - 1,
@@ -3273,13 +3360,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*t.l.filter[0].index(by4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[1] + t.b.x as usize - 1);
-                        mc::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + v_off,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x - 1,
@@ -3309,13 +3397,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         [*f.a[t.a].filter[0].index(bx4 as usize) as usize];
                     for pl in 0..2 {
                         let r = *f.rf.r.index(r[0] + t.b.x as usize);
-                        mc::<BD>(
+                        mc_pl::<BD, false>(
                             f,
                             &mut t.scratch.inter_mut().emu_edge,
                             t.b,
                             MaybeTempPixels::NonTemp {
                                 dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + h_off,
                             },
+                            None,
                             bw4,
                             bh4,
                             t.b.x,
@@ -3341,13 +3430,14 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     v_off = 2 * BD::pxstride(f.cur.stride[1]);
                 }
                 for pl in 0..2 {
-                    mc::<BD>(
+                    mc_pl::<BD, false>(
                         f,
                         &mut t.scratch.inter_mut().emu_edge,
                         t.b,
                         MaybeTempPixels::NonTemp {
                             dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff + h_off + v_off,
                         },
+                        None,
                         bw4,
                         bh4,
                         t.b.x,
@@ -3385,27 +3475,28 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         )?;
                     }
                 } else {
-                    for pl in 0..2 {
-                        mc::<BD>(
-                            f,
-                            &mut t.scratch.inter_mut().emu_edge,
-                            t.b,
-                            MaybeTempPixels::NonTemp {
-                                dst: cur_data[1 + pl].with_offset::<BD>() + uvdstoff,
-                            },
-                            bw4 << (bw4 == ss_hor) as c_int,
-                            bh4 << (bh4 == ss_ver) as c_int,
-                            t.b.x & !ss_hor,
-                            t.b.y & !ss_ver,
-                            1 + pl,
-                            inter.nd.one_d.mv[0],
-                            refp,
-                            inter.r#ref[0] as usize,
-                            filter_2d,
-                        )?;
-                        let uv_dst = cur_data[1 + pl].with_offset::<BD>() + uvdstoff;
-                        if inter.motion_mode == MotionMode::Obmc {
-                            obmc::<BD>(f, t, uv_dst, b_dim, 1 + pl, bx4, by4, w4, h4)?;
+                    let uv_dst = |pl: usize| cur_data[1 + pl].with_offset::<BD>() + uvdstoff;
+                    // Both chroma planes in one call, as they share the reference geometry.
+                    // OBMC for each plane then follows (it only touches that plane).
+                    mc_pl::<BD, true>(
+                        f,
+                        &mut t.scratch.inter_mut().emu_edge,
+                        t.b,
+                        MaybeTempPixels::NonTemp { dst: uv_dst(0) },
+                        Some(uv_dst(1)),
+                        bw4 << (bw4 == ss_hor) as c_int,
+                        bh4 << (bh4 == ss_ver) as c_int,
+                        t.b.x & !ss_hor,
+                        t.b.y & !ss_ver,
+                        1,
+                        inter.nd.one_d.mv[0],
+                        refp,
+                        inter.r#ref[0] as usize,
+                        filter_2d,
+                    )?;
+                    if inter.motion_mode == MotionMode::Obmc {
+                        for pl in 0..2 {
+                            obmc::<BD>(f, t, uv_dst(pl), b_dim, 1 + pl, bx4, by4, w4, h4)?;
                         }
                     }
                 }
@@ -3415,11 +3506,11 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                     // transform size...
                     let ii_mask = match interintra_type {
                         InterIntraType::Blend => {
-                            DAV1D_II_MASKS[bs as usize][chr_layout_idx]
+                            DAV1D_II_MASKS[bs as usize][chr_layout_idx()]
                                 [inter.nd.one_d.interintra_mode.get() as usize]
                         }
                         InterIntraType::Wedge => {
-                            DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx][0]
+                            DAV1D_WEDGE_MASKS[bs as usize][chr_layout_idx()][0]
                                 [inter.nd.one_d.wedge_idx as usize]
                         }
                     };

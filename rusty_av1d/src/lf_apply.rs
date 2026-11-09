@@ -391,6 +391,11 @@ fn filter_plane_cols_y<BD: BitDepth>(
         } else {
             mask.each_ref().map(|[_, b]| b.get() as u32)
         };
+        // An all-zero mask filters nothing (the filter only visits set bits),
+        // and most columns inside larger transform blocks have no edges.
+        if hmask == [0; 3] {
+            continue;
+        }
         let lvl = |y| lvl + (4 * x + y);
         lf_sb.y.h.call::<BD>(f, y_dst(x), &hmask, lvl(0), len);
     }
@@ -423,6 +428,9 @@ fn filter_plane_rows_y<BD: BitDepth>(
         let vmask = mask[y % mask.len()] // To elide the bounds check.
             .each_ref()
             .map(|[a, b]| a.get() as u32 | ((b.get() as u32) << 16));
+        if vmask == [0; 3] {
+            continue; // Nothing to filter; see `filter_plane_cols_y`.
+        }
         let lvl = |y| lvl + (4 * i * b4_stride + y);
         lf_sb.y.v.call::<BD>(f, y_dst(i), &vmask, lvl(1), w);
     }
@@ -465,6 +473,9 @@ fn filter_plane_cols_uv<BD: BitDepth>(
             mask.each_ref().map(|[_, b]| b.get() as u32)
         };
         let hmask = [hmask[0], hmask[1], 0];
+        if hmask == [0; 3] {
+            continue; // Nothing to filter; see `filter_plane_cols_y`.
+        }
         let lvl = |y| lvl + (4 * x + y);
         lf_sb.uv.h.call::<BD>(f, u_dst(x), &hmask, lvl(2), len);
         lf_sb.uv.h.call::<BD>(f, v_dst(x), &hmask, lvl(3), len);
@@ -503,6 +514,9 @@ fn filter_plane_rows_uv<BD: BitDepth>(
             .each_ref()
             .map(|[a, b]| a.get() as u32 | ((b.get() as u32) << (16 >> ss_hor)));
         let vmask = [vmask[0], vmask[1], 0];
+        if vmask == [0; 3] {
+            continue; // Nothing to filter; see `filter_plane_cols_y`.
+        }
         let lvl = |y| lvl + (4 * i * b4_stride + y);
         lf_sb.uv.v.call::<BD>(f, u_dst(i), &vmask, lvl(2), w);
         lf_sb.uv.v.call::<BD>(f, v_dst(i), &vmask, lvl(3), w);

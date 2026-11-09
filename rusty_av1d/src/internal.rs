@@ -1056,8 +1056,14 @@ pub struct ScratchInterIntra {
 // Larger of the two between `ScratchInter` and `ScratchInterIntra`.
 const SCRATCH_SIZE: usize = mem::size_of::<ScratchInter>();
 #[derive(FromZeroes)]
-#[repr(C)]
+// Aligned to the strictest of `ScratchInter` / `ScratchInterIntra` (64): the
+// typed views below then pass zerocopy's alignment test by construction, so
+// the per-block `mut_from_prefix` folds to a pointer cast instead of a runtime
+// `ptr & 63` test with a panic arm.
+#[repr(C, align(64))]
 pub struct TaskContextScratch([u8; SCRATCH_SIZE]);
+const _: () = assert!(mem::align_of::<ScratchInter>() <= 64);
+const _: () = assert!(mem::align_of::<ScratchInterIntra>() <= 64);
 
 impl TaskContextScratch {
     pub fn inter_mut(&mut self) -> &mut ScratchInter {

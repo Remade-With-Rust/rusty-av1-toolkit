@@ -731,7 +731,11 @@ impl ContextWriter<'_> {
     if bo.0.x >= self.bc.blocks.cols() || bo.0.y >= self.bc.blocks.rows() {
       return;
     }
-    debug_assert!(self.bc.blocks[bo].is_inter());
+    // The block's own mode cell is only written on writers that keep the
+    // block context (prom_av1e024 skips that fill on counting writers, whose
+    // trials never read it), so only those can check it. The caller asserts
+    // the coded mode is inter on every writer.
+    debug_assert!(W::COUNTS_ONLY || self.bc.blocks[bo].is_inter());
     debug_assert!(bsize > BlockSize::BLOCK_4X4);
     debug_assert!(!tx_size.is_rect() || bsize.is_rect_tx_allowed());
 
@@ -1252,8 +1256,12 @@ impl ContextWriter<'_> {
     );
     let last = usize::from(eob) - 1;
     let (body, last_c) = coeffs.split_at_mut(last);
+    // Scan positions are below the coded area (<= MAX_CODED_TX_SQUARE, a power
+    // of two), so the mask never changes `pos`; it lets the index be proven in
+    // range and drops a bounds check per coefficient.
+    const _: () = assert!(MAX_CODED_TX_SQUARE.is_power_of_two());
     for (coeff, &pos) in body.iter_mut().zip(&scan[..last]) {
-      coeff.write(ctx_area[pos as usize] as i8);
+      coeff.write(ctx_area[pos as usize & (MAX_CODED_TX_SQUARE - 1)] as i8);
     }
     // the eob position's context depends only on its scan index
     let eob_ctx: i8 = if last == 0 {
@@ -1270,6 +1278,9 @@ impl ContextWriter<'_> {
     unsafe { slice_assume_init_mut(coeffs) }
   }
 
+  // Called once per coefficient above NUM_BASE_LEVELS from the coefficient
+  // loop; a plain `#[inline]` hint was declined there (measured no-op).
+  #[inline(always)]
   pub fn get_br_ctx(
     levels: &[u8],
     coeff_idx: usize, // raster order

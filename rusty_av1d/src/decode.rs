@@ -571,12 +571,15 @@ fn order_palette(
     {
         let have_left = j > 0;
 
-        assert!(have_left || have_top);
+        // Invariants by construction (debug-only): palette indices are decoded
+        // below `pal_sz <= 8`, and each case adds distinct values, so `order`
+        // fills to exactly 8 entries.
+        debug_assert!(have_left || have_top);
 
         let mut mask = 0u8;
         let mut o_idx = 0;
         let mut add = |v: u8| {
-            assert!(v < u8::BITS as u8);
+            debug_assert!(v < u8::BITS as u8);
             order[o_idx] = v;
             o_idx += 1;
             mask |= 1 << v;
@@ -621,7 +624,7 @@ fn order_palette(
                 o_idx += 1;
             }
         }
-        assert!(o_idx == u8::BITS as usize);
+        debug_assert!(o_idx == u8::BITS as usize);
         have_top = true;
         offset += stride - 1;
     }
@@ -1096,7 +1099,10 @@ fn decode_b(
     let has_chroma = f.cur.p.layout != Rav1dPixelLayout::I400
         && (bw4 > ss_hor || t.b.x & 1 != 0)
         && (bh4 > ss_ver || t.b.y & 1 != 0);
-    let frame_type = f.frame_hdr.as_ref().unwrap().frame_type;
+    // Bound once: `f` holds interior mutability, so each `f.frame_hdr()` would
+    // reload and re-test the `Option` after every intervening store.
+    let frame_hdr: &Rav1dFrameHeader = &f.frame_hdr.as_ref().unwrap();
+    let frame_type = frame_hdr.frame_type;
 
     let FrameThreadPassState::First(ts_c) = pass else {
         match &b.ii {
@@ -1241,7 +1247,6 @@ fn decode_b(
 
     // segment_id (if seg_feature for skip/ref/gmv is enabled)
     let mut seg_pred = false;
-    let frame_hdr: &Rav1dFrameHeader = &f.frame_hdr.as_ref().unwrap();
     if frame_hdr.segmentation.enabled != 0 {
         if frame_hdr.segmentation.update_map == 0 {
             b.seg_id = f
@@ -1693,7 +1698,6 @@ fn decode_b(
 
         let mut y_mode = y_mode;
         let mut y_angle = y_angle;
-        let seq_hdr = f.seq_hdr();
         if y_mode == DC_PRED
             && pal_sz[0] == 0
             && cmp::max(b_dim[2], b_dim[3]) <= 3
@@ -1787,8 +1791,6 @@ fn decode_b(
             }
         }
 
-        let frame_hdr = f.frame_hdr();
-
         let tx = if frame_hdr.segmentation.lossless[b.seg_id.get()] {
             b.uvtx = TxfmSize::S4x4;
             b.uvtx
@@ -1815,7 +1817,8 @@ fn decode_b(
         };
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
 
-        let intra = Av1BlockIntra {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Intra(Av1BlockIntra {
             y_mode,
             uv_mode,
             tx,
@@ -1823,17 +1826,19 @@ fn decode_b(
             y_angle,
             uv_angle,
             cfl_alpha,
+        });
+        let Av1BlockIntraInter::Intra(intra) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Intra(intra.clone()); // cheap 9-byte clone
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_intra)(f, t, Some(ts_c), bs, intra_edge_flags, b, &intra);
+            (bd_fn.recon_b_intra)(f, t, Some(ts_c), bs, intra_edge_flags, b, intra);
         }
 
-        if f.frame_hdr().loopfilter.level_y != [0, 0] {
+        if frame_hdr.loopfilter.level_y != [0, 0] {
             let lflvl = match ts.lflvl.get() {
                 TileStateRef::Frame => &f.lf.lvl,
                 TileStateRef::Local => &*ts.lflvlmem.try_read().unwrap(),
@@ -1870,7 +1875,7 @@ fn decode_b(
         } else {
             y_mode
         };
-        let is_inter_or_switch = f.frame_hdr().frame_type.is_inter_or_switch();
+        let is_inter_or_switch = frame_hdr.frame_type.is_inter_or_switch();
         CaseSet::<32, false>::many(
             [(&t.l, t_dim.lh, 1), (ta, t_dim.lw, 0)],
             [bh4 as usize, bw4 as usize],
@@ -1922,7 +1927,6 @@ fn decode_b(
                 );
             }
         }
-        let frame_hdr = f.frame_hdr();
         if frame_hdr.frame_type.is_inter_or_switch() || frame_hdr.allow_intrabc {
             splat_intraref(c, t, &f.rf, bs, bw4 as usize, bh4 as usize);
         }
@@ -2052,7 +2056,8 @@ fn decode_b(
         };
 
         b.uvtx = uvtx;
-        let inter = Av1BlockInter {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Inter(Av1BlockInter {
             nd: Av1BlockInter1d {
                 mv: [r#ref, Default::default()],
                 ..Default::default()
@@ -2068,14 +2073,16 @@ fn decode_b(
             interintra_type: Default::default(),
             tx_split0,
             tx_split1,
+        });
+        let Av1BlockIntraInter::Inter(inter) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Inter(inter.clone()); // Cheap 24-byte clone
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, &inter)?;
+            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, inter)?;
         }
 
         splat_intrabc_mv(c, t, &f.rf, bs, r#ref, bw4 as usize, bh4 as usize);
@@ -2943,7 +2950,8 @@ fn decode_b(
         } = read_vartx_tree(t, f, ts_c, b, bs, bx4, by4);
 
         b.uvtx = uvtx;
-        let inter = Av1BlockInter {
+        // Built in place and borrowed back, rather than a local cloned into `b.ii`.
+        b.ii = Av1BlockIntraInter::Inter(Av1BlockInter {
             nd,
             comp_type,
             inter_mode,
@@ -2955,17 +2963,18 @@ fn decode_b(
             interintra_type,
             tx_split0,
             tx_split1,
+        });
+        let Av1BlockIntraInter::Inter(inter) = &b.ii else {
+            unreachable!()
         };
-        b.ii = Av1BlockIntraInter::Inter(inter.clone());
 
         // reconstruction
         if t.frame_thread.pass == 1 {
             (bd_fn.read_coef_blocks)(f, t, ts_c, bs, b);
         } else {
-            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, &inter)?;
+            (bd_fn.recon_b_inter)(f, t, Some(ts_c), bs, b, inter)?;
         }
 
-        let frame_hdr = f.frame_hdr();
         if frame_hdr.loopfilter.level_y != [0, 0] {
             let is_globalmv =
                 (inter_mode == if is_comp { GLOBALMV_GLOBALMV } else { GLOBALMV }) as c_int;
@@ -3017,9 +3026,9 @@ fn decode_b(
 
         // context updates
         if is_comp {
-            splat_tworef_mv(c, t, &f.rf, bs, &inter, bw4 as usize, bh4 as usize);
+            splat_tworef_mv(c, t, &f.rf, bs, inter, bw4 as usize, bh4 as usize);
         } else {
-            splat_oneref_mv(c, t, &f.rf, bs, &inter, bw4 as usize, bh4 as usize);
+            splat_oneref_mv(c, t, &f.rf, bs, inter, bw4 as usize, bh4 as usize);
         }
 
         CaseSet::<32, false>::many(
@@ -3057,7 +3066,6 @@ fn decode_b(
     }
 
     // update contexts
-    let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
     if frame_hdr.segmentation.enabled != 0 && frame_hdr.segmentation.update_map != 0 {
         // Need checked casts here because we're using `from_raw_parts_mut` and an overflow would be UB.
         let [by, bx, bh4, bw4] = [t.b.y, t.b.x, bh4, bw4].map(|it| usize::try_from(it).unwrap());
@@ -3869,12 +3877,12 @@ fn setup_tile(
 
 fn read_restoration_info(
     ts: &Rav1dTileState,
+    ts_c: &mut Rav1dTileStateContext,
     lr: &mut Av1RestorationUnit,
     p: usize,
     frame_type: Rav1dRestorationType,
     debug_block_info: bool,
 ) {
-    let ts_c = &mut *ts.context.try_lock().unwrap();
     let lr_ref = ts.lr_ref.try_read().unwrap()[p];
 
     if frame_type == Rav1dRestorationType::Switchable {
@@ -4088,6 +4096,9 @@ pub(crate) fn rav1d_decode_tile_sbrow(
     let sb128y = t.b.y >> 5;
     t.a = (col_sb128_start + tile_row * f.sb128w) as usize;
     t.lf_mask = Some((sb128y * f.sb128w + col_sb128_start) as usize);
+    // Locked once for the superblock row rather than per superblock (and again per
+    // restoration plane): this tile's context is only used by this thread meanwhile.
+    let mut ts_c = ts.context.try_lock().unwrap();
     for bx in (ts.tiling.col_start..ts.tiling.col_end).step_by(sb_step as usize) {
         t.b.x = bx;
         if c.flush.load(Ordering::Acquire) {
@@ -4149,7 +4160,7 @@ pub(crate) fn rav1d_decode_tile_sbrow(
                         .try_write()
                         .unwrap();
 
-                    read_restoration_info(ts, &mut lr, p, frame_type, debug_block_info!(f, t.b));
+                    read_restoration_info(ts, &mut ts_c, &mut lr, p, frame_type, debug_block_info!(f, t.b));
                 }
             } else {
                 let x = 4 * t.b.x >> ss_hor;
@@ -4168,14 +4179,14 @@ pub(crate) fn rav1d_decode_tile_sbrow(
                     .try_write()
                     .unwrap();
 
-                read_restoration_info(ts, &mut lr, p, frame_type, debug_block_info!(f, t.b));
+                read_restoration_info(ts, &mut ts_c, &mut lr, p, frame_type, debug_block_info!(f, t.b));
             }
         }
         decode_sb(
             c,
             t,
             f,
-            &mut FrameThreadPassState::First(&mut f.ts[t.ts].context.try_lock().unwrap()),
+            &mut FrameThreadPassState::First(&mut ts_c),
             root_bl,
             EdgeIndex::root(),
         )?;
@@ -4184,6 +4195,7 @@ pub(crate) fn rav1d_decode_tile_sbrow(
             t.lf_mask = t.lf_mask.map(|i| i + 1);
         }
     }
+    drop(ts_c);
 
     if f.seq_hdr().ref_frame_mvs != 0
         && c.tc.len() > 1

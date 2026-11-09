@@ -460,6 +460,9 @@ pub struct Rav1dRefmvsDSPContext {
     pub splat_mv: splat_mv::Fn,
 }
 
+// `always`: ~155K calls per 60 inter frames at ~36 instructions, a third of it call
+// overhead (8 args, 2 on the stack); inlined, intra neighbours also skip the call.
+#[inline(always)]
 fn add_spatial_candidate(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
@@ -541,6 +544,8 @@ fn add_spatial_candidate(
     }
 }
 
+// `always`: ~50K calls each per rav1e60 decode, with 13 arguments (7 on the stack).
+#[inline(always)]
 fn scan_row(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
@@ -610,6 +615,8 @@ fn scan_row(
     }
 }
 
+// `always`: ~50K calls each per rav1e60 decode, with 13 arguments (7 on the stack).
+#[inline(always)]
 fn scan_col(
     mvstack: &mut [RefMvsCandidate],
     cnt: &mut usize,
@@ -677,6 +684,21 @@ fn scan_col(
         cand_bh4 = cand_b.bs.dimensions()[1] as i32;
         assert!(cand_bh4 < bh4);
         len = cmp::max(step, cand_bh4);
+    }
+}
+
+/// Stable sort by descending weight, i.e. `sort_by_key(|cand| -cand.weight)`.
+///
+/// Written out as an insertion sort: there are at most 8 candidates and usually 1-3,
+/// where the standard library's (also insertion) sort is mostly an out-of-line call.
+#[inline(always)]
+fn sort_by_weight(cands: &mut [RefMvsCandidate]) {
+    for i in 1..cands.len() {
+        let mut j = i;
+        while j > 0 && cands[j - 1].weight < cands[j].weight {
+            cands.swap(j - 1, j);
+            j -= 1;
+        }
     }
 }
 
@@ -766,6 +788,9 @@ fn add_temporal_candidate(
     };
 }
 
+// `always`: called from the candidate search with `cnt`; inlined, it no longer forces
+// the count through memory on every append.
+#[inline(always)]
 fn add_compound_extended_candidate(
     same: &mut [RefMvsCandidate],
     same_count: &mut [usize; 4],
@@ -835,6 +860,9 @@ fn add_compound_extended_candidate(
     }
 }
 
+// `always`: called from the candidate search with `cnt`; inlined, it no longer forces
+// the count through memory on every append.
+#[inline(always)]
 fn add_single_extended_candidate(
     mvstack: &mut [RefMvsCandidate; 8],
     cnt: &mut usize,
@@ -1165,10 +1193,8 @@ pub(crate) fn rav1d_refmvs_find(
     };
 
     // sorting (nearest, then "secondary")
-    // Previously used bubble sort; now we use Rust's stable sort,
-    // which for small slices is insertion sort.
-    mvstack[..nearest_cnt].sort_by_key(|cand| -cand.weight);
-    mvstack[nearest_cnt..*cnt].sort_by_key(|cand| -cand.weight);
+    sort_by_weight(&mut mvstack[..nearest_cnt]);
+    sort_by_weight(&mut mvstack[nearest_cnt..*cnt]);
 
     if r#ref.r#ref[1] > 0 {
         if *cnt < 2 {

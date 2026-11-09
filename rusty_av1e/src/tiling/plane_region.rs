@@ -387,6 +387,29 @@ macro_rules! plane_region_common {
         self.to_frame_block_offset(TileBlockOffset(BlockOffset { x: 0, y: 0 }))
       }
 
+      /// `self.subregion(area).frame_block_offset()`, without constructing the
+      /// subregion (and its bounds asserts, which only guard its data pointer).
+      #[inline(always)]
+      pub fn subregion_frame_block_offset(&self, area: Area) -> PlaneBlockOffset {
+        if self.data.is_null() {
+          // `subregion` returns an empty region, whose rect is at the origin.
+          return PlaneBlockOffset(BlockOffset { x: 0, y: 0 });
+        }
+        let rect = area.to_rect(
+          self.plane_cfg.xdec,
+          self.plane_cfg.ydec,
+          self.rect.width,
+          self.rect.height,
+        );
+        debug_assert!(rect.x >= 0 && rect.x as usize <= self.rect.width);
+        debug_assert!(rect.y >= 0 && rect.y as usize <= self.rect.height);
+        let PlaneConfig { xdec, ydec, .. } = self.plane_cfg;
+        PlaneBlockOffset(BlockOffset {
+          x: (self.rect.x + rect.x) as usize >> MI_SIZE_LOG2 - xdec,
+          y: (self.rect.y + rect.y) as usize >> MI_SIZE_LOG2 - ydec,
+        })
+      }
+
       pub(crate) fn scratch_copy(&self) -> Plane<T> {
         let &Rect { width, height, .. } = self.rect();
         let &PlaneConfig { xdec, ydec, .. } = self.plane_cfg;

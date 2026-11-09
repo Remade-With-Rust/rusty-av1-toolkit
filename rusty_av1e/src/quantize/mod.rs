@@ -28,10 +28,25 @@ use std::mem;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 pub fn get_log_tx_scale(tx_size: TxSize) -> usize {
-  let num_pixels = tx_size.area();
-
-  Into::<usize>::into(num_pixels > 256)
-    + Into::<usize>::into(num_pixels > 1024)
+  /// By `tx_size as usize`: 1 for more than 256 pixels, plus 1 for more
+  /// than 1024 (a lookup rather than the area from width and height).
+  const LOG_TX_SCALE: [u8; TxSize::TX_SIZES_ALL] = {
+    use TxSize::*;
+    let sizes = [
+      TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64, TX_4X8, TX_8X4, TX_8X16,
+      TX_16X8, TX_16X32, TX_32X16, TX_32X64, TX_64X32, TX_4X16, TX_16X4,
+      TX_8X32, TX_32X8, TX_16X64, TX_64X16,
+    ];
+    let mut table = [0; TxSize::TX_SIZES_ALL];
+    let mut i = 0;
+    while i < sizes.len() {
+      let num_pixels = sizes[i].area();
+      table[sizes[i] as usize] = (num_pixels > 256) as u8 + (num_pixels > 1024) as u8;
+      i += 1;
+    }
+    table
+  };
+  LOG_TX_SCALE[tx_size as usize] as usize
 }
 
 pub fn dc_q(qindex: u8, delta_q: i8, bit_depth: usize) -> NonZeroU16 {
@@ -108,6 +123,64 @@ pub struct QuantizationContext {
   ac_offset0: u32,
   ac_offset1: u32,
   ac_mul_add: (u32, u32, u32),
+
+  /// Per coding plane, the quantizers its last [`Self::update_plane`] derived.
+  planes: [PlaneQuantizers; 3],
+}
+
+/// The quantizers and their division constants for one `(qindex, dc_delta_q,
+/// ac_delta_q, bit depth)`, as cached by [`QuantizationContext::update_plane`].
+#[derive(Debug, Clone, Copy)]
+struct PlaneQuantizers {
+  /// The inputs, packed by [`PlaneQuantizers::key`], or `u32::MAX` for none.
+  key: u32,
+  dc_quant: NonZeroU16,
+  dc_mul_add: (u32, u32, u32),
+  ac_quant: NonZeroU16,
+  ac_mul_add: (u32, u32, u32),
+  /// [`QuantizationContext::offsets`] for inter (0) and intra (1).
+  offsets: [[u32; 4]; 2],
+}
+
+impl PlaneQuantizers {
+  const NONE: Self = PlaneQuantizers {
+    key: u32::MAX,
+    dc_quant: NonZeroU16::MIN,
+    dc_mul_add: (0, 0, 0),
+    ac_quant: NonZeroU16::MIN,
+    ac_mul_add: (0, 0, 0),
+    offsets: [[0; 4]; 2],
+  };
+
+  /// Everything the quantizers depend on: `qindex`, the deltas, and the
+  /// bit-depth table index that [`dc_q`] and [`ac_q`] select. Below 2^26, so
+  /// never [`Self::NONE`]'s key.
+  #[inline(always)]
+  fn key(qindex: u8, dc_delta_q: i8, ac_delta_q: i8, bit_depth: usize) -> u32 {
+    let bd = ((bit_depth ^ 8) >> 1).min(2);
+    u32::from(qindex)
+      | u32::from(dc_delta_q as u8) << 8
+      | u32::from(ac_delta_q as u8) << 16
+      | (bd as u32) << 24
+  }
+
+  #[inline(never)]
+  fn derive(
+    key: u32, qindex: u8, bit_depth: usize, dc_delta_q: i8, ac_delta_q: i8,
+  ) -> Self {
+    let dc_quant = dc_q(qindex, dc_delta_q, bit_depth);
+    let ac_quant = ac_q(qindex, ac_delta_q, bit_depth);
+    PlaneQuantizers {
+      key,
+      dc_quant,
+      dc_mul_add: divu_gen(dc_quant.into()),
+      ac_quant,
+      ac_mul_add: divu_gen(ac_quant.into()),
+      offsets: [false, true].map(|is_intra| {
+        QuantizationContext::offsets(dc_quant, ac_quant, is_intra)
+      }),
+    }
+  }
 }
 
 impl Default for QuantizationContext {
@@ -122,6 +195,7 @@ impl Default for QuantizationContext {
       ac_offset0: Default::default(),
       ac_offset1: Default::default(),
       ac_mul_add: Default::default(),
+      planes: [PlaneQuantizers::NONE; 3],
     }
   }
 }
@@ -153,7 +227,33 @@ const fn divu_pair(x: u32, d: (u32, u32, u32)) -> u32 {
   let a = a as u64;
   let b = b as u64;
 
-  (((a * x + b) >> 32) >> shift) as u32
+  // One shift: `shift` is floor(log2(d)) <= 31 (see `divu_gen`), so `32 + shift`
+  // is always a valid u64 shift and equals shifting by 32 and then by `shift`.
+  ((a * x + b) >> (32 + shift)) as u32
+}
+
+/// The highest scan index (`iscan`) among coefficients at least `deadzone` in
+/// magnitude, or 0.
+#[inline(always)]
+fn max_scan_index_over<T: Coefficient>(
+  iscan: &[u16], coeffs: &[T], deadzone: T,
+) -> u16 {
+  iscan
+    .iter()
+    .zip(coeffs)
+    .map(|(&i, &c)| if c.abs() >= deadzone { i } else { 0 })
+    .max()
+    .unwrap_or(0)
+}
+
+/// [`max_scan_index_over`] compiled with AVX2 enabled, where LLVM vectorizes the
+/// reduction (unsigned 16-bit max is not in the x86-64 baseline).
+#[cfg(nasm_x86_64)]
+#[target_feature(enable = "avx2")]
+unsafe fn max_scan_index_over_avx2<T: Coefficient>(
+  iscan: &[u16], coeffs: &[T], deadzone: T,
+) -> u16 {
+  max_scan_index_over(iscan, coeffs, deadzone)
 }
 
 #[inline]
@@ -228,6 +328,51 @@ impl QuantizationContext {
     self.ac_quant = ac_q(qindex, ac_delta_q, bit_depth);
     self.ac_mul_add = divu_gen(self.ac_quant.into());
 
+    self.set_offsets(is_intra);
+  }
+
+  /// [`Self::update`] for coding plane `plane` (0 luma, 1 and 2 chroma).
+  ///
+  /// The quantizers and their division constants (two table lookups and two
+  /// 64-bit divisions) depend only on `qindex`, the deltas and the bit depth,
+  /// which are per frame apart from `qindex`, while the planes are coded in
+  /// turn with different deltas. So each plane keeps what it last derived and
+  /// reuses it while its inputs are unchanged.
+  #[inline]
+  pub fn update_plane(
+    &mut self, plane: usize, qindex: u8, tx_size: TxSize, is_intra: bool,
+    bit_depth: usize, dc_delta_q: i8, ac_delta_q: i8,
+  ) {
+    let key = PlaneQuantizers::key(qindex, dc_delta_q, ac_delta_q, bit_depth);
+    let q = &mut self.planes[plane];
+    if q.key != key {
+      *q = PlaneQuantizers::derive(
+        key, qindex, bit_depth, dc_delta_q, ac_delta_q,
+      );
+    }
+    let q = *q;
+    self.log_tx_scale = get_log_tx_scale(tx_size);
+    self.dc_quant = q.dc_quant;
+    self.dc_mul_add = q.dc_mul_add;
+    self.ac_quant = q.ac_quant;
+    self.ac_mul_add = q.ac_mul_add;
+    [self.dc_offset, self.ac_offset0, self.ac_offset1, self.ac_offset_eob] =
+      q.offsets[is_intra as usize];
+  }
+
+  /// The rounding offsets, from the quantizers and `is_intra`.
+  #[inline(always)]
+  fn set_offsets(&mut self, is_intra: bool) {
+    [self.dc_offset, self.ac_offset0, self.ac_offset1, self.ac_offset_eob] =
+      Self::offsets(self.dc_quant, self.ac_quant, is_intra);
+  }
+
+  /// The rounding offsets `[dc, ac0, ac1, ac_eob]` for the quantizers and
+  /// `is_intra`.
+  #[inline(always)]
+  fn offsets(
+    dc_quant: NonZeroU16, ac_quant: NonZeroU16, is_intra: bool,
+  ) -> [u32; 4] {
     // All of these biases were derived by measuring the cost of coding
     // a zero vs coding a one on any given coefficient position, or, in
     // the case of the EOB bias, the cost of coding the block with
@@ -255,19 +400,18 @@ impl QuantizationContext {
     // post-deadzoning.
     //
     // [1] https://jmvalin.ca/notes/theoretical_results.pdf
-    self.dc_offset =
-      self.dc_quant.get() as u32 * (if is_intra { 109 } else { 108 }) / 256;
-    self.ac_offset0 =
-      self.ac_quant.get() as u32 * (if is_intra { 98 } else { 97 }) / 256;
-    self.ac_offset1 =
-      self.ac_quant.get() as u32 * (if is_intra { 109 } else { 108 }) / 256;
-    self.ac_offset_eob =
-      self.ac_quant.get() as u32 * (if is_intra { 88 } else { 44 }) / 256;
+    [
+      dc_quant.get() as u32 * (if is_intra { 109 } else { 108 }) / 256,
+      ac_quant.get() as u32 * (if is_intra { 98 } else { 97 }) / 256,
+      ac_quant.get() as u32 * (if is_intra { 109 } else { 108 }) / 256,
+      ac_quant.get() as u32 * (if is_intra { 88 } else { 44 }) / 256,
+    ]
   }
 
   #[inline]
   pub fn quantize<T: Coefficient>(
     &self, coeffs: &[T], qcoeffs: &mut [T], tx_size: TxSize, tx_type: TxType,
+    cpu: crate::cpu_features::CpuFeatureLevel,
   ) -> u16 {
     let _prof = crate::prof::scope(crate::prof::Stage::Quantize);
     let scan = av1_scan_orders[tx_size as usize][tx_type as usize].scan;
@@ -292,12 +436,19 @@ impl QuantizationContext {
     );
     let eob = {
       let _q1 = crate::prof::scope(crate::prof::Stage::QuantEobScan);
-      let eob_minus_one = iscan
-        .iter()
-        .zip(coeffs)
-        .map(|(&i, &c)| if c.abs() >= deadzone { i } else { 0 })
-        .max()
-        .unwrap_or(0);
+      #[cfg(nasm_x86_64)]
+      let eob_minus_one =
+        if cpu >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+          // SAFETY: AVX2 is available, checked just above.
+          unsafe { max_scan_index_over_avx2(iscan, coeffs, deadzone) }
+        } else {
+          max_scan_index_over(iscan, coeffs, deadzone)
+        };
+      #[cfg(not(nasm_x86_64))]
+      let eob_minus_one = {
+        let _ = cpu;
+        max_scan_index_over(iscan, coeffs, deadzone)
+      };
       // We skip the DC coefficient since it has its own quantizer index.
       if eob_minus_one > 0 {
         eob_minus_one + 1
@@ -317,6 +468,17 @@ impl QuantizationContext {
     // To that end, we want to bias more toward rounding to zero for
     // that tail of zeroes and ones than we do for the larger coefficients.
     let _q2 = crate::prof::scope(crate::prof::Stage::QuantMainLoop);
+    // The AC positions in scan order, as a plain slice: the same positions as
+    // `scan.iter().take(eob).skip(1)` without the adapters' per-step bookkeeping.
+    let ac_scan = scan.get(1..usize::from(eob).min(scan.len())).unwrap_or(&[]);
+    // Every scan has a power-of-two length (the coded transform area) and holds
+    // positions below it, so with both buffers sliced to that length, masking a
+    // position with `n - 1` changes nothing but proves the index in bounds.
+    let n = scan.len();
+    debug_assert!(n.is_power_of_two());
+    let mask = n - 1;
+    let coeffs = &coeffs[..n];
+    let qcoeffs = &mut qcoeffs[..n];
     // prom_av1e014 tried a two-pass split here (precompute both rounding
     // candidates, resolve the level_mode recurrence separately): REFUTED,
     // +39% slower — OoO already hides the 1-bit carried chain, and the
@@ -330,8 +492,8 @@ impl QuantizationContext {
       let mut level_mode: u32 = 1;
       let ac_quant = self.ac_quant.get() as u32;
       let ac_doffset = self.ac_offset1 - self.ac_offset0;
-      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
-        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+      for &pos in ac_scan {
+        let coeff = i32::cast_from(coeffs[pos as usize & mask]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
         let level0 = divu_pair(abs_coeff, self.ac_mul_add);
@@ -345,7 +507,7 @@ impl QuantizationContext {
         level_mode =
           if abs_qcoeff == 1 { level_mode } else { (abs_qcoeff > 1) as u32 };
 
-        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+        qcoeffs[pos as usize & mask] = T::cast_from(copysign(abs_qcoeff, coeff));
       }
     } else {
       // Normal mode (--racecar off): the stock rav1e branchy loop, verbatim
@@ -353,8 +515,8 @@ impl QuantizationContext {
       // this exists only for single-binary A/B.
       let mut level_mode = 1;
       let ac_quant = self.ac_quant.get() as u32;
-      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
-        let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
+      for &pos in ac_scan {
+        let coeff = i32::cast_from(coeffs[pos as usize & mask]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
         let level0 = divu_pair(abs_coeff, self.ac_mul_add);
@@ -372,7 +534,7 @@ impl QuantizationContext {
           level_mode = 1;
         }
 
-        qcoeffs[pos as usize] = T::cast_from(copysign(abs_qcoeff, coeff));
+        qcoeffs[pos as usize & mask] = T::cast_from(copysign(abs_qcoeff, coeff));
       }
     }
 

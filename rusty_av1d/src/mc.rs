@@ -33,6 +33,7 @@ use crate::internal::{
 };
 use crate::levels::Filter2d;
 use crate::pic_or_buf::PicOrBuf;
+use crate::scratch;
 use crate::strided::Strided as _;
 use crate::tables::{
     dav1d_mc_subpel_filters, dav1d_mc_warp_filter, dav1d_obmc_masks, dav1d_resize_filter,
@@ -109,6 +110,12 @@ impl FilterResult {
 
 const MID_STRIDE: usize = 128;
 
+thread_local! {
+    /// Horizontal-pass scratch for the 2-D subpel filters, reused without zeroing:
+    /// each filter writes every `mid` cell its vertical pass reads (see [`scratch`]).
+    static MC_MID: scratch::Arena = const { scratch::Arena::new() };
+}
+
 fn filter_8tap_mid(mid: &[[i16; MID_STRIDE]], x: usize, f: &[i8; 8]) -> FilterResult {
     let pixel = (0..f.len()).map(|y| f[y] as i32 * mid[y][x] as i32).sum();
     FilterResult { pixel }
@@ -126,6 +133,16 @@ fn filter_8tap<BD: BitDepth>(
             f[y] as i32 * px.to::<i32>()
         })
         .sum();
+    FilterResult { pixel }
+}
+
+/// [`filter_8tap`] along a row (`stride == 1`), from a slice of that row which
+/// starts 3 pixels left of output column 0. Reads the same pixels, but with one
+/// slice check per output pixel instead of 8 accessor guards.
+#[inline]
+fn filter_8tap_row<BD: BitDepth>(row: &[BD::Pixel], x: usize, f: &[i8; 8]) -> FilterResult {
+    let px = &row[x..][..8];
+    let pixel = (0..f.len()).map(|y| f[y] as i32 * px[y].to::<i32>()).sum();
     FilterResult { pixel }
 }
 
@@ -159,12 +176,13 @@ fn put_8tap_rust<BD: BitDepth>(
     if let Some(fh) = fh {
         if let Some(fv) = fv {
             let tmp_h = h + 7;
-            let mut mid = [[0i16; MID_STRIDE]; 135]; // Default::default()
+            scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 135]| {
 
             for y in 0..tmp_h {
                 let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    mid[y][x] = filter_8tap::<BD>(src, x, fh, 1)
+                    mid[y][x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .get();
                 }
@@ -179,13 +197,15 @@ fn put_8tap_rust<BD: BitDepth>(
                         .clip(bd);
                 }
             }
+            });
         } else {
             for y in 0..h {
                 let src = src + y as isize * src.pixel_stride::<BD>();
                 let dst = dst + y as isize * dst.pixel_stride::<BD>();
                 let dst = &mut *dst.slice_mut::<BD>(w);
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    dst[x] = filter_8tap::<BD>(src, x, fh, 1)
+                    dst[x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd2(6, intermediate_rnd)
                         .clip(bd);
                 }
@@ -223,7 +243,7 @@ fn put_8tap_scaled_rust<BD: BitDepth>(
     let intermediate_bits = bd.get_intermediate_bits();
     let intermediate_rnd = (1 << intermediate_bits) >> 1;
     let tmp_h = ((h - 1) * dy + my >> 10) + 8;
-    let mut mid = [[0i16; MID_STRIDE]; 256 + 7]; // Default::default()
+    scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 256 + 7]| {
 
     for y in 0..tmp_h {
         let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
@@ -264,6 +284,7 @@ fn put_8tap_scaled_rust<BD: BitDepth>(
         mid = &mut mid[(my >> 10)..];
         my &= 0x3ff;
     }
+    });
 }
 
 #[inline(never)]
@@ -284,12 +305,13 @@ fn prep_8tap_rust<BD: BitDepth>(
     if let Some(fh) = fh {
         if let Some(fv) = fv {
             let tmp_h = h + 7;
-            let mut mid = [[0i16; MID_STRIDE]; 135]; // Default::default()
+            scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 135]| {
 
             for y in 0..tmp_h {
                 let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    mid[y][x] = filter_8tap::<BD>(src, x, fh, 1)
+                    mid[y][x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .get();
                 }
@@ -303,12 +325,14 @@ fn prep_8tap_rust<BD: BitDepth>(
                         .sub_prep_bias::<BD>();
                 }
             }
+            });
         } else {
             for y in 0..h {
                 let src = src + y as isize * src.pixel_stride::<BD>();
                 let tmp = &mut tmp[y * w..][..w];
+                let row = (src + -3isize).slice::<BD>(w + 7);
                 for x in 0..w {
-                    tmp[x] = filter_8tap::<BD>(src, x, fh, 1)
+                    tmp[x] = filter_8tap_row::<BD>(&row, x, fh)
                         .rnd(6 - intermediate_bits)
                         .sub_prep_bias::<BD>();
                 }
@@ -344,7 +368,7 @@ fn prep_8tap_scaled_rust<BD: BitDepth>(
 ) {
     let intermediate_bits = bd.get_intermediate_bits();
     let tmp_h = ((h - 1) * dy + my >> 10) + 8;
-    let mut mid = [[0i16; MID_STRIDE]; 256 + 7]; // Default::default()
+    scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 256 + 7]| {
 
     for y in 0..tmp_h {
         let src = src + (y as isize - 3) * src.pixel_stride::<BD>();
@@ -381,6 +405,7 @@ fn prep_8tap_scaled_rust<BD: BitDepth>(
         mid = &mut mid[(my >> 10)..];
         my &= 0x3ff;
     }
+    });
 }
 
 fn filter_bilin_mid(mid: &[[i16; MID_STRIDE]], x: usize, mxy: usize) -> FilterResult {
@@ -417,7 +442,7 @@ fn put_bilin_rust<BD: BitDepth>(
 
     if mx != 0 {
         if my != 0 {
-            let mut mid = [[0i16; MID_STRIDE]; 129]; // Default::default()
+            scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 129]| {
             let tmp_h = h + 1;
 
             for y in 0..tmp_h {
@@ -437,6 +462,7 @@ fn put_bilin_rust<BD: BitDepth>(
                         .clip(bd)
                 }
             }
+            });
         } else {
             for y in 0..h {
                 let src = src + y as isize * src.pixel_stride::<BD>();
@@ -479,7 +505,7 @@ fn put_bilin_scaled_rust<BD: BitDepth>(
 ) {
     let intermediate_bits = bd.get_intermediate_bits();
     let tmp_h = ((h - 1) * dy + my >> 10) + 2;
-    let mut mid = [[0i16; MID_STRIDE]; 256 + 1];
+    scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 256 + 1]| {
 
     for y in 0..tmp_h {
         let src = src + y as isize * src.pixel_stride::<BD>();
@@ -509,6 +535,7 @@ fn put_bilin_scaled_rust<BD: BitDepth>(
         mid = &mut mid[(my >> 10)..];
         my &= 0x3ff;
     }
+    });
 }
 
 fn prep_bilin_rust<BD: BitDepth>(
@@ -523,7 +550,7 @@ fn prep_bilin_rust<BD: BitDepth>(
     let intermediate_bits = bd.get_intermediate_bits();
     if mx != 0 {
         if my != 0 {
-            let mut mid = [[0i16; MID_STRIDE]; 129];
+            scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 129]| {
             let tmp_h = h + 1;
 
             for y in 0..tmp_h {
@@ -542,6 +569,7 @@ fn prep_bilin_rust<BD: BitDepth>(
                         .sub_prep_bias::<BD>()
                 }
             }
+            });
         } else {
             for y in 0..h {
                 let src = src + y as isize * src.pixel_stride::<BD>();
@@ -581,7 +609,7 @@ fn prep_bilin_scaled_rust<BD: BitDepth>(
 ) {
     let intermediate_bits = bd.get_intermediate_bits();
     let tmp_h = ((h - 1) * dy + my >> 10) + 2;
-    let mut mid = [[0i16; MID_STRIDE]; 256 + 1];
+    scratch::with1(&MC_MID, |mid: &mut [[i16; MID_STRIDE]; 256 + 1]| {
 
     for y in 0..tmp_h {
         let src = src + y as isize * src.pixel_stride::<BD>();
@@ -610,6 +638,7 @@ fn prep_bilin_scaled_rust<BD: BitDepth>(
         mid = &mut mid[(my >> 10)..];
         my &= 0x3ff;
     }
+    });
 }
 
 fn avg_rust<BD: BitDepth>(

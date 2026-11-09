@@ -53,6 +53,9 @@ extern {
 ///
 /// - If in `check_asm` mode, panics on mismatch between native and ASM results.
 #[allow(clippy::let_and_return)]
+// Inlined into `cdef_dist_wxh`'s 8x8 walk so the two `PlaneRegion`s it is handed
+// need not be built in memory (the asm path reads only their data pointer and stride).
+#[inline]
 pub fn cdef_dist_kernel<T: Pixel>(
   src: &PlaneRegion<'_, T>, dst: &PlaneRegion<'_, T>, w: usize, h: usize,
   bit_depth: usize, cpu: CpuFeatureLevel,

@@ -350,6 +350,28 @@ pub fn frozen() -> bool {
   })
 }
 
+// --- writer knob mask -----------------------------------------------------------
+//
+// fastsym / fastrate / frozen are tested on every symbol and flat bit of every
+// RDO trial (~192M times per 10 frames). Each OnceLock test is an acquire load,
+// a state compare, a branch and a value load; the writer resolves all three once
+// at construction into one byte (`WriterBase::knobs`) and tests a bit instead.
+pub const WK_FASTSYM: u8 = 1 << 0;
+pub const WK_FASTRATE: u8 = 1 << 1;
+pub const WK_FROZEN: u8 = 1 << 2;
+
+static WRITER_KNOBS: OnceLock<u8> = OnceLock::new();
+
+/// The knob mask a new `WriterBase` caches.
+#[inline]
+pub fn writer_knobs() -> u8 {
+  *WRITER_KNOBS.get_or_init(|| {
+    (u8::from(fastsym()) * WK_FASTSYM)
+      | (u8::from(fastrate()) * WK_FASTRATE)
+      | (u8::from(frozen()) * WK_FROZEN)
+  })
+}
+
 // --- prom_av1e017: luma reuse across intra chroma-mode trials ----------------
 //
 // The intra chroma loop re-codes the ENTIRE block (all luma planes) per

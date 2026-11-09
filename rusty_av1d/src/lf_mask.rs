@@ -1,10 +1,10 @@
 use std::cmp;
 use std::ffi::c_int;
+use std::iter::zip;
 use std::mem::MaybeUninit;
 
 use crate::ctypes::ptrdiff_t;
 use parking_lot::RwLock;
-use zerocopy::FromBytes;
 
 use crate::align::{Align16, AlignedVec2, ArrayDefault};
 use crate::ctx::CaseSet;
@@ -147,6 +147,38 @@ fn decomp_tx(
     };
 }
 
+/// ORs bit `base + i` into `masks[level]` for the `i`th of `levels`,
+/// where each level's mask is stored as two halves split at bit `split`.
+///
+/// One word per level is accumulated in registers and each level's halves are
+/// ORed into `masks` once, rather than a read-modify-write of `masks` per row/column.
+/// `levels` iterates pre-sliced rows/columns, so there is no bounds check per element.
+#[inline(always)]
+fn or_edge_masks<const L: usize>(
+    masks: &[[RelaxedAtomic<u16>; 2]; L],
+    base: usize,
+    split: u32,
+    levels: impl Iterator<Item = u8>,
+) {
+    let mut acc = [0u32; L];
+    let mut bit = 1u32 << base;
+    for level in levels {
+        acc[level as usize] |= bit;
+        bit <<= 1;
+    }
+    for (masks, acc) in zip(masks, acc) {
+        if acc == 0 {
+            continue;
+        }
+        let halves = [(acc & ((1 << split) - 1)) as u16, (acc >> split) as u16];
+        for (mask, half) in zip(masks, halves) {
+            if half != 0 {
+                mask.update(|it| it | half);
+            }
+        }
+    }
+}
+
 #[inline]
 fn mask_edges_inter(
     masks: &[[[[RelaxedAtomic<u16>; 2]; 3]; 32]; 2],
@@ -179,24 +211,20 @@ fn mask_edges_inter(
     // * `txa[1][1][y][0..w4]` where `y` is the start of a block edge
 
     // left block edge
-    for y in 0..h4 {
-        let mask = 1u32 << (by4 + y);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        // SAFETY: y < h4 so txa[0][0][y][0] is initialized.
-        let txa_y = unsafe { txa[0][0][y][0].assume_init() };
-        masks[0][bx4][cmp::min(txa_y, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let left = zip(&txa[0][0][..h4], &l[..h4]).map(|(txa, &l)| {
+        // SAFETY: rows `..h4` so txa[0][0][y][0] is initialized.
+        let txa_y = unsafe { txa[0].assume_init() };
+        cmp::min(txa_y, l)
+    });
+    or_edge_masks(&masks[0][bx4], by4, 16, left);
 
     // top block edge
-    for x in 0..w4 {
-        let mask = 1u32 << (bx4 + x);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        // SAFETY: x < h4 so txa[1][0][0][x] is initialized.
-        let txa_x = unsafe { txa[1][0][0][x].assume_init() };
-        masks[1][by4][cmp::min(txa_x, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let top = zip(&txa[1][0][0][..w4], &a[..w4]).map(|(txa, &a)| {
+        // SAFETY: columns `..w4` so txa[1][0][0][x] is initialized.
+        let txa_x = unsafe { txa.assume_init() };
+        cmp::min(txa_x, a)
+    });
+    or_edge_masks(&masks[1][by4], bx4, 16, top);
     if !skip {
         // inner (tx) left|right edges
         for y in 0..h4 {
@@ -277,22 +305,12 @@ fn mask_edges_intra(
     let thl4c = cmp::min(2, thl4);
 
     // left block edge
-    for y in 0..h4 {
-        let mask = 1u32 << (by4 + y);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        masks[0][bx4][cmp::min(twl4c, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let left = l[..h4].iter().map(|&l| cmp::min(twl4c, l));
+    or_edge_masks(&masks[0][bx4], by4, 16, left);
 
     // top block edge
-    for x in 0..w4 {
-        let mask = 1u32 << (bx4 + x);
-        let sidx = (mask >= 0x10000) as usize;
-        let smask = mask >> (sidx << 4);
-        // SAFETY: No other mutable references to this sub-slice exist on other
-        // threads.
-        masks[1][by4][cmp::min(thl4c, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let top = a[..w4].iter().map(|&a| cmp::min(thl4c, a));
+    or_edge_masks(&masks[1][by4], bx4, 16, top);
 
     // inner (tx) left|right edges
     let hstep = t_dim.w as usize;
@@ -354,28 +372,19 @@ fn mask_edges_chroma(
     let thl4 = t_dim.lh;
     let twl4c = (twl4 != 0) as u8;
     let thl4c = (thl4 != 0) as u8;
-    let vbits = 4 - ss_ver;
-    let hbits = 4 - ss_hor;
     let vmask = 16 >> ss_ver;
     let hmask = 16 >> ss_hor;
-    let vmax = 1u32 << vmask;
-    let hmax = 1u32 << hmask;
+
+    // Chroma edges are mostly 1-2 units, where indexing beats a sliced iterator's
+    // setup (LLVM unrolls the latter with an odd-count prologue).
 
     // left block edge
-    for y in 0..ch4 {
-        let mask = 1u32 << (cby4 + y);
-        let sidx = (mask >= vmax) as usize;
-        let smask = mask >> (sidx << vbits);
-        masks[0][cbx4][cmp::min(twl4c, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let left = (0..ch4).map(|y| cmp::min(twl4c, l[y]));
+    or_edge_masks(&masks[0][cbx4], cby4, vmask as u32, left);
 
     // top block edge
-    for x in 0..cw4 {
-        let mask = 1u32 << (cbx4 + x);
-        let sidx = (mask >= hmax) as usize;
-        let smask = mask >> (sidx << hbits);
-        masks[1][cby4][cmp::min(thl4c, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    let top = (0..cw4).map(|x| cmp::min(thl4c, a[x]));
+    or_edge_masks(&masks[1][cby4], cbx4, hmask as u32, top);
 
     if !skip_inter {
         // inner (tx) left|right edges
@@ -448,19 +457,14 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let by4 = by & 31;
 
     let filter_level_yuv = filter_level.0.map(|a| a[0][0]);
-    let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
+    // Each 4-byte level cache unit holds the Y levels in `0..2` and the UV levels in `2..4`.
+    let [y0, y1, uv0, uv1] = filter_level_yuv;
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
-        for _y in 0..bh4 {
-            for x in 0..bw4 {
-                let idx = 4 * (level_cache_off + x);
-                // `0.., ..2` is for Y
-                let lvl = &mut *level_cache.index_mut((idx + 0.., ..2));
-                *u16::mut_from(lvl).unwrap() = filter_level_y;
-            }
-            level_cache_off += b4_stride;
-        }
+        let level_cache_off = by * b4_stride + bx;
+        // `0.., ..2` is for Y
+        let (unit, row) = ((4, bw4), (4 * b4_stride, bh4));
+        level_cache.write_strided(4 * level_cache_off + 0, unit, row, [y0, y1]);
 
         mask_edges_intra(&lflvl.filter_y, by4, bx4, bw4, bh4, ytx, ay, ly);
     }
@@ -488,16 +492,10 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
-    for _y in 0..cbh4 {
-        for x in 0..cbw4 {
-            let idx = 4 * (level_cache_off + x);
-            // `2.., ..2` is for UV
-            let lvl = &mut *level_cache.index_mut((idx + 2.., ..2));
-            *u16::mut_from(lvl).unwrap() = filter_level_uv;
-        }
-        level_cache_off += b4_stride;
-    }
+    let level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    // `2.., ..2` is for UV
+    let (unit, row) = ((4, cbw4), (4 * b4_stride, cbh4));
+    level_cache.write_strided(4 * level_cache_off + 2, unit, row, [uv0, uv1]);
 
     mask_edges_chroma(
         &lflvl.filter_uv,
@@ -547,19 +545,14 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let by4 = by & 31;
 
     let filter_level_yuv = filter_level.0.map(|a| a[r#ref][is_gmv]);
-    let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
+    // Each 4-byte level cache unit holds the Y levels in `0..2` and the UV levels in `2..4`.
+    let [y0, y1, uv0, uv1] = filter_level_yuv;
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
-        for _y in 0..bh4 {
-            for x in 0..bw4 {
-                let idx = 4 * (level_cache_off + x);
-                // `0.., ..2` is for Y
-                let lvl = &mut *level_cache.index_mut((idx + 0.., ..2));
-                *u16::mut_from(lvl).unwrap() = filter_level_y;
-            }
-            level_cache_off += b4_stride;
-        }
+        let level_cache_off = by * b4_stride + bx;
+        // `0.., ..2` is for Y
+        let (unit, row) = ((4, bw4), (4 * b4_stride, bh4));
+        level_cache.write_strided(4 * level_cache_off + 0, unit, row, [y0, y1]);
 
         mask_edges_inter(
             &lflvl.filter_y,
@@ -598,16 +591,10 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
-    for _y in 0..cbh4 {
-        for x in 0..cbw4 {
-            let idx = 4 * (level_cache_off + x);
-            // `2.., ..2` is for UV
-            let lvl = &mut *level_cache.index_mut((idx + 2.., ..2));
-            *u16::mut_from(lvl).unwrap() = filter_level_uv;
-        }
-        level_cache_off += b4_stride;
-    }
+    let level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    // `2.., ..2` is for UV
+    let (unit, row) = ((4, cbw4), (4 * b4_stride, cbh4));
+    level_cache.write_strided(4 * level_cache_off + 2, unit, row, [uv0, uv1]);
 
     mask_edges_chroma(
         &lflvl.filter_uv,

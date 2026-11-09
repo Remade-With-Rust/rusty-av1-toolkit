@@ -271,7 +271,7 @@ impl MsacContext {
 pub fn rav1d_msac_decode_bools(s: &mut MsacContext, n: u8) -> c_uint {
     let mut v = 0;
     for _ in 0..n {
-        v = v << 1 | rav1d_msac_decode_bool_equi(s) as c_uint;
+        v = v << 1 | rav1d_msac_decode_bool_equi_bit(s);
     }
     v
 }
@@ -286,7 +286,7 @@ pub fn rav1d_msac_decode_uniform(s: &mut MsacContext, n: c_uint) -> c_int {
     (if v < m {
         v
     } else {
-        (v << 1) - m + rav1d_msac_decode_bool_equi(s) as c_uint
+        (v << 1) - m + rav1d_msac_decode_bool_equi_bit(s)
     }) as c_int
 }
 
@@ -296,11 +296,27 @@ const _: () = assert!(EC_MIN_PROB <= (1 << EC_PROB_SHIFT) / 16);
 
 const EC_WIN_SIZE: usize = mem::size_of::<EcWin>() << 3;
 
-#[inline]
+// Out of line: a refill happens once every few symbols, and keeping it out of
+// the inlined `ctx_norm` keeps every decoder's hot path small.
+#[inline(never)]
 fn ctx_refill(s: &mut MsacContext) {
     let mut c = (EC_WIN_SIZE as c_int) - 24 - s.cnt;
     let mut dif = s.dif;
     s.with_buf(|mut buf| {
+        // Word-at-a-time fast path, identical to the byte loop below: that loop
+        // ORs `!b << c` for c = c0, c0 - 8, ... while c >= 0, i.e. it takes
+        // n = c0 / 8 + 1 bytes, which are the top n bytes of a big-endian load
+        // shifted left by c0 % 8. The result is below 2^(c0 + 8), so it fits the
+        // window on 64-bit (c0 <= 56) and 32-bit (c0 <= 24) targets alike. Fewer
+        // than 8 bytes left (end of the tile data) takes the byte loop, which also
+        // fills past the end with ones.
+        if let (Some(word), true) = (buf.first_chunk::<8>(), c >= 0) {
+            let n = (c >> 3) as usize + 1;
+            let bytes = !u64::from_be_bytes(*word) >> (64 - 8 * n);
+            dif |= (bytes << (c & 7)) as EcWin;
+            c -= 8 * n as c_int;
+            return &buf[n..];
+        }
         loop {
             if buf.is_empty() {
                 // set remaining bits to 1;
@@ -324,7 +340,9 @@ fn ctx_refill(s: &mut MsacContext) {
 fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
     let d = 15 ^ (31 ^ clz(rng));
     let cnt = s.cnt;
-    assert!(rng <= 65535);
+    // Range-coder invariants, debug-only as in dav1d: they hold by construction
+    // for every input, so release builds do not pay a branch per symbol.
+    debug_assert!(rng <= 65535);
     s.dif = dif << d;
     s.rng = rng << d;
     s.cnt = cnt - d;
@@ -339,9 +357,20 @@ fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
     allow(dead_code)
 )]
 fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
+    bool_equi_rust_inline(s)
+}
+
+/// The body of [`rav1d_msac_decode_bool_equi_rust`], always inlined; used
+/// directly only by [`rav1d_msac_decode_bool_equi_coef`].
+#[cfg_attr(
+    all(feature = "asm", any(target_feature = "sse2", target_feature = "neon")),
+    allow(dead_code)
+)]
+#[inline(always)]
+fn bool_equi_rust_inline(s: &mut MsacContext) -> bool {
     let r = s.rng;
     let mut dif = s.dif;
-    assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
+    debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let mut v = (r >> 8 << 7) + EC_MIN_PROB;
     let vw = (v as EcWin) << (EC_WIN_SIZE - 16);
     let ret = dif >= vw;
@@ -358,7 +387,7 @@ fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
 fn rav1d_msac_decode_bool_rust(s: &mut MsacContext, f: c_uint) -> bool {
     let r = s.rng;
     let mut dif = s.dif;
-    assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
+    debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let mut v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
     let vw = (v as EcWin) << (EC_WIN_SIZE - 16);
     let ret = dif >= vw;
@@ -389,13 +418,21 @@ pub fn rav1d_msac_decode_subexp(s: &mut MsacContext, r#ref: c_uint, n: c_uint, m
 ///
 /// `n_symbols` is in the range `0..16`, so it is really a `u4`.
 fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
+    symbol_adapt_rust_inline(s, cdf, n_symbols)
+}
+
+/// The body of [`rav1d_msac_decode_symbol_adapt_rust`], always inlined; used
+/// directly only by the coefficient decoder (see
+/// [`rav1d_msac_decode_symbol_adapt4_coef`]).
+#[inline(always)]
+fn symbol_adapt_rust_inline(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
     let c = (s.dif >> (EC_WIN_SIZE - 16)) as c_uint;
     let r = s.rng >> 8;
     let mut u;
     let mut v = s.rng;
     let mut val = 0;
-    assert!(n_symbols < 16);
-    assert!(cdf[n_symbols as usize] <= 32);
+    debug_assert!(n_symbols < 16);
+    debug_assert!(cdf[n_symbols as usize] <= 32);
     loop {
         u = v;
         v = r * ((cdf[val as usize] >> EC_PROB_SHIFT) as c_uint);
@@ -406,7 +443,7 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
         }
         val += 1;
     }
-    assert!(u <= s.rng);
+    debug_assert!(u <= s.rng);
     ctx_norm(
         s,
         s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
@@ -545,6 +582,39 @@ pub fn rav1d_msac_decode_symbol_adapt4(s: &mut MsacContext, cdf: &mut [u16], n_s
     ret as u8 % 4
 }
 
+/// [`rav1d_msac_decode_symbol_adapt4`] for the coefficient token loop. On the
+/// pure-Rust path (no `asm`, and `wasm32`) the decoder body is inlined there,
+/// where 96% of all symbol decodes happen: the call frame goes and the CDF
+/// length and `n_symbols` become constants. Every other site keeps the
+/// out-of-line body, so code size does not grow with it. The asm paths are
+/// unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_symbol_adapt4_coef(
+    s: &mut MsacContext,
+    cdf: &mut [u16],
+    n_symbols: u8,
+) -> u8 {
+    debug_assert!(n_symbols < 4);
+    let ret;
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_symbol_adapt_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_symbol_adapt4_sse2(&mut s.asm, cdf.as_mut_ptr(), n_symbols as usize)
+            };
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_symbol_adapt_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_symbol_adapt4_neon(&mut s.asm, cdf.as_mut_ptr(), n_symbols as usize)
+            };
+        } else {
+            ret = symbol_adapt_rust_inline(s, cdf, n_symbols);
+        }
+    }
+    debug_assert!(ret < 4);
+    ret as u8 % 4
+}
+
 /// Return value is in the range `0..=n_symbols`.
 ///
 /// `n_symbols` is in the range `0..8`.
@@ -620,6 +690,23 @@ pub fn rav1d_msac_decode_bool_adapt(s: &mut MsacContext, cdf: &mut [u16; 2]) -> 
     }
 }
 
+/// [`rav1d_msac_decode_bool_equi`] as `0` or `1`, for callers that use the bit
+/// arithmetically. The x86 asm already returns exactly 0 or 1 in a 32-bit
+/// register (its `setb al` follows a shift that leaves the rest of `eax` zero,
+/// and the 32-bit build zero-extends `al`), so this skips the `!= 0` and the
+/// re-widening a `bool` round trip costs at every call.
+#[inline(always)]
+pub fn rav1d_msac_decode_bool_equi_bit(s: &mut MsacContext) -> u32 {
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe { dav1d_msac_decode_bool_equi_sse2(&mut s.asm) }
+        } else {
+            rav1d_msac_decode_bool_equi(s) as u32
+        }
+    }
+}
+
 pub fn rav1d_msac_decode_bool_equi(s: &mut MsacContext) -> bool {
     cfg_if! {
         if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
@@ -634,6 +721,28 @@ pub fn rav1d_msac_decode_bool_equi(s: &mut MsacContext) -> bool {
             }
         } else {
             rav1d_msac_decode_bool_equi_rust(s)
+        }
+    }
+}
+
+/// [`rav1d_msac_decode_bool_equi`] for the coefficient sign reads: on the
+/// pure-Rust path the decoder body is inlined there (99% of all equiprobable
+/// bools). The asm paths are unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_bool_equi_coef(s: &mut MsacContext) -> bool {
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe {
+                dav1d_msac_decode_bool_equi_sse2(&mut s.asm) != 0
+            }
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe {
+                dav1d_msac_decode_bool_equi_neon(&mut s.asm) != 0
+            }
+        } else {
+            bool_equi_rust_inline(s)
         }
     }
 }
@@ -677,4 +786,53 @@ pub fn rav1d_msac_decode_hi_tok(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
     }
     debug_assert!(ret < 16);
     ret % 16
+}
+
+/// [`rav1d_msac_decode_hi_tok`] for the coefficient token loop: on the
+/// pure-Rust path its up-to-four 4-ary decodes use the inlined body (see
+/// [`rav1d_msac_decode_symbol_adapt4_coef`]). The asm paths are unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_hi_tok_coef(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    let ret;
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_hi_tok_rust`].
+            ret = (unsafe {
+                dav1d_msac_decode_hi_tok_sse2(&mut s.asm, cdf.as_mut_ptr())
+            }) as u8;
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_hi_tok_rust`].
+            ret = unsafe {
+                dav1d_msac_decode_hi_tok_neon(&mut s.asm, cdf.as_mut_ptr())
+            } as u8;
+        } else {
+            // Only the first decode is inlined: a result below 3 ends the token,
+            // which is the common case. The continuation is rare, so it stays out
+            // of line and does not grow the token loop.
+            let tok_br = symbol_adapt_rust_inline(s, cdf, 3);
+            ret = if tok_br == 3 { hi_tok_rust_tail(s, cdf) } else { 3 + tok_br };
+        }
+    }
+    debug_assert!(ret < 16);
+    ret % 16
+}
+
+/// The continuation of [`rav1d_msac_decode_hi_tok_coef`] after a first `3`.
+#[cfg_attr(
+    all(feature = "asm", any(target_feature = "sse2", target_feature = "neon")),
+    allow(dead_code)
+)]
+#[cold]
+#[inline(never)]
+fn hi_tok_rust_tail(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    let mut tok_br = rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+    let mut tok = 6 + tok_br;
+    if tok_br == 3 {
+        tok_br = rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+        tok = 9 + tok_br;
+        if tok_br == 3 {
+            tok = 12 + rav1d_msac_decode_symbol_adapt_rust(s, cdf, 3);
+        }
+    }
+    tok
 }

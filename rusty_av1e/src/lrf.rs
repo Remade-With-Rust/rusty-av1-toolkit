@@ -478,53 +478,68 @@ impl<'a, T: Pixel> Iterator for VertPaddedIter<'a, T> {
 impl<T: Pixel> ExactSizeIterator for VertPaddedIter<'_, T> {}
 impl<T: Pixel> FusedIterator for VertPaddedIter<'_, T> {}
 
-struct HorzPaddedIter<'a, T: Pixel> {
-  // Active area cropping is done using the length of the slice
-  slice: &'a [T],
-  // x index of the iterator
-  // When less than 0, repeat the first element. When greater than end, repeat
-  // the last element
-  index: isize,
-  // The index at which to terminate. Can be larger than the slice length.
-  end: usize,
-}
+/// The row above the first row of the integral images.
+static INTEGRAL_ZEROS: [u32; 4 + IMAGE_WIDTH_MAX + 3] = [0; 4 + IMAGE_WIDTH_MAX + 3];
 
-impl<'a, T: Pixel> HorzPaddedIter<'a, T> {
-  fn new(
-    slice: &'a [T], start_index: isize, width: usize,
-  ) -> HorzPaddedIter<'a, T> {
-    HorzPaddedIter {
-      slice,
-      index: start_index,
-      end: (width as isize + start_index) as usize,
-    }
+/// One row of the integral images: the running sums (and sums of squares) of
+/// the row padded to `width` elements, `row[clamp(start_index_x + j, 0, len - 1)]`,
+/// each added to the row above.
+///
+/// The padded row is a run of the first element, the row itself, then a run of
+/// the last element, so it is walked as those three runs over pre-sliced rows,
+/// rather than clamping the index of every element.
+#[inline(always)]
+fn integral_image_row<T: Pixel>(
+  row: &[T], start_index_x: isize, width: usize, above: &[u32],
+  sq_above: &[u32], out: &mut [u32], sq_out: &mut [u32],
+) {
+  let len = row.len() as isize;
+  let pad_l = (-start_index_x).clamp(0, width as isize) as usize;
+  let mid_end = (len - start_index_x).clamp(pad_l as isize, width as isize) as usize;
+  let mid = &row[(start_index_x + pad_l as isize) as usize..][..mid_end - pad_l];
+  let first = u32::cast_from(row[0]);
+  let last = u32::cast_from(row[row.len() - 1]);
+
+  let (above, sq_above) = (&above[..width], &sq_above[..width]);
+  let (out, sq_out) = (&mut out[..width], &mut sq_out[..width]);
+  let (out_l, out_rest) = out.split_at_mut(pad_l);
+  let (out_m, out_r) = out_rest.split_at_mut(mid_end - pad_l);
+  let (sq_out_l, sq_out_rest) = sq_out.split_at_mut(pad_l);
+  let (sq_out_m, sq_out_r) = sq_out_rest.split_at_mut(mid_end - pad_l);
+
+  let mut sum: u32 = 0;
+  let mut sq_sum: u32 = 0;
+  // Wrap adds to prevent undefined behaviour on overflow. Overflow is
+  // cancelled out when calculating the sum of a region.
+  let mut step =
+    |current: u32, above: &u32, sq_above: &u32, out: &mut u32, sq_out: &mut u32| {
+      sum = sum.wrapping_add(current);
+      *out = sum.wrapping_add(*above);
+      sq_sum = sq_sum.wrapping_add(current * current);
+      *sq_out = sq_sum.wrapping_add(*sq_above);
+    };
+  for ((a, sa), (o, so)) in above[..pad_l]
+    .iter()
+    .zip(&sq_above[..pad_l])
+    .zip(out_l.iter_mut().zip(sq_out_l.iter_mut()))
+  {
+    step(first, a, sa, o, so);
+  }
+  for ((&v, (a, sa)), (o, so)) in mid
+    .iter()
+    .zip(above[pad_l..mid_end].iter().zip(&sq_above[pad_l..mid_end]))
+    .zip(out_m.iter_mut().zip(sq_out_m.iter_mut()))
+  {
+    step(u32::cast_from(v), a, sa, o, so);
+  }
+  for ((a, sa), (o, so)) in above[mid_end..]
+    .iter()
+    .zip(&sq_above[mid_end..])
+    .zip(out_r.iter_mut().zip(sq_out_r.iter_mut()))
+  {
+    step(last, a, sa, o, so);
   }
 }
-
-impl<'a, T: Pixel> Iterator for HorzPaddedIter<'a, T> {
-  type Item = &'a T;
-
-  #[inline(always)]
-  fn next(&mut self) -> Option<Self::Item> {
-    if self.index < self.end as isize {
-      // clamp to the edges of the frame
-      let x = clamp(self.index, 0, self.slice.len() as isize - 1) as usize;
-      self.index += 1;
-      Some(&self.slice[x])
-    } else {
-      None
-    }
-  }
-
-  #[inline(always)]
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    let size: usize = (self.end as isize - self.index) as usize;
-    (size, Some(size))
-  }
-}
-
-impl<T: Pixel> ExactSizeIterator for HorzPaddedIter<'_, T> {}
-impl<T: Pixel> FusedIterator for HorzPaddedIter<'_, T> {}
 
 #[profiling::function]
 pub fn setup_integral_image<T: Pixel>(
@@ -559,41 +574,28 @@ pub fn setup_integral_image<T: Pixel>(
     stripe_h + (stripe_h & 1),
     crop_h,
   )
-  .map(|row: &[T]| {
-    HorzPaddedIter::new(
-      // Limit how many unique elements we use
-      &row[..row_uniques],
-      start_index_x,
-      left_w + stripe_w + right_w,
-    )
-  });
+  // Limit how many unique elements we use
+  .map(|row: &[T]| &row[..row_uniques]);
+  let width = left_w + stripe_w + right_w;
 
-  // Setup the first row
+  // Setup the first row (the row above it is all zeros)
   {
-    let mut sum: u32 = 0;
-    let mut sq_sum: u32 = 0;
     // Remove the first row and use it outside of the main loop
     let row = rows_iter.next().unwrap();
-    for (src, (integral, sq_integral)) in
-      row.zip(integral_image.iter_mut().zip(sq_integral_image.iter_mut()))
-    {
-      let current = u32::cast_from(*src);
-
-      // Wrap adds to prevent undefined behaviour on overflow. Overflow is
-      // cancelled out when calculating the sum of a region.
-      sum = sum.wrapping_add(current);
-      *integral = sum;
-      sq_sum = sq_sum.wrapping_add(current * current);
-      *sq_integral = sq_sum;
-    }
+    integral_image_row(
+      row,
+      start_index_x,
+      width,
+      &INTEGRAL_ZEROS,
+      &INTEGRAL_ZEROS,
+      integral_image,
+      sq_integral_image,
+    );
   }
   // Calculate all other rows
   let mut integral_slice = &mut integral_image[..];
   let mut sq_integral_slice = &mut sq_integral_image[..];
   for row in rows_iter {
-    let mut sum: u32 = 0;
-    let mut sq_sum: u32 = 0;
-
     // Split the data between the previous row and future rows.
     // This allows us to mutate the current row while accessing the
     // previous row.
@@ -601,23 +603,15 @@ pub fn setup_integral_image<T: Pixel>(
       integral_slice.split_at_mut(integral_image_stride);
     let (sq_integral_row_prev, sq_integral_row) =
       sq_integral_slice.split_at_mut(integral_image_stride);
-    for (
-      src,
-      ((integral_above, sq_integral_above), (integral, sq_integral)),
-    ) in row.zip(
-      integral_row_prev
-        .iter()
-        .zip(sq_integral_row_prev.iter())
-        .zip(integral_row.iter_mut().zip(sq_integral_row.iter_mut())),
-    ) {
-      let current = u32::cast_from(*src);
-      // Wrap adds to prevent undefined behaviour on overflow. Overflow is
-      // cancelled out when calculating the sum of a region.
-      sum = sum.wrapping_add(current);
-      *integral = sum.wrapping_add(*integral_above);
-      sq_sum = sq_sum.wrapping_add(current * current);
-      *sq_integral = sq_sum.wrapping_add(*sq_integral_above);
-    }
+    integral_image_row(
+      row,
+      start_index_x,
+      width,
+      integral_row_prev,
+      sq_integral_row_prev,
+      integral_row,
+      sq_integral_row,
+    );
 
     // The current row also contains all future rows. Replacing the slice with
     // it moves down a row.
@@ -626,24 +620,84 @@ pub fn setup_integral_image<T: Pixel>(
   }
 }
 
+/// Scratch rows for [`sgrproj_stripe_filter`] and [`sgrproj_solve`]:
+/// the box sums `a`/`b` and filter outputs `f` of both radii.
+///
+/// Thread-local and reused rather than zeroed per call: each call writes
+/// every element it reads (the `sgrproj_box_ab_*` and `sgrproj_box_f_*`
+/// kernels fill the rows before they are used), so the zeroing only served
+/// to initialize the arrays. Debug builds poison the rows on every borrow.
+struct SgrScratch {
+  a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2],
+  b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2],
+  f_r2_0: [u32; IMAGE_WIDTH_MAX],
+  f_r2_1: [u32; IMAGE_WIDTH_MAX],
+  a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3],
+  b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3],
+  f_r1: [u32; IMAGE_WIDTH_MAX],
+}
+
+thread_local! {
+  static SGR_SCRATCH: std::cell::RefCell<SgrScratch> = const {
+    std::cell::RefCell::new(SgrScratch {
+      a_r2: [[0; IMAGE_WIDTH_MAX + 2]; 2],
+      b_r2: [[0; IMAGE_WIDTH_MAX + 2]; 2],
+      f_r2_0: [0; IMAGE_WIDTH_MAX],
+      f_r2_1: [0; IMAGE_WIDTH_MAX],
+      a_r1: [[0; IMAGE_WIDTH_MAX + 2]; 3],
+      b_r1: [[0; IMAGE_WIDTH_MAX + 2]; 3],
+      f_r1: [0; IMAGE_WIDTH_MAX],
+    })
+  };
+}
+
+#[inline(always)]
+fn with_sgr_scratch<R>(f: impl FnOnce(&mut SgrScratch) -> R) -> R {
+  SGR_SCRATCH.with_borrow_mut(|scratch| {
+    if cfg!(debug_assertions) {
+      const P: u32 = 0x5a5a_5a5a;
+      for row in scratch.a_r2.iter_mut().chain(&mut scratch.b_r2) {
+        row.fill(P);
+      }
+      for row in scratch.a_r1.iter_mut().chain(&mut scratch.b_r1) {
+        row.fill(P);
+      }
+      scratch.f_r2_0.fill(P);
+      scratch.f_r2_1.fill(P);
+      scratch.f_r1.fill(P);
+    }
+    f(scratch)
+  })
+}
+
 #[profiling::function]
 pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
   set: u8, xqd: [i8; 2], fi: &FrameInvariants<T>,
   integral_image_buffer: &IntegralImageBuffer, integral_image_stride: usize,
   cdeffed: &PlaneSlice<U>, out: &mut PlaneRegionMut<U>,
 ) {
+  with_sgr_scratch(|scratch| {
+    sgrproj_stripe_filter_with(
+      scratch,
+      set,
+      xqd,
+      fi,
+      integral_image_buffer,
+      integral_image_stride,
+      cdeffed,
+      out,
+    )
+  })
+}
+
+#[inline(always)]
+fn sgrproj_stripe_filter_with<T: Pixel, U: Pixel>(
+  scratch: &mut SgrScratch, set: u8, xqd: [i8; 2], fi: &FrameInvariants<T>,
+  integral_image_buffer: &IntegralImageBuffer, integral_image_stride: usize,
+  cdeffed: &PlaneSlice<U>, out: &mut PlaneRegionMut<U>,
+) {
   let &Rect { width: stripe_w, height: stripe_h, .. } = out.rect();
-  let mut a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut f_r2_0: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut f_r2_1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut f_r1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
+  let SgrScratch { a_r2, b_r2, f_r2_0, f_r2_1, a_r1, b_r1, f_r1 } = scratch;
 
   let s_r2: u32 = SGRPROJ_PARAMS_S[set as usize][0];
   let s_r1: u32 = SGRPROJ_PARAMS_S[set as usize][1];
@@ -729,24 +783,24 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
       sgrproj_box_f_r2(
         &ap0,
         &bp0,
-        &mut f_r2_0,
-        &mut f_r2_1,
+        &mut *f_r2_0,
+        &mut *f_r2_1,
         y,
         stripe_w,
         cdeffed,
         fi.cpu_feature_level,
       );
-      [&f_r2_0, &f_r2_1]
+      [&*f_r2_0, &*f_r2_1]
     } else {
       sgrproj_box_f_r0(
-        &mut f_r2_0,
+        &mut *f_r2_0,
         y,
         stripe_w,
         cdeffed,
         fi.cpu_feature_level,
       );
       // share results for both rows
-      [&f_r2_0, &f_r2_0]
+      [&*f_r2_0, &*f_r2_0]
     };
     for dy in 0..(2.min(stripe_h - y)) {
       let y = y + dy;
@@ -770,7 +824,7 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
         sgrproj_box_f_r1(
           &ap1,
           &bp1,
-          &mut f_r1,
+          &mut *f_r1,
           y,
           stripe_w,
           cdeffed,
@@ -778,7 +832,7 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
         );
       } else {
         sgrproj_box_f_r0(
-          &mut f_r1,
+          &mut *f_r1,
           y,
           stripe_w,
           cdeffed,
@@ -814,10 +868,39 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
         }
       }
 
+      /// `apply_filter` compiled with AVX2 enabled, where LLVM vectorizes its
+      /// 32-bit multiplies (`vpmulld`, absent from the x86-64 baseline).
+      #[cfg(nasm_x86_64)]
+      #[target_feature(enable = "avx2")]
+      unsafe fn apply_filter_avx2<U: Pixel>(
+        out: &mut [U], line: &[U], f_r1: &[u32], f_r2_ab: &[u32],
+        stripe_w: usize, bit_depth: usize, w0: i32, w1: i32, w2: i32,
+      ) {
+        apply_filter(out, line, f_r1, f_r2_ab, stripe_w, bit_depth, w0, w1, w2)
+      }
+
+      #[cfg(nasm_x86_64)]
+      if fi.cpu_feature_level >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+        // SAFETY: AVX2 is available, checked just above.
+        unsafe {
+          apply_filter_avx2(
+            &mut out[y],
+            line,
+            &*f_r1,
+            f_r2_ab[dy],
+            stripe_w,
+            fi.sequence.bit_depth,
+            w0,
+            w1,
+            w2,
+          )
+        };
+        continue;
+      }
       apply_filter(
         &mut out[y],
         line,
-        &f_r1,
+        &*f_r1,
         f_r2_ab[dy],
         stripe_w,
         fi.sequence.bit_depth,
@@ -849,17 +932,27 @@ pub fn sgrproj_solve<T: Pixel>(
   integral_image_buffer: &IntegralImageBuffer, input: &PlaneRegion<'_, T>,
   cdeffed: &PlaneSlice<T>, cdef_w: usize, cdef_h: usize,
 ) -> (i8, i8) {
-  let mut a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut f_r2_0: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut f_r2_1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut f_r1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
+  with_sgr_scratch(|scratch| {
+    sgrproj_solve_with(
+      scratch,
+      set,
+      fi,
+      integral_image_buffer,
+      input,
+      cdeffed,
+      cdef_w,
+      cdef_h,
+    )
+  })
+}
+
+#[inline(always)]
+fn sgrproj_solve_with<T: Pixel>(
+  scratch: &mut SgrScratch, set: u8, fi: &FrameInvariants<T>,
+  integral_image_buffer: &IntegralImageBuffer, input: &PlaneRegion<'_, T>,
+  cdeffed: &PlaneSlice<T>, cdef_w: usize, cdef_h: usize,
+) -> (i8, i8) {
+  let SgrScratch { a_r2, b_r2, f_r2_0, f_r2_1, a_r1, b_r1, f_r1 } = scratch;
 
   let s_r2: u32 = SGRPROJ_PARAMS_S[set as usize][0];
   let s_r1: u32 = SGRPROJ_PARAMS_S[set as usize][1];
@@ -948,18 +1041,18 @@ pub fn sgrproj_solve<T: Pixel>(
       sgrproj_box_f_r2(
         &ap0,
         &bp0,
-        &mut f_r2_0,
-        &mut f_r2_1,
+        &mut *f_r2_0,
+        &mut *f_r2_1,
         y,
         cdef_w,
         cdeffed,
         fi.cpu_feature_level,
       );
-      [&f_r2_0, &f_r2_1]
+      [&*f_r2_0, &*f_r2_1]
     } else {
-      sgrproj_box_f_r0(&mut f_r2_0, y, cdef_w, cdeffed, fi.cpu_feature_level);
+      sgrproj_box_f_r0(&mut *f_r2_0, y, cdef_w, cdeffed, fi.cpu_feature_level);
       // share results for both rows
-      [&f_r2_0, &f_r2_0]
+      [&*f_r2_0, &*f_r2_0]
     };
     for dy in 0..(2.min(cdef_h - y)) {
       let y = y + dy;
@@ -983,14 +1076,14 @@ pub fn sgrproj_solve<T: Pixel>(
         sgrproj_box_f_r1(
           &ap1,
           &bp1,
-          &mut f_r1,
+          &mut *f_r1,
           y,
           cdef_w,
           cdeffed,
           fi.cpu_feature_level,
         );
       } else {
-        sgrproj_box_f_r0(&mut f_r1, y, cdef_w, cdeffed, fi.cpu_feature_level);
+        sgrproj_box_f_r0(&mut *f_r1, y, cdef_w, cdeffed, fi.cpu_feature_level);
       }
 
       #[inline(always)]
@@ -1036,12 +1129,39 @@ pub fn sgrproj_solve<T: Pixel>(
         c[1] += sums.c[1] as f64;
       }
 
+      /// `process_line` compiled with AVX2 enabled, where LLVM vectorizes its
+      /// widening multiply-accumulates; the same exact integer sums.
+      #[cfg(nasm_x86_64)]
+      #[target_feature(enable = "avx2")]
+      unsafe fn process_line_avx2<T: Pixel>(
+        h: &mut [[f64; 2]; 2], c: &mut [f64; 2], cdeffed: &[T], input: &[T],
+        f_r1: &[u32], f_r2_ab: &[u32], cdef_w: usize,
+      ) {
+        process_line(h, c, cdeffed, input, f_r1, f_r2_ab, cdef_w)
+      }
+
+      #[cfg(nasm_x86_64)]
+      if fi.cpu_feature_level >= crate::cpu_features::CpuFeatureLevel::AVX2 {
+        // SAFETY: AVX2 is available, checked just above.
+        unsafe {
+          process_line_avx2(
+            &mut h,
+            &mut c,
+            &cdeffed[y],
+            &input[y],
+            &*f_r1,
+            f_r2_01[dy],
+            cdef_w,
+          )
+        };
+        continue;
+      }
       process_line(
         &mut h,
         &mut c,
         &cdeffed[y],
         &input[y],
-        &f_r1,
+        &*f_r1,
         f_r2_01[dy],
         cdef_w,
       );

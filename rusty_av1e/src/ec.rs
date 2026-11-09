@@ -51,6 +51,22 @@ pub trait Writer {
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   );
+  /// The `harvest::WK_*` knob bits this writer resolved at construction.
+  fn knobs(&self) -> u8;
+  /// [`Writer::symbol_with_update_hot`] for a writer whose `knobs()` are all
+  /// clear (the default configuration): no knob tests at all. Callers check
+  /// `knobs()` once per block and pick this path for the whole loop.
+  fn symbol_with_update_plain<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  );
+  /// [`Writer::symbol_with_update`], always inlined. For the per-coefficient
+  /// sites only, where the call frame costs as much as the symbol; every other
+  /// site keeps the out-of-line copy so code size does not grow with it.
+  fn symbol_with_update_hot<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  );
   /// Write a bool using passed in probability
   fn bool(&mut self, val: bool, f: u16);
   /// Write a single bit with flat probability
@@ -131,6 +147,9 @@ impl CountsOnly for WriterBase<WriterEncoder> {
 pub trait StorageBackend {
   /// Store partially-computed range code into given storage backend
   fn store(&mut self, fl: u16, fh: u16, nms: u16);
+  /// [`StorageBackend::store`] for a writer whose knobs are all clear: the
+  /// exact range-coder path with no knob test.
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16);
   /// Return bit-length of encoded stream to date
   fn stream_bits(&mut self) -> usize;
   /// Backend implementation of checkpoint to pass through Writer interface
@@ -151,6 +170,9 @@ pub struct WriterBase<S> {
   /// Extra offset added to `tell()` and `tell_frac()` to approximate costs
   /// of actually coding a symbol
   fake_bits_frac: u32,
+  /// `harvest::WK_*` knob bits, resolved once at construction instead of one
+  /// OnceLock test per symbol.
+  knobs: u8,
   /// Use-specific storage
   s: S,
 }
@@ -200,7 +222,7 @@ pub struct WriterCheckpoint {
 /// Constructor for a counting Writer
 impl WriterCounter {
   #[inline]
-  pub const fn new() -> WriterBase<WriterCounter> {
+  pub fn new() -> WriterBase<WriterCounter> {
     WriterBase::new(WriterCounter { bits: 0 })
   }
 }
@@ -208,7 +230,7 @@ impl WriterCounter {
 /// Constructor for a recording Writer
 impl WriterRecorder {
   #[inline]
-  pub const fn new() -> WriterBase<WriterRecorder> {
+  pub fn new() -> WriterBase<WriterRecorder> {
     WriterBase::new(WriterRecorder { storage: Vec::new(), bits: 0 })
   }
 }
@@ -216,7 +238,7 @@ impl WriterRecorder {
 /// Constructor for a encoding Writer
 impl WriterEncoder {
   #[inline]
-  pub const fn new() -> WriterBase<WriterEncoder> {
+  pub fn new() -> WriterBase<WriterEncoder> {
     WriterBase::new(WriterEncoder { precarry: Vec::new(), low: 0 })
   }
 }
@@ -228,12 +250,16 @@ impl StorageBackend for WriterBase<WriterCounter> {
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     // prom_av1e015: cost by prob→bits table instead of simulating the range
     // coder (the libaom av1_prob_cost structure). See harvest::fastsym().
-    if crate::harvest::fastsym() {
+    if self.knobs & crate::harvest::WK_FASTSYM != 0 {
       let w =
         usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
       self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
       return;
     }
+    self.store_plain(fl, fh, nms);
+  }
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -277,13 +303,17 @@ impl StorageBackend for WriterBase<WriterRecorder> {
     // (replay re-runs the real coding from the stored tokens), so under
     // fastsym the cost comes from the prob→bits table instead. The token
     // push is untouched — replay integrity does not depend on rng/bits.
-    if crate::harvest::fastsym() {
+    if self.knobs & crate::harvest::WK_FASTSYM != 0 {
       let w =
         usize::from(fl >> EC_PROB_SHIFT) - usize::from(fh >> EC_PROB_SHIFT);
       self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
       self.s.storage.push((fl, fh, nms));
       return;
     }
+    self.store_plain(fl, fh, nms);
+  }
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -322,6 +352,10 @@ impl StorageBackend for WriterBase<WriterRecorder> {
 /// tokens, only the resulting bitstream, and so it cannot be replayed
 /// (only checkpointed and rolled back).
 impl StorageBackend for WriterBase<WriterEncoder> {
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
+    self.store(fl, fh, nms);
+  }
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     let (l, r) = self.lr_compute(fl, fh, nms);
     let mut low = l + self.s.low;
@@ -378,8 +412,14 @@ impl<S> WriterBase<S> {
   /// actual encoder and Recorder.
   #[inline]
   #[cfg(not(feature = "desync_finder"))]
-  const fn new(storage: S) -> Self {
-    WriterBase { rng: 0x8000, cnt: -9, fake_bits_frac: 0, s: storage }
+  fn new(storage: S) -> Self {
+    WriterBase {
+      rng: 0x8000,
+      cnt: -9,
+      fake_bits_frac: 0,
+      knobs: crate::harvest::writer_knobs(),
+      s: storage,
+    }
   }
 
   #[inline]
@@ -390,6 +430,7 @@ impl<S> WriterBase<S> {
       cnt: -9,
       debug: std::env::var_os("RAV1E_DEBUG").is_some(),
       fake_bits_frac: 0,
+      knobs: crate::harvest::writer_knobs(),
       s: storage,
     }
   }
@@ -548,6 +589,7 @@ where
   /// Encode a single binary value.
   /// `val`: The value to encode (0 or 1).
   /// `f`: The probability that the val is one, scaled by 32768.
+  #[inline]
   fn bool(&mut self, val: bool, f: u16) {
     debug_assert!(0 < f);
     debug_assert!(f < 32768);
@@ -557,12 +599,15 @@ where
   ///
   /// - `val`: The value to encode (`false` or `true`).
   /// - `f`: The probability that the `val` is `true`, scaled by `32768`.
+  #[inline]
   fn bit(&mut self, bit: u16) {
     // prom_av1e012: on counting writers a flat bit costs exactly 1 bit by
     // construction — account it instead of running the EC store. Covers every
     // flat-bit site in the rate path (signs, eob extras, golomb/quniform via
     // literal, MV bits). BD-gated via RAV1E_FASTRATE (rng drift epsilons).
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FASTRATE != 0
+    {
       self.add_bits_frac(8);
       return;
     }
@@ -580,7 +625,9 @@ where
   fn literal(&mut self, bits: u8, s: u32) {
     // prom_av1e012: see bit() — one accounting add replaces `bits` EC stores
     // on counting writers.
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::fastrate() {
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FASTRATE != 0
+    {
       self.add_bits_frac(8 * u32::from(bits));
       return;
     }
@@ -598,63 +645,35 @@ where
   ///   The lower 6 bits of the last value hold the count.
   #[inline(always)]
   fn symbol<const CDF_LEN: usize>(&mut self, s: u32, cdf: &[u16; CDF_LEN]) {
-    debug_assert!(cdf[cdf.len() - 1] < (1 << EC_PROB_SHIFT));
-    let s = s as usize;
-    debug_assert!(s < cdf.len());
-    // The above is stricter than the following overflow check: s <= cdf.len()
-    let nms = cdf.len() - s;
-    let fl = if s > 0 {
-      // SAFETY: We asserted that s is less than the length of the cdf
-      unsafe { *cdf.get_unchecked(s - 1) }
-    } else {
-      32768
-    };
-    // SAFETY: We asserted that s is less than the length of the cdf
-    let fh = unsafe { *cdf.get_unchecked(s) };
-    debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
-    debug_assert!(fl <= 32768);
-    self.store(fl, fh, nms as u16);
+    self.symbol_impl::<CDF_LEN, false>(s, cdf);
   }
-  /// Encodes a symbol given a cumulative distribution function (CDF)
-  /// table in Q15, then updates the CDF probabilities to reflect we've
-  /// written one more symbol 's'.
-  ///
-  /// - `s`: The index of the symbol to encode.
-  /// - `cdf`: The CDF, such that symbol s falls in the range
-  ///   `[s > 0 ? cdf[s - 1] : 0, cdf[s])`.
-  ///   The values must be monotonically non-decreasing, and the last value
-  ///   must be greater 32704. There should be at most 16 values.
-  ///   The lower 6 bits of the last value hold the count.
+  #[inline(always)]
+  fn knobs(&self) -> u8 {
+    self.knobs
+  }
+  #[inline(always)]
+  fn symbol_with_update_plain<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    debug_assert_eq!(self.knobs, 0);
+    let cdf = log.push(fc, cdf);
+    self.symbol_impl::<CDF_LEN, true>(s, cdf);
+    update_cdf(cdf, s);
+  }
+  /// Encodes a symbol, then updates the CDF.
   fn symbol_with_update<const CDF_LEN: usize>(
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {
-    // F-audit / entropy final audit: an info scope here measured 192,251,661
-    // calls/10f at ~11.5 ns/symbol = the majority of write_coeffs_lv_map and the
-    // irreducible serial core (CDF adaptation is loop-carried). Scope removed: at
-    // 192M calls its ~23ns overhead corrupts every other stage. Re-add for audits.
-    #[cfg(feature = "desync_finder")]
-    {
-      if self.debug {
-        self.print_backtrace(s);
-      }
-    }
-    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
-    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
-    // counter neither snapshots the undo log nor adapts the CDF — the cost
-    // reads the current (final-encode-evolved) distribution. Counter-only:
-    // recorder tokens are replayed into the real bitstream and must carry
-    // spec-adaptive brackets.
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY && crate::harvest::frozen()
-    {
-      let cdf = fc.read(cdf);
-      self.symbol(s, cdf);
-      return;
-    }
-    let cdf = log.push(fc, cdf);
-    self.symbol(s, cdf);
-
-    update_cdf(cdf, s);
+    self.symbol_with_update_hot(s, cdf, log, fc)
+  }
+  #[inline(always)]
+  fn symbol_with_update_hot<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    self.symbol_with_update_impl(s, cdf, log, fc)
   }
   /// Returns approximate cost for a symbol given a cumulative
   /// distribution function (CDF) table and current write state.
@@ -907,6 +926,79 @@ where
     StorageBackend::rollback(self, wc)
   }
 }
+
+impl<S> WriterBase<S>
+where
+  WriterBase<S>: StorageBackend + CountsOnly,
+{
+  /// The body of `Writer::symbol`; `PLAIN` skips the knob test in `store`.
+  #[inline(always)]
+  fn symbol_impl<const CDF_LEN: usize, const PLAIN: bool>(
+    &mut self, s: u32, cdf: &[u16; CDF_LEN],
+  ) {
+    debug_assert!(cdf[cdf.len() - 1] < (1 << EC_PROB_SHIFT));
+    let s = s as usize;
+    debug_assert!(s < cdf.len());
+    // The above is stricter than the following overflow check: s <= cdf.len()
+    let nms = cdf.len() - s;
+    // SAFETY: We asserted that s is less than the length of the cdf
+    let fh = unsafe { *cdf.get_unchecked(s) };
+    // Two store sites rather than one store of a selected `fl`: for s == 0 the
+    // lower bound is the constant 32768, which makes `lr_compute`'s `u` fold to
+    // `rng` (no multiply, no `fl >= 32768` select) in the inlined store.
+    if s > 0 {
+      // SAFETY: We asserted that s is less than the length of the cdf
+      let fl = unsafe { *cdf.get_unchecked(s - 1) };
+      debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
+      debug_assert!(fl <= 32768);
+      self.store_sel::<PLAIN>(fl, fh, nms as u16);
+    } else {
+      self.store_sel::<PLAIN>(32768, fh, nms as u16);
+    }
+  }
+  #[inline(always)]
+  fn store_sel<const PLAIN: bool>(&mut self, fl: u16, fh: u16, nms: u16) {
+    if PLAIN {
+      self.store_plain(fl, fh, nms);
+    } else {
+      self.store(fl, fh, nms);
+    }
+  }
+  #[inline(always)]
+  fn symbol_with_update_impl<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    // F-audit / entropy final audit: an info scope here measured 192,251,661
+    // calls/10f at ~11.5 ns/symbol = the majority of write_coeffs_lv_map and the
+    // irreducible serial core (CDF adaptation is loop-carried). Scope removed: at
+    // 192M calls its ~23ns overhead corrupts every other stage. Re-add for audits.
+    #[cfg(feature = "desync_finder")]
+    {
+      if self.debug {
+        self.print_backtrace(s);
+      }
+    }
+    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
+    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
+    // counter neither snapshots the undo log nor adapts the CDF — the cost
+    // reads the current (final-encode-evolved) distribution. Counter-only:
+    // recorder tokens are replayed into the real bitstream and must carry
+    // spec-adaptive brackets.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FROZEN != 0
+    {
+      let cdf = fc.read(cdf);
+      self.symbol(s, cdf);
+      return;
+    }
+    let cdf = log.push(fc, cdf);
+    self.symbol(s, cdf);
+
+    update_cdf(cdf, s);
+  }
+}
+
 
 pub trait BCodeWriter {
   fn recenter_nonneg(&mut self, r: u16, v: u16) -> u16;

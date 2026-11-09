@@ -1,7 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::ffi::{c_int, c_uint};
-use std::ops::Add;
 use std::{cmp, iter, mem, slice};
 
 use bitflags::bitflags;
@@ -11,7 +10,6 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::align::AlignedVec64;
 use crate::cpu::CpuFlags;
-use crate::cursor::CursorMut;
 use crate::disjoint_mut::DisjointMut;
 use crate::ffi_safe::FFISafe;
 #[cfg(all(
@@ -22,9 +20,10 @@ use crate::include::common::bitdepth::bd_fn;
 #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
 use crate::include::common::bitdepth::bpc_fn;
 use crate::include::common::bitdepth::{
-    AsPrimitive, BitDepth, DynPixel, LeftPixelRow, ToPrimitive, BPC,
+    AsPrimitive, BitDepth, DynPixel, LeftPixelRow, BPC,
 };
 use crate::include::common::intops::iclip;
+use crate::scratch;
 use crate::include::dav1d::picture::{
     FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
 };
@@ -374,6 +373,12 @@ unsafe extern "C" fn wiener_c_erased<BD: BitDepth>(
     wiener_rust(p, left, lpf, lpf_off, w, h, params, edges, bd)
 }
 
+thread_local! {
+    /// Padded-input and horizontal-pass scratch for [`wiener_rust`] and the
+    /// self-guided drivers, reused without zeroing (see [`scratch`]).
+    static LR_UNIT: scratch::Arena = const { scratch::Arena::new() };
+}
+
 // FIXME Could split into luma and chroma specific functions,
 // (since first and last tops are always 0 for chroma)
 // FIXME Could implement a version that requires less temporary memory
@@ -390,14 +395,13 @@ fn wiener_rust<BD: BitDepth>(
     bd: BD,
 ) {
     // Wiener filtering is applied to a maximum stripe height of 64 + 3 pixels
-    // of padding above and below
-    let mut tmp = [0.into(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
-
-    // Values stored between horizontal and vertical filtering don't
-    // fit in a u8.
-    let mut hor = [0; (64 + 3 + 3) * REST_UNIT_STRIDE];
+    // of padding above and below.
+    // `padding` writes every `tmp` cell the horizontal pass reads, and the horizontal
+    // pass writes every `hor` cell the vertical pass reads.
+    // Values stored between horizontal and vertical filtering don't fit in a u8.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], hor: &mut [u16; LEN]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
 
     let filter = &params.filter;
     let bitdepth = bd.bitdepth().as_::<c_int>();
@@ -441,6 +445,7 @@ fn wiener_rust<BD: BitDepth>(
                 iclip(sum + rounding_off_v >> round_bits_v, 0, bd.into_c()).as_();
         }
     }
+    });
 }
 
 /// Sum over a 3x3 area
@@ -636,6 +641,11 @@ fn boxsum5<BD: BitDepth>(
     }
 }
 
+thread_local! {
+    /// Box-sum scratch for [`selfguided_filter`], reused without zeroing (see [`scratch`]).
+    static SGR_BOXSUM: scratch::Arena = const { scratch::Arena::new() };
+}
+
 #[inline(never)]
 fn selfguided_filter<BD: BitDepth>(
     dst: &mut [BD::Coef; 64 * 384],
@@ -650,112 +660,112 @@ fn selfguided_filter<BD: BitDepth>(
 
     // Selfguided filter is applied to a maximum stripe height of 64 + 3 pixels
     // of padding above and below
-    let mut sumsq = [0; (64 + 2 + 2) * REST_UNIT_STRIDE];
+    const BOXSUM_LEN: usize = (64 + 2 + 2) * REST_UNIT_STRIDE;
+    // Every cell read below is first written by `boxsum3`/`boxsum5`.
     // By inverting `a` and `b` after the boxsums, `b` can be of `BD::Coef` instead of `i32`.
-    let mut sum = [0.as_::<BD::Coef>(); (64 + 2 + 2) * REST_UNIT_STRIDE];
+    scratch::with2(&SGR_BOXSUM, |sumsq: &mut [i32; BOXSUM_LEN], sum: &mut [BD::Coef; BOXSUM_LEN]| {
 
     let step = (n == 25) as usize + 1;
     if n == 25 {
-        boxsum5::<BD>(&mut sumsq, &mut sum, src, w + 6, h + 6);
+        boxsum5::<BD>(sumsq, sum, src, w + 6, h + 6);
     } else {
-        boxsum3::<BD>(&mut sumsq, &mut sum, src, w + 6, h + 6);
+        boxsum3::<BD>(sumsq, sum, src, w + 6, h + 6);
     }
     let bitdepth_min_8 = bd.bitdepth() - 8;
 
-    let mut a = CursorMut::new(&mut sumsq) + 2 * REST_UNIT_STRIDE + 3;
-    let mut b = CursorMut::new(&mut sum) + 2 * REST_UNIT_STRIDE + 3;
-
-    let mut aa = a.clone() - REST_UNIT_STRIDE;
-    let mut bb = b.clone() - REST_UNIT_STRIDE;
+    // Rows -1..=h (every `step`-th), columns -1..=w of `a`/`b`, through row
+    // slices so no per-element offset conversion or bounds check is needed.
+    // `row` is the `a`/`b` index of column -1 in the current row.
+    let mut row = 2 * REST_UNIT_STRIDE + 3 - REST_UNIT_STRIDE - 1;
     for _ in (-1..h as isize + 1).step_by(step) {
-        for i in -1..w as isize + 1 {
-            let a = aa[i] + (1 << 2 * bitdepth_min_8 >> 1) >> 2 * bitdepth_min_8;
-            let b = bb[i].as_::<c_int>() + (1 << bitdepth_min_8 >> 1) >> bitdepth_min_8;
+        let a_row = &mut sumsq[row..][..w + 2];
+        let b_row = &mut sum[row..][..w + 2];
+        for (aa, bb) in iter::zip(a_row, b_row) {
+            let a = *aa + (1 << 2 * bitdepth_min_8 >> 1) >> 2 * bitdepth_min_8;
+            let b = (*bb).as_::<c_int>() + (1 << bitdepth_min_8 >> 1) >> bitdepth_min_8;
 
             let p = cmp::max(a * n - b * b, 0) as c_uint;
             let z = (p * s + (1 << 19)) >> 20;
             let x = dav1d_sgr_x_by_x[cmp::min(z, 255) as usize] as c_uint;
 
             // This is where we invert A and B, so that B is of size coef.
-            aa[i] = ((x * bb[i].as_::<c_uint>() * sgr_one_by_x + (1 << 11)) >> 12) as c_int;
-            bb[i] = x.as_::<BD::Coef>();
+            *aa = ((x * (*bb).as_::<c_uint>() * sgr_one_by_x + (1 << 11)) >> 12) as c_int;
+            *bb = x.as_::<BD::Coef>();
         }
-        aa += step as usize * REST_UNIT_STRIDE;
-        bb += step as usize * REST_UNIT_STRIDE;
-    }
-
-    fn six_neighbors<P>(p: &CursorMut<P>, i: isize) -> c_int
-    where
-        P: Add<Output = P> + ToPrimitive<c_int> + Copy,
-    {
-        let stride = REST_UNIT_STRIDE as isize;
-        (p[i - stride] + p[i + stride]).as_::<c_int>() * 6
-            + (p[i - 1 - stride] + p[i - 1 + stride] + p[i + 1 - stride] + p[i + 1 + stride])
-                .as_::<c_int>()
-                * 5
-    }
-
-    fn eight_neighbors<P>(p: &CursorMut<P>, i: isize) -> c_int
-    where
-        P: Add<Output = P> + ToPrimitive<c_int> + Copy,
-    {
-        let stride = REST_UNIT_STRIDE as isize;
-        (p[i] + p[i - 1] + p[i + 1] + p[i - stride] + p[i + stride]).as_::<c_int>() * 4
-            + (p[i - 1 - stride] + p[i - 1 + stride] + p[i + 1 - stride] + p[i + 1 + stride])
-                .as_::<c_int>()
-                * 3
+        row += step * REST_UNIT_STRIDE;
     }
 
     const MAX_RESTORATION_WIDTH: usize = 256 * 3 / 2;
+    const STRIDE: usize = REST_UNIT_STRIDE;
 
-    let mut src = &src[3 * REST_UNIT_STRIDE + 3..];
-    let mut dst = dst.as_mut_slice();
+    // The final pass reads `a`/`b` in the rows around each output row. It takes
+    // plain row slices of length `w + 2` starting one column left of the output
+    // (`c - 1`, where `c` is the `a`/`b` position of output column 0), so every
+    // index is provably in range: a handful of slice checks per row instead of a
+    // `CursorMut` offset conversion and bounds check per neighbour. Sums are
+    // still formed in the element type and in the original order.
+    let a_buf: &[i32] = &sumsq[..];
+    let b_buf: &[BD::Coef] = &sum[..];
+    let center = |j: usize| 2 * STRIDE + 3 + j * STRIDE;
+    let src_row = |j: usize| &src[3 * STRIDE + 3 + j * STRIDE..][..w];
     if n == 25 {
+        let six = |j: usize, dst: &mut [BD::Coef]| {
+            let c = center(j);
+            let (a0, a2) = (&a_buf[c - STRIDE - 1..][..w + 2], &a_buf[c + STRIDE - 1..][..w + 2]);
+            let (b0, b2) = (&b_buf[c - STRIDE - 1..][..w + 2], &b_buf[c + STRIDE - 1..][..w + 2]);
+            let src = src_row(j);
+            let dst = &mut dst[..w];
+            for i in 0..w {
+                let nb = (b0[i + 1] + b2[i + 1]).as_::<c_int>() * 6
+                    + (b0[i] + b2[i] + b0[i + 2] + b2[i + 2]).as_::<c_int>() * 5;
+                let na = (a0[i + 1] + a2[i + 1]) * 6 + (a0[i] + a2[i] + a0[i + 2] + a2[i + 2]) * 5;
+                dst[i] = ((na - nb * src[i].as_::<c_int>() + (1 << 8)) >> 9).as_();
+            }
+        };
         let mut j = 0;
         while j < h - 1 {
+            six(j, &mut dst[j * MAX_RESTORATION_WIDTH..]);
+            let c = center(j + 1);
+            let a1 = &a_buf[c - 1..][..w + 2];
+            let b1 = &b_buf[c - 1..][..w + 2];
+            let src = src_row(j + 1);
+            let dst = &mut dst[(j + 1) * MAX_RESTORATION_WIDTH..][..w];
             for i in 0..w {
-                let (a, b) = (six_neighbors(&b, i as isize), six_neighbors(&a, i as isize));
-                dst[i] = ((b - a * src[i].as_::<c_int>() + (1 << 8)) >> 9).as_();
+                let nb = b1[i + 1].as_::<c_int>() * 6 + (b1[i] + b1[i + 2]).as_::<c_int>() * 5;
+                let na = a1[i + 1] * 6 + (a1[i] + a1[i + 2]) * 5;
+                dst[i] = (na - nb * src[i].as_::<c_int>() + (1 << 7) >> 8).as_();
             }
-            dst = &mut dst[MAX_RESTORATION_WIDTH..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
-            for i in 0..w {
-                let (a, b) = (
-                    b[i].as_::<c_int>() * 6 + (b[i as isize - 1] + b[i + 1]).as_::<c_int>() * 5,
-                    a[i] * 6 + (a[i as isize - 1] + a[i + 1]) * 5,
-                );
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 7) >> 8).as_();
-            }
-            dst = &mut dst[MAX_RESTORATION_WIDTH..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
             j += 2;
         }
         // Last row, when number of rows is odd
         if j + 1 == h {
-            for i in 0..w {
-                let (a, b) = (six_neighbors(&b, i as isize), six_neighbors(&a, i as isize));
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
-            }
+            six(j, &mut dst[j * MAX_RESTORATION_WIDTH..]);
         }
     } else {
-        for _ in 0..h {
+        for j in 0..h {
+            let c = center(j);
+            let (a0, a1, a2) = (
+                &a_buf[c - STRIDE - 1..][..w + 2],
+                &a_buf[c - 1..][..w + 2],
+                &a_buf[c + STRIDE - 1..][..w + 2],
+            );
+            let (b0, b1, b2) = (
+                &b_buf[c - STRIDE - 1..][..w + 2],
+                &b_buf[c - 1..][..w + 2],
+                &b_buf[c + STRIDE - 1..][..w + 2],
+            );
+            let src = src_row(j);
+            let dst = &mut dst[j * 384..][..w];
             for i in 0..w {
-                let (a, b) = (
-                    eight_neighbors(&b, i as isize),
-                    eight_neighbors(&a, i as isize),
-                );
-                dst[i] = (b - a * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
+                let nb = (b1[i + 1] + b1[i] + b1[i + 2] + b0[i + 1] + b2[i + 1]).as_::<c_int>() * 4
+                    + (b0[i] + b2[i] + b0[i + 2] + b2[i + 2]).as_::<c_int>() * 3;
+                let na = (a1[i + 1] + a1[i] + a1[i + 2] + a0[i + 1] + a2[i + 1]) * 4
+                    + (a0[i] + a2[i] + a0[i + 2] + a2[i + 2]) * 3;
+                dst[i] = (na - nb * src[i].as_::<c_int>() + (1 << 8) >> 9).as_();
             }
-            dst = &mut dst[384..];
-            src = &src[REST_UNIT_STRIDE..];
-            b += REST_UNIT_STRIDE;
-            a += REST_UNIT_STRIDE;
         }
     };
+    });
 }
 
 /// # Safety
@@ -802,16 +812,16 @@ fn sgr_5x5_rust<BD: BitDepth>(
     bd: BD,
 ) {
     // Selfguided filter is applied to a maximum stripe height of 64 + 3 pixels
-    // of padding above and below
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-
+    // of padding above and below.
     // Selfguided filter outputs to a maximum stripe height of 64 and a
-    // maximum restoration width of 384 (256 * 1.5)
-    let mut dst = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // maximum restoration width of 384 (256 * 1.5).
+    // `padding` writes every `tmp` cell the filter reads, and the filter writes every
+    // `dst` cell read below.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], dst: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst, &mut tmp, w, h, 25, sgr.s0, bd);
+    selfguided_filter(dst, tmp, w, h, 25, sgr.s0, bd);
 
     let w0 = sgr.w0 as c_int;
     for j in 0..h {
@@ -822,6 +832,7 @@ fn sgr_5x5_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 /// # Safety
@@ -867,12 +878,12 @@ fn sgr_3x3_rust<BD: BitDepth>(
     edges: LrEdgeFlags,
     bd: BD,
 ) {
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-    let mut dst = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // See `sgr_5x5_rust` for why the scratch needs no zeroing.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], dst: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst, &mut tmp, w, h, 9, sgr.s1, bd);
+    selfguided_filter(dst, tmp, w, h, 9, sgr.s1, bd);
 
     let w1 = sgr.w1 as c_int;
     for j in 0..h {
@@ -883,6 +894,7 @@ fn sgr_3x3_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 /// # Safety
@@ -928,14 +940,17 @@ fn sgr_mix_rust<BD: BitDepth>(
     edges: LrEdgeFlags,
     bd: BD,
 ) {
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-    let mut dst0 = [0.as_(); 64 * 384];
-    let mut dst1 = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // See `sgr_5x5_rust` for why the scratch needs no zeroing.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with3(
+        &LR_UNIT,
+        |tmp: &mut [BD::Pixel; LEN],
+         dst0: &mut [BD::Coef; 64 * 384],
+         dst1: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst0, &mut tmp, w, h, 25, sgr.s0, bd);
-    selfguided_filter(&mut dst1, &mut tmp, w, h, 9, sgr.s1, bd);
+    selfguided_filter(dst0, tmp, w, h, 25, sgr.s0, bd);
+    selfguided_filter(dst1, tmp, w, h, 9, sgr.s1, bd);
 
     let w0 = sgr.w0 as c_int;
     let w1 = sgr.w1 as c_int;
@@ -947,6 +962,7 @@ fn sgr_mix_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 #[deny(unsafe_op_in_unsafe_fn)]

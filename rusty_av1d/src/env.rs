@@ -652,7 +652,9 @@ pub(crate) fn fix_mv_precision(hdr: &Rav1dFrameHeader, mv: &mut Mv) {
     }
 }
 
-#[inline]
+/// The identity and translation cases inline (the common ones, once or twice per
+/// inter block); the projection for the warped types stays out of line.
+#[inline(always)]
 pub(crate) fn get_gmv_2d(
     gmv: &Rav1dWarpedMotionParams,
     bx4: c_int,
@@ -662,10 +664,6 @@ pub(crate) fn get_gmv_2d(
     hdr: &Rav1dFrameHeader,
 ) -> Mv {
     match gmv.r#type {
-        Rav1dWarpedMotionType::RotZoom => {
-            assert!(gmv.matrix[5] == gmv.matrix[2]);
-            assert!(gmv.matrix[4] == -gmv.matrix[3]);
-        }
         Rav1dWarpedMotionType::Translation => {
             let mut res = Mv {
                 y: (gmv.matrix[0] >> 13) as i16,
@@ -674,12 +672,27 @@ pub(crate) fn get_gmv_2d(
             if hdr.force_integer_mv {
                 fix_int_mv_precision(&mut res);
             }
-            return res;
+            res
         }
-        Rav1dWarpedMotionType::Identity => {
-            return Mv::ZERO;
+        Rav1dWarpedMotionType::Identity => Mv::ZERO,
+        Rav1dWarpedMotionType::RotZoom | Rav1dWarpedMotionType::Affine => {
+            get_gmv_2d_warped(gmv, bx4, by4, bw4, bh4, hdr)
         }
-        Rav1dWarpedMotionType::Affine => {}
+    }
+}
+
+#[inline(never)]
+fn get_gmv_2d_warped(
+    gmv: &Rav1dWarpedMotionParams,
+    bx4: c_int,
+    by4: c_int,
+    bw4: c_int,
+    bh4: c_int,
+    hdr: &Rav1dFrameHeader,
+) -> Mv {
+    if gmv.r#type == Rav1dWarpedMotionType::RotZoom {
+        assert!(gmv.matrix[5] == gmv.matrix[2]);
+        assert!(gmv.matrix[4] == -gmv.matrix[3]);
     }
     let x = bx4 * 4 + bw4 * 2 - 1;
     let y = by4 * 4 + bh4 * 2 - 1;

@@ -173,8 +173,11 @@ pub fn cdef_dist_wxh<T: Pixel, F: Fn(Area, BlockSize) -> DistortionScale>(
   debug_assert!(src2.plane_cfg.ydec == 0);
 
   let mut sum = Distortion::zero();
-  for y in (0..h).step_by(8) {
-    for x in (0..w).step_by(8) {
+  // Plain loops: `step_by(8)` over a `Range` costs more than the loop body's glue.
+  let mut y = 0;
+  while y < h {
+    let mut x = 0;
+    while x < w {
       let kernel_h = (h - y).min(8);
       let kernel_w = (w - x).min(8);
       let area = Area::StartingAt { x: x as isize, y: y as isize };
@@ -191,7 +194,9 @@ pub fn cdef_dist_wxh<T: Pixel, F: Fn(Area, BlockSize) -> DistortionScale>(
       // cdef is always called on non-subsampled planes, so BLOCK_8X8 is
       // correct here.
       sum += value * compute_bias(area, BlockSize::BLOCK_8X8);
+      x += 8;
     }
+    y += 8;
   }
   sum
 }
@@ -308,7 +313,7 @@ fn compute_distortion<T: Pixel>(
       |bias_area, bsize| {
         distortion_scale(
           fi,
-          input_region.subregion(bias_area).frame_block_offset(),
+          input_region.subregion_frame_block_offset(bias_area),
           bsize,
         )
       },
@@ -322,7 +327,7 @@ fn compute_distortion<T: Pixel>(
       |bias_area, bsize| {
         distortion_scale(
           fi,
-          input_region.subregion(bias_area).frame_block_offset(),
+          input_region.subregion_frame_block_offset(bias_area),
           bsize,
         )
       },
@@ -358,7 +363,7 @@ fn compute_distortion<T: Pixel>(
         |bias_area, bsize| {
           distortion_scale(
             fi,
-            input_region.subregion(bias_area).frame_block_offset(),
+            input_region.subregion_frame_block_offset(bias_area),
             bsize,
           )
         },
@@ -474,8 +479,9 @@ pub fn distortion_scale<T: Pixel>(
   }
   // EncoderConfig::temporal_rdo() should always return false in situations
   // where distortion is computed on > 8x8 blocks, so we should never hit this
-  // assert.
-  assert!(bsize <= BlockSize::BLOCK_8X8);
+  // assert. Debug-only: it is evaluated per 8x8 bias block, and `BlockSize`'s
+  // partial order compares widths and heights through lookups.
+  debug_assert!(bsize <= BlockSize::BLOCK_8X8);
 
   let x = frame_bo.0.x >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
   let y = frame_bo.0.y >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
@@ -752,11 +758,17 @@ pub fn compute_rd_cost<T: Pixel>(
   fi.lambda.mul_add(rate_in_bits, distortion.0 as f64)
 }
 
+/// RDO-based transform size and type decision for a block.
+///
+/// `pred_in_rec` is cleared if the transform type search runs, because its
+/// trials overwrite the block in the reconstruction (see
+/// [`encode_block_post_cdef`]).
+#[inline]
 pub fn rdo_tx_size_type<T: Pixel>(
   fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
   cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
   luma_mode: PredictionMode, ref_frames: [RefType; 2], mvs: [MotionVector; 2],
-  skip: bool,
+  skip: bool, pred_in_rec: &mut bool,
 ) -> (TxSize, TxType) {
   let _prof = crate::prof::scope(crate::prof::Stage::RdoTxSizeType);
   let is_inter = !luma_mode.is_intra();
@@ -766,14 +778,49 @@ pub fn rdo_tx_size_type<T: Pixel>(
     tx_size = sub_tx_size_map[tx_size as usize]; // Always choose one level split size
   }
 
-  let mut best_tx_type = TxType::DCT_DCT;
-  let mut best_tx_size = tx_size;
-  let mut best_rd = f64::MAX;
-
   // prom_av1e041: the DEEP dispatch unlocks transform RDO. tx-SIZE RDO stays
   // intra (inter uses the sub_tx_size default); tx-TYPE RDO (ADST/DCT selection)
   // is unlocked for INTER too — the SVT busy-content lever we lacked.
   let deep = crate::encoder::deep::active();
+  // When neither search can run, the answer is the default transform at this
+  // size, without the search setup: the size search is intra only, and the
+  // type search needs the deep dispatch for inter and never runs for skip.
+  // This is every inter trial outside the deep dispatch.
+  if !(fi.config.speed_settings.transform.rdo_tx_decision || deep)
+    || (is_inter && (!deep || skip))
+  {
+    return (tx_size, TxType::DCT_DCT);
+  }
+  rdo_tx_size_type_search(
+    fi,
+    ts,
+    cw,
+    bsize,
+    tile_bo,
+    luma_mode,
+    ref_frames,
+    mvs,
+    skip,
+    pred_in_rec,
+    tx_size,
+    deep,
+  )
+}
+
+/// The transform size and type searches of [`rdo_tx_size_type`], starting
+/// from the block's largest transform, `tx_size`.
+#[inline(never)]
+fn rdo_tx_size_type_search<T: Pixel>(
+  fi: &FrameInvariants<T>, ts: &mut TileStateMut<'_, T>,
+  cw: &mut ContextWriter, bsize: BlockSize, tile_bo: TileBlockOffset,
+  luma_mode: PredictionMode, ref_frames: [RefType; 2], mvs: [MotionVector; 2],
+  skip: bool, pred_in_rec: &mut bool, mut tx_size: TxSize, deep: bool,
+) -> (TxSize, TxType) {
+  let is_inter = !luma_mode.is_intra();
+  let mut best_tx_type = TxType::DCT_DCT;
+  let mut best_tx_size = tx_size;
+  let mut best_rd = f64::MAX;
+
   let do_rdo_tx_size = fi.tx_mode_select
     && (fi.config.speed_settings.transform.rdo_tx_decision || deep)
     && !is_inter;
@@ -801,6 +848,7 @@ pub fn rdo_tx_size_type<T: Pixel>(
       if do_rdo_tx_type { RAV1E_TX_TYPES } else { &[TxType::DCT_DCT] };
 
     // Luma plane transform type decision
+    *pred_in_rec = false;
     let (tx_type, rd_cost) = rdo_tx_type_decision(
       fi,
       ts,
@@ -942,7 +990,7 @@ fn luma_chroma_mode_rdo<T: Pixel>(
   mvs: [MotionVector; 2], ref_frames: [RefType; 2],
   mode_set_chroma: &[PredictionMode], luma_mode_is_intra: bool,
   mode_context: usize, mv_stack: &ArrayVec<CandidateMV, 9>,
-  angle_delta: AngleDelta,
+  angle_delta: AngleDelta, segments: &[std::ops::RangeInclusive<u8>; 2],
 ) {
   let PlaneConfig { xdec, ydec, .. } = ts.input.planes[1].cfg;
 
@@ -994,17 +1042,29 @@ fn luma_chroma_mode_rdo<T: Pixel>(
 
   #[cfg(feature = "profile")]
   let _fp = crate::encoder::fwd_phase::enter(0);
+  // Whether `ts.rec` holds this block's inter prediction for `luma_mode`,
+  // `ref_frames` and `mvs`, so the next trial need not motion compensate again.
+  // A skip trial leaves it there: it codes no residual, so its motion
+  // compensation is the last write to the block.
+  let mut pred_in_rec = false;
   // Find the best chroma prediction mode for the current luma prediction mode
   let mut chroma_rdo = |skip: bool| -> bool {
-    use crate::segmentation::select_segment;
-
     let mut zero_distortion = false;
 
-    for sidx in select_segment(fi, ts, tile_bo, bsize, skip) {
+    for sidx in segments[skip as usize].clone() {
       cw.bc.blocks.set_segmentation_idx(tile_bo, bsize, sidx);
 
       let (tx_size, tx_type) = rdo_tx_size_type(
-        fi, ts, cw, bsize, tile_bo, luma_mode, ref_frames, mvs, skip,
+        fi,
+        ts,
+        cw,
+        bsize,
+        tile_bo,
+        luma_mode,
+        ref_frames,
+        mvs,
+        skip,
+        &mut pred_in_rec,
       );
       // prom_av1e017: across chroma-mode iterations only the chroma coding
       // differs — cache the luma tx section from iteration 1 and skip it on
@@ -1059,7 +1119,9 @@ fn luma_chroma_mode_rdo<T: Pixel>(
           need_recon_pixel,
           None,
           luma_reuse.as_mut(),
+          pred_in_rec,
         );
+        pred_in_rec = skip && !luma_mode_is_intra;
 
         let rate = wr.tell_frac() - tell;
         let distortion = if fi.use_tx_domain_distortion && !need_recon_pixel {
@@ -1231,8 +1293,8 @@ pub fn rdo_mode_decision<T: Pixel>(
           rdo_type,
           true, // For CFL, luma should be always reconstructed.
           None,
-        
           None,
+          false,
         );
 
         let rate = wr.tell_frac() - tell;
@@ -1319,6 +1381,7 @@ pub fn rdo_mode_decision<T: Pixel>(
         true,
         None,
         None,
+        false,
       );
       let rate = wr.tell_frac() - tell;
       let distortion =
@@ -1475,6 +1538,10 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
   rdo_type: RDOType,
 ) -> PartitionParameters {
   let mut best = PartitionParameters::default();
+  // The segments to try per skip flag depend only on the block (and the frame's
+  // segmentation), so they are selected once here rather than per mode trial.
+  let segments = [false, true]
+    .map(|skip| crate::segmentation::select_segment(fi, ts, tile_bo, bsize, skip));
 
   // we can never have more than 7 reference frame sets
   let mut ref_frames_set = ArrayVec::<_, 7>::new();
@@ -1830,6 +1897,7 @@ fn inter_frame_rdo_mode_decision<T: Pixel>(
         mode_contexts[i],
         &mv_stacks[i],
         AngleDelta::default(),
+        &segments,
       );
 
       if harvest_on {
@@ -1866,6 +1934,9 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
   mut best: PartitionParameters, is_chroma_block: bool,
 ) -> PartitionParameters {
   let _prof = crate::prof::scope(crate::prof::Stage::IntraModeRdo);
+  // See `inter_frame_rdo_mode_decision`.
+  let segments = [false, true]
+    .map(|skip| crate::segmentation::select_segment(fi, ts, tile_bo, bsize, skip));
   let mut modes = ArrayVec::<_, INTRA_MODES>::new();
 
   // Reduce number of prediction modes at higher speed levels
@@ -2010,6 +2081,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
       0,
       &ArrayVec::<CandidateMV, 9>::new(),
       AngleDelta::default(),
+      &segments,
     );
   });
 
@@ -2047,6 +2119,7 @@ fn intra_frame_rdo_mode_decision<T: Pixel>(
           0,
           &mv_stack,
           AngleDelta { y, uv },
+          &segments,
         );
       }
       best.angle_delta

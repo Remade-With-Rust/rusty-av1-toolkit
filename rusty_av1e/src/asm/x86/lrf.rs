@@ -239,34 +239,36 @@ pub(crate) unsafe fn sgrproj_box_ab_r1_avx2<const BD: usize>(
   af: &mut [u32], bf: &mut [u32], iimg: &[u32], iimg_sq: &[u32],
   iimg_stride: usize, y: usize, stripe_w: usize, s: u32,
 ) {
-  for x in (0..stripe_w + 2).step_by(8) {
-    if x + 8 <= stripe_w + 2 {
-      sgrproj_box_ab_8_avx2::<BD>(
-        1,
-        af,
-        bf,
-        iimg,
-        iimg_sq,
-        iimg_stride,
-        x,
-        y,
-        s,
-      );
-    } else {
-      // finish using scalar
-      rust::sgrproj_box_ab_internal::<BD>(
-        1,
-        af,
-        bf,
-        iimg,
-        iimg_sq,
-        iimg_stride,
-        x,
-        y,
-        stripe_w,
-        s,
-      );
-    }
+  // The vector loop proper, then the scalar remainder once (rather than testing
+  // the bound on every `step_by(8)` iteration).
+  let mut x = 0;
+  while x + 8 <= stripe_w + 2 {
+    sgrproj_box_ab_8_avx2::<BD>(
+      1,
+      af,
+      bf,
+      iimg,
+      iimg_sq,
+      iimg_stride,
+      x,
+      y,
+      s,
+    );
+    x += 8;
+  }
+  if x < stripe_w + 2 {
+    rust::sgrproj_box_ab_internal::<BD>(
+      1,
+      af,
+      bf,
+      iimg,
+      iimg_sq,
+      iimg_stride,
+      x,
+      y,
+      stripe_w,
+      s,
+    );
   }
 
   #[cfg(feature = "check_asm")]
@@ -295,34 +297,36 @@ pub(crate) unsafe fn sgrproj_box_ab_r2_avx2<const BD: usize>(
   af: &mut [u32], bf: &mut [u32], iimg: &[u32], iimg_sq: &[u32],
   iimg_stride: usize, y: usize, stripe_w: usize, s: u32,
 ) {
-  for x in (0..stripe_w + 2).step_by(8) {
-    if x + 8 <= stripe_w + 2 {
-      sgrproj_box_ab_8_avx2::<BD>(
-        2,
-        af,
-        bf,
-        iimg,
-        iimg_sq,
-        iimg_stride,
-        x,
-        y,
-        s,
-      );
-    } else {
-      // finish using scalar
-      rust::sgrproj_box_ab_internal::<BD>(
-        2,
-        af,
-        bf,
-        iimg,
-        iimg_sq,
-        iimg_stride,
-        x,
-        y,
-        stripe_w,
-        s,
-      );
-    }
+  // The vector loop proper, then the scalar remainder once (rather than testing
+  // the bound on every `step_by(8)` iteration).
+  let mut x = 0;
+  while x + 8 <= stripe_w + 2 {
+    sgrproj_box_ab_8_avx2::<BD>(
+      2,
+      af,
+      bf,
+      iimg,
+      iimg_sq,
+      iimg_stride,
+      x,
+      y,
+      s,
+    );
+    x += 8;
+  }
+  if x < stripe_w + 2 {
+    rust::sgrproj_box_ab_internal::<BD>(
+      2,
+      af,
+      bf,
+      iimg,
+      iimg_sq,
+      iimg_stride,
+      x,
+      y,
+      stripe_w,
+      s,
+    );
   }
 
   #[cfg(feature = "check_asm")]
@@ -372,13 +376,15 @@ unsafe fn sgrproj_box_f_r0_8_avx2<T: Pixel>(
 pub(crate) unsafe fn sgrproj_box_f_r0_avx2<T: Pixel>(
   f: &mut [u32], y: usize, w: usize, cdeffed: &PlaneSlice<T>,
 ) {
-  for x in (0..w).step_by(8) {
-    if x + 8 <= w {
-      sgrproj_box_f_r0_8_avx2(f, x, y, cdeffed);
-    } else {
-      // finish using scalar
-      rust::sgrproj_box_f_r0_internal(f, x, y, w, cdeffed);
-    }
+  // The vector loop proper, then the scalar remainder once (rather than testing
+  // the bound on every `step_by(8)` iteration).
+  let mut x = 0;
+  while x + 8 <= w {
+    sgrproj_box_f_r0_8_avx2(f, x, y, cdeffed);
+    x += 8;
+  }
+  if x < w {
+    rust::sgrproj_box_f_r0_internal(f, x, y, w, cdeffed);
   }
 
   #[cfg(feature = "check_asm")]
@@ -495,13 +501,15 @@ pub(crate) unsafe fn sgrproj_box_f_r1_avx2<T: Pixel>(
   af: &[&[u32]; 3], bf: &[&[u32]; 3], f: &mut [u32], y: usize, w: usize,
   cdeffed: &PlaneSlice<T>,
 ) {
-  for x in (0..w).step_by(8) {
-    if x + 8 <= w {
-      sgrproj_box_f_r1_8_avx2(af, bf, f, x, y, cdeffed);
-    } else {
-      // finish using scalar
-      rust::sgrproj_box_f_r1_internal(af, bf, f, x, y, w, cdeffed);
-    }
+  // The vector loop proper, then the scalar remainder once (rather than testing
+  // the bound on every `step_by(8)` iteration).
+  let mut x = 0;
+  while x + 8 <= w {
+    sgrproj_box_f_r1_8_avx2(af, bf, f, x, y, cdeffed);
+    x += 8;
+  }
+  if x < w {
+    rust::sgrproj_box_f_r1_internal(af, bf, f, x, y, w, cdeffed);
   }
 
   #[cfg(feature = "check_asm")]
@@ -617,13 +625,15 @@ pub(crate) unsafe fn sgrproj_box_f_r2_avx2<T: Pixel>(
   af: &[&[u32]; 2], bf: &[&[u32]; 2], f0: &mut [u32], f1: &mut [u32],
   y: usize, w: usize, cdeffed: &PlaneSlice<T>,
 ) {
-  for x in (0..w).step_by(8) {
-    if x + 8 <= w {
-      sgrproj_box_f_r2_8_avx2(af, bf, f0, f1, x, y, cdeffed);
-    } else {
-      // finish using scalar
-      rust::sgrproj_box_f_r2_internal(af, bf, f0, f1, x, y, w, cdeffed);
-    }
+  // The vector loop proper, then the scalar remainder once (rather than testing
+  // the bound on every `step_by(8)` iteration).
+  let mut x = 0;
+  while x + 8 <= w {
+    sgrproj_box_f_r2_8_avx2(af, bf, f0, f1, x, y, cdeffed);
+    x += 8;
+  }
+  if x < w {
+    rust::sgrproj_box_f_r2_internal(af, bf, f0, f1, x, y, w, cdeffed);
   }
 
   #[cfg(feature = "check_asm")]
