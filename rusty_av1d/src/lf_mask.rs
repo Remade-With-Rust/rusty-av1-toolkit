@@ -379,28 +379,14 @@ fn mask_edges_chroma(
     let thl4 = t_dim.lh;
     let twl4c = (twl4 != 0) as u8;
     let thl4c = (thl4 != 0) as u8;
-    let vbits = 4 - ss_ver;
-    let hbits = 4 - ss_hor;
     let vmask = 16 >> ss_ver;
     let hmask = 16 >> ss_hor;
-    let vmax = 1u32 << vmask;
-    let hmax = 1u32 << hmask;
 
     // left block edge
-    for y in 0..ch4 {
-        let mask = 1u32 << (cby4 + y);
-        let sidx = (mask >= vmax) as usize;
-        let smask = mask >> (sidx << vbits);
-        masks[0][cbx4][cmp::min(twl4c, l[y]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    or_edge_masks(&masks[0][cbx4], cby4, ch4, vmask as u32, |y| cmp::min(twl4c, l[y]));
 
     // top block edge
-    for x in 0..cw4 {
-        let mask = 1u32 << (cbx4 + x);
-        let sidx = (mask >= hmax) as usize;
-        let smask = mask >> (sidx << hbits);
-        masks[1][cby4][cmp::min(thl4c, a[x]) as usize][sidx].update(|it| it | smask as u16);
-    }
+    or_edge_masks(&masks[1][cby4], cbx4, cw4, hmask as u32, |x| cmp::min(thl4c, a[x]));
 
     if !skip_inter {
         // inner (tx) left|right edges
