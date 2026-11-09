@@ -816,16 +816,16 @@ fn sgr_5x5_rust<BD: BitDepth>(
     bd: BD,
 ) {
     // Selfguided filter is applied to a maximum stripe height of 64 + 3 pixels
-    // of padding above and below
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-
+    // of padding above and below.
     // Selfguided filter outputs to a maximum stripe height of 64 and a
-    // maximum restoration width of 384 (256 * 1.5)
-    let mut dst = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // maximum restoration width of 384 (256 * 1.5).
+    // `padding` writes every `tmp` cell the filter reads, and the filter writes every
+    // `dst` cell read below.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], dst: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst, &mut tmp, w, h, 25, sgr.s0, bd);
+    selfguided_filter(dst, tmp, w, h, 25, sgr.s0, bd);
 
     let w0 = sgr.w0 as c_int;
     for j in 0..h {
@@ -836,6 +836,7 @@ fn sgr_5x5_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 /// # Safety
@@ -881,12 +882,12 @@ fn sgr_3x3_rust<BD: BitDepth>(
     edges: LrEdgeFlags,
     bd: BD,
 ) {
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-    let mut dst = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // See `sgr_5x5_rust` for why the scratch needs no zeroing.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with2(&LR_UNIT, |tmp: &mut [BD::Pixel; LEN], dst: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst, &mut tmp, w, h, 9, sgr.s1, bd);
+    selfguided_filter(dst, tmp, w, h, 9, sgr.s1, bd);
 
     let w1 = sgr.w1 as c_int;
     for j in 0..h {
@@ -897,6 +898,7 @@ fn sgr_3x3_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 /// # Safety
@@ -942,14 +944,17 @@ fn sgr_mix_rust<BD: BitDepth>(
     edges: LrEdgeFlags,
     bd: BD,
 ) {
-    let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
-    let mut dst0 = [0.as_(); 64 * 384];
-    let mut dst1 = [0.as_(); 64 * 384];
-
-    padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+    // See `sgr_5x5_rust` for why the scratch needs no zeroing.
+    const LEN: usize = (64 + 3 + 3) * REST_UNIT_STRIDE;
+    scratch::with3(
+        &LR_UNIT,
+        |tmp: &mut [BD::Pixel; LEN],
+         dst0: &mut [BD::Coef; 64 * 384],
+         dst1: &mut [BD::Coef; 64 * 384]| {
+    padding::<BD>(tmp, p, left, lpf, lpf_off, w, h, edges);
     let sgr = params.sgr();
-    selfguided_filter(&mut dst0, &mut tmp, w, h, 25, sgr.s0, bd);
-    selfguided_filter(&mut dst1, &mut tmp, w, h, 9, sgr.s1, bd);
+    selfguided_filter(dst0, tmp, w, h, 25, sgr.s0, bd);
+    selfguided_filter(dst1, tmp, w, h, 9, sgr.s1, bd);
 
     let w0 = sgr.w0 as c_int;
     let w1 = sgr.w1 as c_int;
@@ -961,6 +966,7 @@ fn sgr_mix_rust<BD: BitDepth>(
             p[i] = bd.iclip_pixel(p[i].as_::<c_int>() + (v + (1 << 10) >> 11));
         }
     }
+    });
 }
 
 #[deny(unsafe_op_in_unsafe_fn)]
