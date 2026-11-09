@@ -626,24 +626,84 @@ pub fn setup_integral_image<T: Pixel>(
   }
 }
 
+/// Scratch rows for [`sgrproj_stripe_filter`] and [`sgrproj_solve`]:
+/// the box sums `a`/`b` and filter outputs `f` of both radii.
+///
+/// Thread-local and reused rather than zeroed per call: each call writes
+/// every element it reads (the `sgrproj_box_ab_*` and `sgrproj_box_f_*`
+/// kernels fill the rows before they are used), so the zeroing only served
+/// to initialize the arrays. Debug builds poison the rows on every borrow.
+struct SgrScratch {
+  a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2],
+  b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2],
+  f_r2_0: [u32; IMAGE_WIDTH_MAX],
+  f_r2_1: [u32; IMAGE_WIDTH_MAX],
+  a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3],
+  b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3],
+  f_r1: [u32; IMAGE_WIDTH_MAX],
+}
+
+thread_local! {
+  static SGR_SCRATCH: std::cell::RefCell<SgrScratch> = const {
+    std::cell::RefCell::new(SgrScratch {
+      a_r2: [[0; IMAGE_WIDTH_MAX + 2]; 2],
+      b_r2: [[0; IMAGE_WIDTH_MAX + 2]; 2],
+      f_r2_0: [0; IMAGE_WIDTH_MAX],
+      f_r2_1: [0; IMAGE_WIDTH_MAX],
+      a_r1: [[0; IMAGE_WIDTH_MAX + 2]; 3],
+      b_r1: [[0; IMAGE_WIDTH_MAX + 2]; 3],
+      f_r1: [0; IMAGE_WIDTH_MAX],
+    })
+  };
+}
+
+#[inline(always)]
+fn with_sgr_scratch<R>(f: impl FnOnce(&mut SgrScratch) -> R) -> R {
+  SGR_SCRATCH.with_borrow_mut(|scratch| {
+    if cfg!(debug_assertions) {
+      const P: u32 = 0x5a5a_5a5a;
+      for row in scratch.a_r2.iter_mut().chain(&mut scratch.b_r2) {
+        row.fill(P);
+      }
+      for row in scratch.a_r1.iter_mut().chain(&mut scratch.b_r1) {
+        row.fill(P);
+      }
+      scratch.f_r2_0.fill(P);
+      scratch.f_r2_1.fill(P);
+      scratch.f_r1.fill(P);
+    }
+    f(scratch)
+  })
+}
+
 #[profiling::function]
 pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
   set: u8, xqd: [i8; 2], fi: &FrameInvariants<T>,
   integral_image_buffer: &IntegralImageBuffer, integral_image_stride: usize,
   cdeffed: &PlaneSlice<U>, out: &mut PlaneRegionMut<U>,
 ) {
+  with_sgr_scratch(|scratch| {
+    sgrproj_stripe_filter_with(
+      scratch,
+      set,
+      xqd,
+      fi,
+      integral_image_buffer,
+      integral_image_stride,
+      cdeffed,
+      out,
+    )
+  })
+}
+
+#[inline(always)]
+fn sgrproj_stripe_filter_with<T: Pixel, U: Pixel>(
+  scratch: &mut SgrScratch, set: u8, xqd: [i8; 2], fi: &FrameInvariants<T>,
+  integral_image_buffer: &IntegralImageBuffer, integral_image_stride: usize,
+  cdeffed: &PlaneSlice<U>, out: &mut PlaneRegionMut<U>,
+) {
   let &Rect { width: stripe_w, height: stripe_h, .. } = out.rect();
-  let mut a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut f_r2_0: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut f_r2_1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut f_r1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
+  let SgrScratch { a_r2, b_r2, f_r2_0, f_r2_1, a_r1, b_r1, f_r1 } = scratch;
 
   let s_r2: u32 = SGRPROJ_PARAMS_S[set as usize][0];
   let s_r1: u32 = SGRPROJ_PARAMS_S[set as usize][1];
@@ -729,24 +789,24 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
       sgrproj_box_f_r2(
         &ap0,
         &bp0,
-        &mut f_r2_0,
-        &mut f_r2_1,
+        &mut *f_r2_0,
+        &mut *f_r2_1,
         y,
         stripe_w,
         cdeffed,
         fi.cpu_feature_level,
       );
-      [&f_r2_0, &f_r2_1]
+      [&*f_r2_0, &*f_r2_1]
     } else {
       sgrproj_box_f_r0(
-        &mut f_r2_0,
+        &mut *f_r2_0,
         y,
         stripe_w,
         cdeffed,
         fi.cpu_feature_level,
       );
       // share results for both rows
-      [&f_r2_0, &f_r2_0]
+      [&*f_r2_0, &*f_r2_0]
     };
     for dy in 0..(2.min(stripe_h - y)) {
       let y = y + dy;
@@ -770,7 +830,7 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
         sgrproj_box_f_r1(
           &ap1,
           &bp1,
-          &mut f_r1,
+          &mut *f_r1,
           y,
           stripe_w,
           cdeffed,
@@ -778,7 +838,7 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
         );
       } else {
         sgrproj_box_f_r0(
-          &mut f_r1,
+          &mut *f_r1,
           y,
           stripe_w,
           cdeffed,
@@ -817,7 +877,7 @@ pub fn sgrproj_stripe_filter<T: Pixel, U: Pixel>(
       apply_filter(
         &mut out[y],
         line,
-        &f_r1,
+        &*f_r1,
         f_r2_ab[dy],
         stripe_w,
         fi.sequence.bit_depth,
@@ -849,17 +909,27 @@ pub fn sgrproj_solve<T: Pixel>(
   integral_image_buffer: &IntegralImageBuffer, input: &PlaneRegion<'_, T>,
   cdeffed: &PlaneSlice<T>, cdef_w: usize, cdef_h: usize,
 ) -> (i8, i8) {
-  let mut a_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut b_r2: [[u32; IMAGE_WIDTH_MAX + 2]; 2] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 2];
-  let mut f_r2_0: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut f_r2_1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
-  let mut a_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut b_r1: [[u32; IMAGE_WIDTH_MAX + 2]; 3] =
-    [[0; IMAGE_WIDTH_MAX + 2]; 3];
-  let mut f_r1: [u32; IMAGE_WIDTH_MAX] = [0; IMAGE_WIDTH_MAX];
+  with_sgr_scratch(|scratch| {
+    sgrproj_solve_with(
+      scratch,
+      set,
+      fi,
+      integral_image_buffer,
+      input,
+      cdeffed,
+      cdef_w,
+      cdef_h,
+    )
+  })
+}
+
+#[inline(always)]
+fn sgrproj_solve_with<T: Pixel>(
+  scratch: &mut SgrScratch, set: u8, fi: &FrameInvariants<T>,
+  integral_image_buffer: &IntegralImageBuffer, input: &PlaneRegion<'_, T>,
+  cdeffed: &PlaneSlice<T>, cdef_w: usize, cdef_h: usize,
+) -> (i8, i8) {
+  let SgrScratch { a_r2, b_r2, f_r2_0, f_r2_1, a_r1, b_r1, f_r1 } = scratch;
 
   let s_r2: u32 = SGRPROJ_PARAMS_S[set as usize][0];
   let s_r1: u32 = SGRPROJ_PARAMS_S[set as usize][1];
@@ -948,18 +1018,18 @@ pub fn sgrproj_solve<T: Pixel>(
       sgrproj_box_f_r2(
         &ap0,
         &bp0,
-        &mut f_r2_0,
-        &mut f_r2_1,
+        &mut *f_r2_0,
+        &mut *f_r2_1,
         y,
         cdef_w,
         cdeffed,
         fi.cpu_feature_level,
       );
-      [&f_r2_0, &f_r2_1]
+      [&*f_r2_0, &*f_r2_1]
     } else {
-      sgrproj_box_f_r0(&mut f_r2_0, y, cdef_w, cdeffed, fi.cpu_feature_level);
+      sgrproj_box_f_r0(&mut *f_r2_0, y, cdef_w, cdeffed, fi.cpu_feature_level);
       // share results for both rows
-      [&f_r2_0, &f_r2_0]
+      [&*f_r2_0, &*f_r2_0]
     };
     for dy in 0..(2.min(cdef_h - y)) {
       let y = y + dy;
@@ -983,14 +1053,14 @@ pub fn sgrproj_solve<T: Pixel>(
         sgrproj_box_f_r1(
           &ap1,
           &bp1,
-          &mut f_r1,
+          &mut *f_r1,
           y,
           cdef_w,
           cdeffed,
           fi.cpu_feature_level,
         );
       } else {
-        sgrproj_box_f_r0(&mut f_r1, y, cdef_w, cdeffed, fi.cpu_feature_level);
+        sgrproj_box_f_r0(&mut *f_r1, y, cdef_w, cdeffed, fi.cpu_feature_level);
       }
 
       #[inline(always)]
@@ -1041,7 +1111,7 @@ pub fn sgrproj_solve<T: Pixel>(
         &mut c,
         &cdeffed[y],
         &input[y],
-        &f_r1,
+        &*f_r1,
         f_r2_01[dy],
         cdef_w,
       );
