@@ -317,6 +317,9 @@ impl QuantizationContext {
     // To that end, we want to bias more toward rounding to zero for
     // that tail of zeroes and ones than we do for the larger coefficients.
     let _q2 = crate::prof::scope(crate::prof::Stage::QuantMainLoop);
+    // The AC positions in scan order, as a plain slice: the same positions as
+    // `scan.iter().take(eob).skip(1)` without the adapters' per-step bookkeeping.
+    let ac_scan = scan.get(1..usize::from(eob).min(scan.len())).unwrap_or(&[]);
     // prom_av1e014 tried a two-pass split here (precompute both rounding
     // candidates, resolve the level_mode recurrence separately): REFUTED,
     // +39% slower — OoO already hides the 1-bit carried chain, and the
@@ -330,7 +333,7 @@ impl QuantizationContext {
       let mut level_mode: u32 = 1;
       let ac_quant = self.ac_quant.get() as u32;
       let ac_doffset = self.ac_offset1 - self.ac_offset0;
-      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
+      for &pos in ac_scan {
         let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
@@ -353,7 +356,7 @@ impl QuantizationContext {
       // this exists only for single-binary A/B.
       let mut level_mode = 1;
       let ac_quant = self.ac_quant.get() as u32;
-      for &pos in scan.iter().take(usize::from(eob)).skip(1) {
+      for &pos in ac_scan {
         let coeff = i32::cast_from(coeffs[pos as usize]) << self.log_tx_scale;
         let abs_coeff = coeff.unsigned_abs();
 
