@@ -341,6 +341,17 @@ fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
     allow(dead_code)
 )]
 fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
+    bool_equi_rust_inline(s)
+}
+
+/// The body of [`rav1d_msac_decode_bool_equi_rust`], always inlined; used
+/// directly only by [`rav1d_msac_decode_bool_equi_coef`].
+#[cfg_attr(
+    all(feature = "asm", any(target_feature = "sse2", target_feature = "neon")),
+    allow(dead_code)
+)]
+#[inline(always)]
+fn bool_equi_rust_inline(s: &mut MsacContext) -> bool {
     let r = s.rng;
     let mut dif = s.dif;
     debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
@@ -694,6 +705,28 @@ pub fn rav1d_msac_decode_bool_equi(s: &mut MsacContext) -> bool {
             }
         } else {
             rav1d_msac_decode_bool_equi_rust(s)
+        }
+    }
+}
+
+/// [`rav1d_msac_decode_bool_equi`] for the coefficient sign reads: on the
+/// pure-Rust path the decoder body is inlined there (99% of all equiprobable
+/// bools). The asm paths are unchanged.
+#[inline(always)]
+pub fn rav1d_msac_decode_bool_equi_coef(s: &mut MsacContext) -> bool {
+    cfg_if! {
+        if #[cfg(all(feature = "asm", target_feature = "sse2"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe {
+                dav1d_msac_decode_bool_equi_sse2(&mut s.asm) != 0
+            }
+        } else if #[cfg(all(feature = "asm", target_feature = "neon"))] {
+            // SAFETY: `checkasm` has verified that it is equivalent to [`dav1d_msac_decode_bool_equi_rust`].
+            unsafe {
+                dav1d_msac_decode_bool_equi_neon(&mut s.asm) != 0
+            }
+        } else {
+            bool_equi_rust_inline(s)
         }
     }
 }

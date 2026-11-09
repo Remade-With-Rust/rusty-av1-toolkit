@@ -40,6 +40,7 @@ use crate::msac::{
     rav1d_msac_decode_bools,
     rav1d_msac_decode_hi_tok, rav1d_msac_decode_symbol_adapt16, rav1d_msac_decode_symbol_adapt4,
     rav1d_msac_decode_symbol_adapt4_coef, rav1d_msac_decode_hi_tok_coef,
+    rav1d_msac_decode_bool_equi_coef,
     rav1d_msac_decode_symbol_adapt8, MsacContext,
 };
 use crate::picture::Rav1dThreadPicture;
@@ -1232,7 +1233,7 @@ fn decode_coefs<BD: BitDepth>(
         Some(Ac::Qm(qm_tbl)) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
             loop {
-                let sign = rav1d_msac_decode_bool_equi(&mut ts_c.msac);
+                let sign = rav1d_msac_decode_bool_equi_coef(&mut ts_c.msac);
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, ts_c.msac.rng);
                 }
@@ -1277,7 +1278,7 @@ fn decode_coefs<BD: BitDepth>(
         Some(Ac::NoQm) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
             loop {
-                let sign = rav1d_msac_decode_bool_equi(&mut ts_c.msac) as c_int;
+                let sign = rav1d_msac_decode_bool_equi_coef(&mut ts_c.msac) as c_int;
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, ts_c.msac.rng);
                 }
