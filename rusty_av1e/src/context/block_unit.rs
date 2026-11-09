@@ -2527,55 +2527,68 @@ impl ContextWriter<'_> {
       usize::MAX
     };
 
-    let scan_with_ctx =
-      scan.iter().copied().zip(coeff_contexts.iter().copied());
-    for (c, ((pos, coeff_ctx), v)) in
-      scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev()
-    {
-      // Skip the base/range cost of the high-frequency middle coefficients
-      // (kept: DC, last-eob, and the low-frequency head up to eob/N).
-      if c != 0 && c + 1 != usize::from(eob) && c > fast_hi {
-        continue;
-      }
-      let pos = pos as usize;
-      let coeff_ctx = coeff_ctx as usize;
-      let level = v.abs();
-
-      if c == usize::from(eob) - 1 {
-        symbol_with_update_hot!(
-          self,
-          w,
-          cmp::min(u32::cast_from(level), 3) - 1,
-          &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][coeff_ctx]
-        );
-      } else {
-        symbol_with_update_hot!(
-          self,
-          w,
-          cmp::min(u32::cast_from(level), 3),
-          &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx]
-        );
-      }
-
-      if level > T::cast_from(NUM_BASE_LEVELS) {
-        let base_range = level - T::cast_from(1 + NUM_BASE_LEVELS);
-        let br_ctx = Self::get_br_ctx(levels, pos, bhl, tx_class);
-        let mut idx: T = T::cast_from(0);
-
-        loop {
-          if idx >= T::cast_from(COEFF_BASE_RANGE) {
-            break;
+    // The loop body is instantiated twice: with the knob-free symbol writer
+    // when every writer knob is clear (the default configuration), so no
+    // per-symbol knob test survives, and with the knob-aware writer otherwise.
+    macro_rules! coeff_loop {
+      ($sym:ident) => {
+        let scan_with_ctx =
+          scan.iter().copied().zip(coeff_contexts.iter().copied());
+        for (c, ((pos, coeff_ctx), v)) in
+          scan_with_ctx.zip(coeffs.iter().copied()).enumerate().rev()
+        {
+          // Skip the base/range cost of the high-frequency middle coefficients
+          // (kept: DC, last-eob, and the low-frequency head up to eob/N).
+          if c != 0 && c + 1 != usize::from(eob) && c > fast_hi {
+            continue;
           }
-          let k = cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
-          let cdf = &self.fc.coeff_br_cdf
-            [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
-          symbol_with_update_hot!(self, w, u32::cast_from(k), cdf);
-          if k < T::cast_from(BR_CDF_SIZE - 1) {
-            break;
+          let pos = pos as usize;
+          let coeff_ctx = coeff_ctx as usize;
+          let level = v.abs();
+
+          if c == usize::from(eob) - 1 {
+            $sym!(
+              self,
+              w,
+              cmp::min(u32::cast_from(level), 3) - 1,
+              &self.fc.coeff_base_eob_cdf[txs_ctx][plane_type][coeff_ctx]
+            );
+          } else {
+            $sym!(
+              self,
+              w,
+              cmp::min(u32::cast_from(level), 3),
+              &self.fc.coeff_base_cdf[txs_ctx][plane_type][coeff_ctx]
+            );
           }
-          idx += T::cast_from(BR_CDF_SIZE - 1);
+
+          if level > T::cast_from(NUM_BASE_LEVELS) {
+            let base_range = level - T::cast_from(1 + NUM_BASE_LEVELS);
+            let br_ctx = Self::get_br_ctx(levels, pos, bhl, tx_class);
+            let mut idx: T = T::cast_from(0);
+
+            loop {
+              if idx >= T::cast_from(COEFF_BASE_RANGE) {
+                break;
+              }
+              let k =
+                cmp::min(base_range - idx, T::cast_from(BR_CDF_SIZE - 1));
+              let cdf = &self.fc.coeff_br_cdf
+                [txs_ctx.min(TxSize::TX_32X32 as usize)][plane_type][br_ctx];
+              $sym!(self, w, u32::cast_from(k), cdf);
+              if k < T::cast_from(BR_CDF_SIZE - 1) {
+                break;
+              }
+              idx += T::cast_from(BR_CDF_SIZE - 1);
+            }
+          }
         }
-      }
+      };
+    }
+    if w.knobs() == 0 {
+      coeff_loop!(symbol_with_update_plain);
+    } else {
+      coeff_loop!(symbol_with_update_hot);
     }
   }
 

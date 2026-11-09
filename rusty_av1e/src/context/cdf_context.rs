@@ -618,6 +618,16 @@ macro_rules! symbol_with_update_hot {
   };
 }
 
+/// [`symbol_with_update!`] for a writer whose knobs are all clear (see
+/// `Writer::symbol_with_update_plain`).
+macro_rules! symbol_with_update_plain {
+  ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
+    let cdf = $self.fc.offset($cdf);
+    $w.symbol_with_update_plain($s, cdf, &mut $self.fc_log, &mut $self.fc);
+    symbol_with_update!($self, $cdf);
+  };
+}
+
 macro_rules! symbol_with_update {
   ($self:ident, $w:ident, $s:expr, $cdf:expr) => {
     let cdf = $self.fc.offset($cdf);

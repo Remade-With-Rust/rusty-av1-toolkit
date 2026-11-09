@@ -51,6 +51,15 @@ pub trait Writer {
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   );
+  /// The `harvest::WK_*` knob bits this writer resolved at construction.
+  fn knobs(&self) -> u8;
+  /// [`Writer::symbol_with_update_hot`] for a writer whose `knobs()` are all
+  /// clear (the default configuration): no knob tests at all. Callers check
+  /// `knobs()` once per block and pick this path for the whole loop.
+  fn symbol_with_update_plain<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  );
   /// [`Writer::symbol_with_update`], always inlined. For the per-coefficient
   /// sites only, where the call frame costs as much as the symbol; every other
   /// site keeps the out-of-line copy so code size does not grow with it.
@@ -138,6 +147,9 @@ impl CountsOnly for WriterBase<WriterEncoder> {
 pub trait StorageBackend {
   /// Store partially-computed range code into given storage backend
   fn store(&mut self, fl: u16, fh: u16, nms: u16);
+  /// [`StorageBackend::store`] for a writer whose knobs are all clear: the
+  /// exact range-coder path with no knob test.
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16);
   /// Return bit-length of encoded stream to date
   fn stream_bits(&mut self) -> usize;
   /// Backend implementation of checkpoint to pass through Writer interface
@@ -244,6 +256,10 @@ impl StorageBackend for WriterBase<WriterCounter> {
       self.fake_bits_frac += crate::harvest::sym_cost_frac(w);
       return;
     }
+    self.store_plain(fl, fh, nms);
+  }
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -294,6 +310,10 @@ impl StorageBackend for WriterBase<WriterRecorder> {
       self.s.storage.push((fl, fh, nms));
       return;
     }
+    self.store_plain(fl, fh, nms);
+  }
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
     let (_l, r) = self.lr_compute(fl, fh, nms);
     let d = r.leading_zeros() as usize;
 
@@ -332,6 +352,10 @@ impl StorageBackend for WriterBase<WriterRecorder> {
 /// tokens, only the resulting bitstream, and so it cannot be replayed
 /// (only checkpointed and rolled back).
 impl StorageBackend for WriterBase<WriterEncoder> {
+  #[inline]
+  fn store_plain(&mut self, fl: u16, fh: u16, nms: u16) {
+    self.store(fl, fh, nms);
+  }
   fn store(&mut self, fl: u16, fh: u16, nms: u16) {
     let (l, r) = self.lr_compute(fl, fh, nms);
     let mut low = l + self.s.low;
@@ -621,33 +645,23 @@ where
   ///   The lower 6 bits of the last value hold the count.
   #[inline(always)]
   fn symbol<const CDF_LEN: usize>(&mut self, s: u32, cdf: &[u16; CDF_LEN]) {
-    debug_assert!(cdf[cdf.len() - 1] < (1 << EC_PROB_SHIFT));
-    let s = s as usize;
-    debug_assert!(s < cdf.len());
-    // The above is stricter than the following overflow check: s <= cdf.len()
-    let nms = cdf.len() - s;
-    let fl = if s > 0 {
-      // SAFETY: We asserted that s is less than the length of the cdf
-      unsafe { *cdf.get_unchecked(s - 1) }
-    } else {
-      32768
-    };
-    // SAFETY: We asserted that s is less than the length of the cdf
-    let fh = unsafe { *cdf.get_unchecked(s) };
-    debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
-    debug_assert!(fl <= 32768);
-    self.store(fl, fh, nms as u16);
+    self.symbol_impl::<CDF_LEN, false>(s, cdf);
   }
-  /// Encodes a symbol given a cumulative distribution function (CDF)
-  /// table in Q15, then updates the CDF probabilities to reflect we've
-  /// written one more symbol 's'.
-  ///
-  /// - `s`: The index of the symbol to encode.
-  /// - `cdf`: The CDF, such that symbol s falls in the range
-  ///   `[s > 0 ? cdf[s - 1] : 0, cdf[s])`.
-  ///   The values must be monotonically non-decreasing, and the last value
-  ///   must be greater 32704. There should be at most 16 values.
-  ///   The lower 6 bits of the last value hold the count.
+  #[inline(always)]
+  fn knobs(&self) -> u8 {
+    self.knobs
+  }
+  #[inline(always)]
+  fn symbol_with_update_plain<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    debug_assert_eq!(self.knobs, 0);
+    let cdf = log.push(fc, cdf);
+    self.symbol_impl::<CDF_LEN, true>(s, cdf);
+    update_cdf(cdf, s);
+  }
+  /// Encodes a symbol, then updates the CDF.
   fn symbol_with_update<const CDF_LEN: usize>(
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
@@ -659,33 +673,7 @@ where
     &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
     fc: &mut CDFContext,
   ) {
-    // F-audit / entropy final audit: an info scope here measured 192,251,661
-    // calls/10f at ~11.5 ns/symbol = the majority of write_coeffs_lv_map and the
-    // irreducible serial core (CDF adaptation is loop-carried). Scope removed: at
-    // 192M calls its ~23ns overhead corrupts every other stage. Re-add for audits.
-    #[cfg(feature = "desync_finder")]
-    {
-      if self.debug {
-        self.print_backtrace(s);
-      }
-    }
-    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
-    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
-    // counter neither snapshots the undo log nor adapts the CDF — the cost
-    // reads the current (final-encode-evolved) distribution. Counter-only:
-    // recorder tokens are replayed into the real bitstream and must carry
-    // spec-adaptive brackets.
-    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
-      && self.knobs & crate::harvest::WK_FROZEN != 0
-    {
-      let cdf = fc.read(cdf);
-      self.symbol(s, cdf);
-      return;
-    }
-    let cdf = log.push(fc, cdf);
-    self.symbol(s, cdf);
-
-    update_cdf(cdf, s);
+    self.symbol_with_update_impl(s, cdf, log, fc)
   }
   /// Returns approximate cost for a symbol given a cumulative
   /// distribution function (CDF) table and current write state.
@@ -938,6 +926,72 @@ where
     StorageBackend::rollback(self, wc)
   }
 }
+
+impl<S> WriterBase<S>
+where
+  WriterBase<S>: StorageBackend + CountsOnly,
+{
+  /// The body of `Writer::symbol`; `PLAIN` skips the knob test in `store`.
+  #[inline(always)]
+  fn symbol_impl<const CDF_LEN: usize, const PLAIN: bool>(
+    &mut self, s: u32, cdf: &[u16; CDF_LEN],
+  ) {
+    debug_assert!(cdf[cdf.len() - 1] < (1 << EC_PROB_SHIFT));
+    let s = s as usize;
+    debug_assert!(s < cdf.len());
+    // The above is stricter than the following overflow check: s <= cdf.len()
+    let nms = cdf.len() - s;
+    let fl = if s > 0 {
+      // SAFETY: We asserted that s is less than the length of the cdf
+      unsafe { *cdf.get_unchecked(s - 1) }
+    } else {
+      32768
+    };
+    // SAFETY: We asserted that s is less than the length of the cdf
+    let fh = unsafe { *cdf.get_unchecked(s) };
+    debug_assert!((fh >> EC_PROB_SHIFT) <= (fl >> EC_PROB_SHIFT));
+    debug_assert!(fl <= 32768);
+    if PLAIN {
+      self.store_plain(fl, fh, nms as u16);
+    } else {
+      self.store(fl, fh, nms as u16);
+    }
+  }
+  #[inline(always)]
+  fn symbol_with_update_impl<const CDF_LEN: usize>(
+    &mut self, s: u32, cdf: CDFOffset<CDF_LEN>, log: &mut CDFContextLog,
+    fc: &mut CDFContext,
+  ) {
+    // F-audit / entropy final audit: an info scope here measured 192,251,661
+    // calls/10f at ~11.5 ns/symbol = the majority of write_coeffs_lv_map and the
+    // irreducible serial core (CDF adaptation is loop-carried). Scope removed: at
+    // 192M calls its ~23ns overhead corrupts every other stage. Re-add for audits.
+    #[cfg(feature = "desync_finder")]
+    {
+      if self.debug {
+        self.print_backtrace(s);
+      }
+    }
+    // prom_av1e016: frozen trial costing. Counter updates are ALWAYS rolled
+    // back (their net effect on fc is zero), so under RAV1E_FROZEN the
+    // counter neither snapshots the undo log nor adapts the CDF — the cost
+    // reads the current (final-encode-evolved) distribution. Counter-only:
+    // recorder tokens are replayed into the real bitstream and must carry
+    // spec-adaptive brackets.
+    if <WriterBase<S> as CountsOnly>::COUNTS_ONLY
+      && self.knobs & crate::harvest::WK_FROZEN != 0
+    {
+      let cdf = fc.read(cdf);
+      self.symbol(s, cdf);
+      return;
+    }
+    let cdf = log.push(fc, cdf);
+    self.symbol(s, cdf);
+
+    update_cdf(cdf, s);
+  }
+}
+
 
 pub trait BCodeWriter {
   fn recenter_nonneg(&mut self, r: u16, v: u16) -> u16;
