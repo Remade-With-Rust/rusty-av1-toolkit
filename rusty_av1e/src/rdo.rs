@@ -479,8 +479,9 @@ pub fn distortion_scale<T: Pixel>(
   }
   // EncoderConfig::temporal_rdo() should always return false in situations
   // where distortion is computed on > 8x8 blocks, so we should never hit this
-  // assert.
-  assert!(bsize <= BlockSize::BLOCK_8X8);
+  // assert. Debug-only: it is evaluated per 8x8 bias block, and `BlockSize`'s
+  // partial order compares widths and heights through lookups.
+  debug_assert!(bsize <= BlockSize::BLOCK_8X8);
 
   let x = frame_bo.0.x >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
   let y = frame_bo.0.y >> IMPORTANCE_BLOCK_TO_BLOCK_SHIFT;
