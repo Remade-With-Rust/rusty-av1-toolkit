@@ -20,7 +20,15 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@main
+  # No root manifest: rusty_av1d/ and rusty_av1e/ are separate workspaces, so
+  # each is checked on its own.
+  check-av1d:
+    uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@harness/working-directory
     with:
       command: test
+      working-directory: rusty_av1d
+  check-av1e:
+    uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@harness/working-directory
+    with:
+      command: test
+      working-directory: rusty_av1e
