@@ -27,8 +27,10 @@ jobs:
     with:
       command: test
       working-directory: rusty_av1d
+      apt-packages: nasm
   check-av1e:
     uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@harness/working-directory
     with:
       command: test
       working-directory: rusty_av1e
+      apt-packages: nasm
