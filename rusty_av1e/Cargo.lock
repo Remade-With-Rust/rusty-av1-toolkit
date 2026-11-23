@@ -1608,9 +1608,9 @@ checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
 
 [[package]]
 name = "rusty_alloc"
-version = "2.4.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af775820e14adea82b15c22e9d2815cb85976c12285c30caa327f4d441038969"
+checksum = "fbc3c5d570c6a698fe1329b5abfbadeb3993723dc06af6c0dad541b2a34e1ff9"
 dependencies = [
  "libc",
  "portable-atomic",
@@ -1619,9 +1619,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "2.4.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a5b07b04e499fe5ff94c9866fd3b39e148b02f978b42ee6f572f92d7e32b9f"
+checksum = "99a38e4517642f7c2123e8a27200b15f06d763b59ab7a33d57a2f82dd958e66d"
 dependencies = [
  "rusty_alloc",
 ]
